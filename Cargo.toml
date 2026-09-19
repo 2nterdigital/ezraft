@@ -43,9 +43,17 @@ serde       = { version = "1.0.114", features = ["derive"] }
 serde_json  = { version = "1.0.57" }
 tokio       = { version = "1.39", default-features = false, features = ["fs", "io-util", "macros", "rt", "rt-multi-thread", "sync", "time"] }
 
+[features]
+# Test-only network fault injection (ech0-media#23): drop, delay, or hide the response of
+# requests between chosen directed node pairs, and heal them again. Off by default, so a normal
+# build has none of the hook's types, fields, or branches - see `src/transport/fault.rs`. The
+# self dev-dependency below turns it on for every `cargo test` binary without any `--features`.
+fault-injection = []
+
 [dev-dependencies]
 chrono             = { version = "0.4" }
 clap               = { version = "4.1.11", features = ["derive", "env"] }
+ezraft             = { path = ".", features = ["fault-injection"] }
 tracing            = { version = "0.1" }
 tracing-subscriber = { version = "0.3.3", features = ["env-filter"] }
 

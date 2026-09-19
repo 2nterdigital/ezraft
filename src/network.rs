@@ -3,6 +3,10 @@
 //! This module provides the built-in HTTP networking that connects Raft nodes.
 //! Users don't need to implement anything - the framework handles all RPC communication.
 //!
+//! The actual outbound send - and, in test builds, the fault-injection hook - live in
+//! [`crate::transport`]; this module adapts that to openraft's network traits and maps
+//! [`crate::transport`]'s errors to openraft's own.
+//!
 //! # Snapshot transfer
 //!
 //! All RPCs, snapshot included, are plain request/response JSON over HTTP: a snapshot is
@@ -17,7 +21,6 @@ use std::fmt::Display;
 use std::future::Future;
 use std::io;
 
-use openraft::AnyError;
 use openraft::BasicNode;
 use openraft::OptionalSend;
 use openraft::error::Infallible;
@@ -38,13 +41,14 @@ use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::type_config::alias::SnapshotOf;
 use openraft::type_config::alias::VoteOf;
-use reqwest::Client;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::app::EzApp;
 use crate::snapshot::EzSnapshotData;
 use crate::snapshot::EzSnapshotMeta;
+use crate::transport::Transport;
+use crate::transport::TransportError;
 use crate::type_config::EzVote;
 use crate::type_config::OpenRaftTypes;
 
@@ -53,21 +57,26 @@ type C<T> = OpenRaftTypes<T>;
 
 /// HTTP network factory
 ///
-/// Creates HTTP clients to communicate with other Raft nodes.
+/// Creates the per-peer [`Network`] openraft asks for. Every one of them shares one
+/// [`Transport`], and so one connection pool - and, in test builds, one fault-injection handle.
 /// Implements OpenRaft's `RaftNetworkFactory` trait.
 pub struct EzNetworkFactory {
-    client: Client,
+    transport: Transport,
 }
 
 impl EzNetworkFactory {
-    /// Create a new network factory
-    ///
-    /// The HTTP client is built once here and handed to every peer, so the whole node shares one
-    /// connection pool instead of opening a fresh one per peer.
-    pub fn new() -> Result<Self, io::Error> {
-        let client = Client::builder().no_proxy().build().map_err(io::Error::other)?;
+    /// Create a new network factory for the node whose id is `from`
+    pub fn new(from: u64) -> Result<Self, io::Error> {
+        Ok(Self {
+            transport: Transport::new(from)?,
+        })
+    }
 
-        Ok(Self { client })
+    /// Attach the test cluster's shared fault-injection handle
+    #[cfg(feature = "fault-injection")]
+    pub(crate) fn with_faults(mut self, faults: Option<crate::transport::fault::Faults>) -> Self {
+        self.transport = self.transport.with_faults(faults);
+        self
     }
 }
 
@@ -76,22 +85,24 @@ where T: EzApp
 {
     type Network = Network;
 
-    async fn new_client(&mut self, _target: u64, node: &BasicNode) -> Self::Network {
-        let addr = node.addr.clone();
-        let client = self.client.clone();
-
-        Network { addr, client }
+    async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
+        Network {
+            addr: node.addr.clone(),
+            target,
+            transport: self.transport.clone(),
+        }
     }
 }
 
 /// HTTP network client for a single Raft node
 pub struct Network {
     addr: String,
-    client: Client,
+    target: u64,
+    transport: Transport,
 }
 
 impl Network {
-    /// Send an HTTP POST request to a target node
+    /// Send a request to this client's target node, and decode the peer's `Result<Resp, Err>`
     ///
     /// The request is given the timeout budget openraft computed for it: it is dropped at
     /// `soft_ttl` so this side reports the failure before openraft abandons the call itself.
@@ -107,30 +118,16 @@ impl Network {
         Resp: Serialize + DeserializeOwned,
         Err: std::error::Error + Serialize + DeserializeOwned,
     {
-        let url = format!("http://{}/{}", self.addr, uri);
-
-        let resp = self.client.post(url.clone()).timeout(option.soft_ttl()).json(&req).send().await.map_err(|e| {
-            // A peer that does not answer in time is treated like one that cannot be reached, so
-            // replication backs off instead of hammering it.
-            if e.is_connect() || e.is_timeout() {
-                RPCError::Unreachable(Unreachable::new(&e))
-            } else {
-                RPCError::Network(NetworkError::new(&e))
-            }
-        })?;
-
-        // The body is a serialized `Result` only on success; any other status carries a
-        // plain-text reason that would otherwise surface as an opaque deserialization failure.
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            let err = AnyError::error(format!("{} responded {}: {}", url, status, body));
-            return Err(RPCError::Network(NetworkError::new(&err)));
-        }
-
-        let res: Result<Resp, Err> = resp.json().await.map_err(|e| NetworkError::new(&e))?;
-
-        Ok(res)
+        self.transport
+            .send(self.target, &self.addr, uri, option.soft_ttl(), req)
+            .await
+            .map_err(|e| match &e {
+                // A peer that does not answer in time - or, in test builds, one a fault dropped the
+                // request to - is treated like one that cannot be reached, so replication backs off
+                // instead of hammering it.
+                TransportError::Unreachable(_) => RPCError::Unreachable(Unreachable::new(&e)),
+                TransportError::Other(_) => RPCError::Network(NetworkError::new(&e)),
+            })
     }
 }
 
