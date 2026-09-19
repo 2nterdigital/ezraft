@@ -5,7 +5,6 @@
 //! and installing a snapshot or finishing startup recovery publishes again ([`Self::new`],
 //! [`RaftStateMachine::install_snapshot`]).
 
-use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Seek;
@@ -29,9 +28,6 @@ use openraft::storage::EntryResponder;
 use openraft::storage::RaftStateMachine;
 use tokio::sync::Mutex;
 
-use crate::command::Command;
-use crate::command::CommandBody;
-use crate::command::CommandOutcome;
 use crate::kv::InternalState;
 use crate::kv::KvState;
 use crate::kv::Publisher;
@@ -223,117 +219,22 @@ impl RaftStateMachine<OpenRaftTypes> for StateMachineStore {
             sm.last_applied = Some(log_id);
 
             let resp = match entry.payload {
-                // A command fenced to a term takes effect only if this very entry was appended in
-                // that term (ech0-media#34). Decided from the entry alone - its own log term
-                // against the term it carries - so every replica refuses it identically, and
-                // before anything else looks at it: a refused command touches neither the state
-                // nor the ledger.
-                EntryPayload::Normal(Command {
-                    required_term: Some(required),
-                    ..
-                }) if required != term => Some(CommandOutcome::StaleTerm),
-                EntryPayload::Normal(Command {
-                    request_id,
-                    ledger_capacity,
-                    body: CommandBody::Txn(txn),
-                    ..
-                }) => {
-                    // The idempotency ledger (ech0-media#30) is consulted *inside*
-                    // `apply_idempotent`, before `txn` ever runs: a retried request id comes back
-                    // as the outcome already recorded for it, with `changes: None`. Publish before
-                    // answering the writer (ech0-media#16) only applies to a freshly executed
-                    // command - a deduplicated one changed nothing, so there is nothing new to
-                    // publish.
-                    let applied = sm.kv.apply_idempotent(request_id, ledger_capacity as usize, &txn);
+                // What a command means is `Command::apply`'s to decide, from the log and the
+                // replicated state alone; this only publishes what it reports changed - before
+                // answering the writer (ech0-media#16), so a write is already visible on this
+                // node's own view and watches by the time its caller hears of it.
+                EntryPayload::Normal(command) => {
+                    let sm = &mut *sm;
+                    let membership = sm.membership.membership();
+                    let applied = command.apply(term, |id| membership.get_node(&id).is_some(), &mut sm.kv);
+
                     if let Some(changes) = applied.changes {
                         self.publisher.publish(sm.kv.view(), changes);
                     }
-                    Some(CommandOutcome::Txn(applied.outcome))
-                }
-                EntryPayload::Normal(Command {
-                    request_id,
-                    ledger_capacity,
-                    body: CommandBody::RegisterNode(cmd),
-                    ..
-                }) => {
-                    // Same idempotency discipline as a transaction, consulting the same ledger
-                    // (ech0-media#33): a retried registration is a no-op here, not a second
-                    // publish. Never touches `kv`/`revision`/`Changes` - the registry is
-                    // foundation-internal state, not the user's key space.
-                    let applied = sm.kv.apply_registry_command(request_id, ledger_capacity as usize, |registry| {
-                        registry.set(cmd.node_id, crate::kv::NodeInfo {
-                            external_addr: cmd.external_addr,
-                            meta: cmd.meta,
-                            status: crate::kv::NodeStatus::Up,
-                        });
-                    });
                     if let Some(registry) = applied.registry {
                         self.publisher.publish_registry(registry);
                     }
-                    Some(CommandOutcome::Registry)
-                }
-                EntryPayload::Normal(Command {
-                    request_id,
-                    ledger_capacity,
-                    body: CommandBody::RemoveNode(cmd),
-                    ..
-                }) => {
-                    let applied = sm.kv.apply_registry_command(request_id, ledger_capacity as usize, |registry| {
-                        registry.remove(cmd.node_id);
-                    });
-                    if let Some(registry) = applied.registry {
-                        self.publisher.publish_registry(registry);
-                    }
-                    Some(CommandOutcome::Registry)
-                }
-                EntryPayload::Normal(Command {
-                    request_id,
-                    ledger_capacity,
-                    body: CommandBody::SetStatus(cmd),
-                    ..
-                }) => {
-                    // Ledger-guarded the same way every other registry command is (ech0-media#34):
-                    // a retried request id changes nothing and publishes nothing. An entry that no
-                    // longer exists (concurrently reconciled away) is a silent no-op, not an
-                    // error - the leader's own decision to set this status can be stale by the
-                    // time it is applied, and there is nothing left to correct.
-                    let applied = sm.kv.apply_registry_command(request_id, ledger_capacity as usize, |registry| {
-                        if let Some(mut info) = registry.get(cmd.node_id) {
-                            info.status = cmd.status;
-                            registry.set(cmd.node_id, info);
-                        }
-                    });
-                    if let Some(registry) = applied.registry {
-                        self.publisher.publish_registry(registry);
-                    }
-                    Some(CommandOutcome::Registry)
-                }
-                EntryPayload::Normal(Command {
-                    request_id,
-                    ledger_capacity,
-                    body: CommandBody::ReconcileRegistry,
-                    ..
-                }) => {
-                    // Deterministic by construction (ech0-media#34's determinism rule): every
-                    // replica applies the very same `EntryPayload::Membership` entries in the same
-                    // order before reaching this one, so `sm.membership` here is identical on
-                    // every replica - no value from this node's own configuration enters the
-                    // decision of which entries are stale.
-                    let member_ids: BTreeSet<u64> = {
-                        let membership = sm.membership.membership();
-                        membership.voter_ids().chain(membership.learner_ids()).collect()
-                    };
-                    let applied = sm.kv.apply_registry_command(request_id, ledger_capacity as usize, |registry| {
-                        let stale: Vec<u64> =
-                            registry.iter().map(|(id, _)| id).filter(|id| !member_ids.contains(id)).collect();
-                        for node_id in stale {
-                            registry.remove(node_id);
-                        }
-                    });
-                    if let Some(registry) = applied.registry {
-                        self.publisher.publish_registry(registry);
-                    }
-                    Some(CommandOutcome::Registry)
+                    Some(applied.outcome)
                 }
                 EntryPayload::Membership(membership) => {
                     sm.membership = StoredMembership::new(Some(log_id), membership);
@@ -544,6 +445,8 @@ mod tests {
     use openraft::Membership;
 
     use super::*;
+    use crate::command::Command;
+    use crate::command::CommandBody;
     use crate::kv::KeyValue;
     use crate::kv::Txn;
     use crate::storage::EzStorage;
