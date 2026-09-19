@@ -171,10 +171,8 @@ pub(crate) enum RetryReason {
     /// The node this attempt forwarded to does not (or no longer) lead
     RemoteNotLeader {
         asked: u64,
-        /// The leader that node hinted at instead, if it named one. Not acted on directly today -
-        /// the next attempt still waits for *this* node's own metrics to reflect a leadership
-        /// change - kept for the tracing event and a future attempt that could retry against the
-        /// hint directly.
+        /// The leader that node hinted at instead, if it named one - for the tracing event: the
+        /// next attempt asks whoever *this* node's own metrics name by then.
         hint: Option<u64>,
     },
     /// The forward RPC to the believed leader timed out
@@ -242,10 +240,7 @@ enum ProposeOutcome {
     /// A definite outcome: the command was applied (or deduplicated by the ledger).
     Definite(CommandOutcome),
     /// This node - whichever one `raft` belongs to - does not durably lead right now
-    NotLeader {
-        leader_id: Option<u64>,
-        leader_addr: Option<String>,
-    },
+    NotLeader { leader_id: Option<u64> },
     /// Neither of the above: an error this milestone does not otherwise model for a plain KV
     /// write (for instance the engine shutting down mid-write). Never treated as a success.
     Unknown,
@@ -294,7 +289,6 @@ async fn propose(
         }),
         Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => Ok(ProposeOutcome::NotLeader {
             leader_id: fwd.leader_id,
-            leader_addr: fwd.leader_node.map(|node| node.internal_addr),
         }),
         Err(_other) => Ok(ProposeOutcome::Unknown),
     }
@@ -535,7 +529,7 @@ impl EzKv {
                         outcome = ?unexpected,
                         "a transaction was answered with another kind of command's outcome",
                     );
-                    self.wait_before_next_attempt(believed_leader, backoff, remaining).await;
+                    self.wait_before_next_attempt(believed_leader, backoff, Some(deadline)).await;
                 }
                 Attempt::Done(Err(err)) => return Err(WriteError::LimitExceeded(err)),
                 Attempt::Retry(reason) => {
@@ -546,7 +540,7 @@ impl EzKv {
                         target_leader = ?reason.target(),
                         "write-forward retry",
                     );
-                    self.wait_before_next_attempt(believed_leader, backoff, remaining).await;
+                    self.wait_before_next_attempt(believed_leader, backoff, Some(deadline)).await;
                 }
             }
         }
@@ -572,7 +566,11 @@ impl EzKv {
     }
 
     /// Wait for a leadership change away from `believed_leader`, or `backoff`, whichever comes
-    /// first - never longer than `remaining`, and never a busy loop either way
+    /// first - never past `deadline`, and never a busy loop either way
+    ///
+    /// `deadline` rather than a remaining budget: the attempt that just failed spent some of it,
+    /// so only the deadline itself still says how long this may wait. `None` is a loop that
+    /// retries for as long as it takes.
     ///
     /// `pub(crate)`, not private: every any-node command's retry loop waits the same way between
     /// attempts, `crate::registry`'s included (ech0-media#33).
@@ -580,9 +578,12 @@ impl EzKv {
         &self,
         believed_leader: Option<u64>,
         backoff: Duration,
-        remaining: Duration,
+        deadline: Option<tokio::time::Instant>,
     ) {
-        let budget = backoff.min(remaining);
+        let budget = match deadline {
+            Some(deadline) => backoff.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            None => backoff,
+        };
         let started = tokio::time::Instant::now();
         let leader_changed = self
             .wait_metrics(

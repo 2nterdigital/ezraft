@@ -246,6 +246,64 @@ async fn not_member_on_a_node_removed_from_the_cluster() -> io::Result<()> {
     Ok(())
 }
 
+/// `NotMember` still reaches a removed node once the leader it knew is gone.
+///
+/// Nothing is replicated to a removed node any more, so its idea of who leads stops at whoever
+/// led when it was removed. With that node gone there is nobody left it knows to ask - while the
+/// one node that can say "you are not a member", the new leader, is one it has never heard of as
+/// a leader. It gets there by asking the other members it remembers, and following their hint.
+#[tokio::test(flavor = "multi_thread")]
+async fn not_member_on_a_removed_node_once_the_leader_it_knew_is_gone() -> io::Result<()> {
+    let (addr_a, a, _data_a) = founding_node().await?;
+    let (_, b, _data_b) = joined_voter(&addr_a).await?;
+    let (_, c, _data_c) = joined_voter(&addr_a).await?;
+    let (_, removed, _data_r) = joined_learner(&addr_a).await?;
+    let removed_id = removed.node_id();
+    let voters = BTreeSet::from([0, b.node_id(), c.node_id()]);
+    wait_for_voters(&a, voters, "b and c joined as voters").await?;
+    // An established member: it has replicated the membership that names it and everyone else,
+    // which is also the only address book it will ever have.
+    removed
+        .wait_metrics(
+            WAIT,
+            |m| m.membership_config.membership().nodes().count() == 4,
+            "the learner has replicated the whole membership",
+        )
+        .await?;
+
+    a.remove_node(removed_id).await.map_err(|e| io::Error::other(e.to_string()))?;
+    for node in [&b, &c] {
+        node.wait_metrics(
+            WAIT,
+            |m| m.committed_membership_config.membership().get_node(&removed_id).is_none(),
+            "both surviving voters have committed the removal",
+        )
+        .await?;
+    }
+
+    let old_leader = a.node_id();
+    a.shutdown().await?;
+    b.wait_metrics(
+        WAIT,
+        |m| matches!(m.current_leader, Some(id) if id != old_leader),
+        "the surviving voters elect a new leader",
+    )
+    .await?;
+    assert_eq!(
+        Some(old_leader),
+        removed.metrics().await.current_leader,
+        "nobody told the removed node about the new leader",
+    );
+
+    let result = removed.linearizable_view(READ_TIMEOUT).await;
+    assert!(
+        matches!(result, Err(ReadError::NotMember(id)) if id == removed_id),
+        "{result:?}"
+    );
+
+    Ok(())
+}
+
 /// `NotCaughtUp` when the follower can reach the leader for the RPC, but replication to it is
 /// cut, so its own apply can never advance to the confirmed read position.
 #[tokio::test(flavor = "multi_thread")]

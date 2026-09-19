@@ -100,7 +100,7 @@ pub(crate) fn spawn_self_registration(node: EzKv, external_addr: String, meta: B
                 }
                 Attempt::Retry(reason) => {
                     tracing::debug!(node_id, %reason, "self-registration retry");
-                    node.wait_before_next_attempt(believed_leader, backoff, round_timeout).await;
+                    node.wait_before_next_attempt(believed_leader, backoff, None).await;
                 }
             }
         }
@@ -135,7 +135,7 @@ pub(crate) async fn remove_entry(node: &EzKv, node_id: u64) {
             Attempt::Done(_) => return,
             Attempt::Retry(reason) => {
                 tracing::debug!(node_id, %reason, "registry removal retry");
-                node.wait_before_next_attempt(believed_leader, backoff, remaining).await;
+                node.wait_before_next_attempt(believed_leader, backoff, Some(deadline)).await;
             }
         }
     }
@@ -200,11 +200,11 @@ impl EzKv {
                 // - so it is not an outcome, and not worth a panic.
                 Attempt::Done(unexpected) => {
                     tracing::error!(request_id = %request_id, outcome = ?unexpected, "unexpected answer to a registry command");
-                    self.wait_before_next_attempt(believed_leader, backoff, remaining).await;
+                    self.wait_before_next_attempt(believed_leader, backoff, Some(deadline)).await;
                 }
                 Attempt::Retry(reason) => {
                     tracing::debug!(request_id = %request_id, %reason, "update_node_meta retry");
-                    self.wait_before_next_attempt(believed_leader, backoff, remaining).await;
+                    self.wait_before_next_attempt(believed_leader, backoff, Some(deadline)).await;
                 }
             }
         }

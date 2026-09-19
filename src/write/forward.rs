@@ -63,8 +63,6 @@ enum ForwardReply {
     NotLeader {
         /// The leader this node knows of instead, if any
         leader_id: Option<u64>,
-        /// That leader's address, if any
-        leader_addr: Option<String>,
     },
 }
 
@@ -87,16 +85,11 @@ async fn handle(raft: &ORRaft, kv_limits: KvLimits, ledger_capacity: usize, req:
     match propose(raft, kv_limits, ledger_capacity, req.request_id, None, req.body).await {
         Err(limit_err) => ForwardReply::LimitExceeded(limit_err),
         Ok(super::ProposeOutcome::Definite(outcome)) => ForwardReply::Outcome(outcome),
-        Ok(super::ProposeOutcome::NotLeader { leader_id, leader_addr }) => {
-            ForwardReply::NotLeader { leader_id, leader_addr }
-        }
+        Ok(super::ProposeOutcome::NotLeader { leader_id }) => ForwardReply::NotLeader { leader_id },
         // This node cannot vouch for anything right now (for instance its own engine shutting
         // down mid-propose): the honest answer is "ask someone else", exactly like naming no
         // leader at all.
-        Ok(super::ProposeOutcome::Unknown) => ForwardReply::NotLeader {
-            leader_id: None,
-            leader_addr: None,
-        },
+        Ok(super::ProposeOutcome::Unknown) => ForwardReply::NotLeader { leader_id: None },
     }
 }
 
