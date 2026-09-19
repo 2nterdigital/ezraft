@@ -130,6 +130,39 @@
   `replication_lag_threshold`，均为 `Option`：不设则随 `snapshot_interval` 推导（`/5` 与等于 interval），只改
   interval 不会得到不一致的组合；显式设置的阈值小于 interval 时启动即报错。`postcard` 转为正式依赖。
   **删除** #27 留下的过渡 JSON 快照格式 `KvExport`。
+- [#32 watch：分组变更、Reset、Progress 与视图衔接](https://github.com/2nterdigital/ech0-media/issues/32)：
+  新增 `src/watch.rs` + `src/watch/`：`EzKv::watch(prefix, Now | After(rev))` 与原子的
+  `EzKv::view_and_watch(prefix)`，返回 `futures::Stream` 形式的 `WatchStream`，按 revision 严格递增产出
+  `WatchUpdate::Changes`（一个写事务过滤到前缀后的一组变更，按 op 顺序，删除项带旧值）、
+  `Reset { view, cause }`、`Progress { revision }`。watch hub 位于唯一的 `Publisher` 内部：**追加到保留窗口、
+  投递给各订阅者、替换视图在同一个临界区完成，注册订阅也取同一把锁**，因此"视图 + 其后的一切"无缺口、无重复；
+  发布路径不 `.await`、不等待任何消费者。保留窗口是 `imbl::Vector`（组数与字节双上限，不进快照、不复制），
+  新订阅者在锁内 O(1) 复制、锁外过滤；每个成功事务都有一组（可为空），窗口覆盖连续的 revision 区间；重启后窗口
+  为空，下限为启动时状态的 revision。**不发 Reset 即无缺口**：续订位置早于窗口下限（`ResumeTooOld`）、订阅者
+  有界队列溢出（`SubscriberTooSlow`，积压被一条携带最新视图的 Reset 取代）、本节点安装快照
+  （`SnapshotInstalled`）时先发 Reset；`After(rev)` 指向尚未到达的 revision 时等待。`Progress` 与 `Changes`
+  走同一有序队列、同一把锁，按订阅者限速，保证不会早于 revision 不大于它的 `Changes`，且 revision 停止推进后
+  仍会送达。节点 `shutdown()` 后流在交付已有内容后结束（`None`），不会永久挂起。`EzConfig` 新增
+  `watch_limits`（默认 10000 组 / 64 MiB / 队列 1024 / 1 秒，待 #36 实测）。每次 Reset 有结构化 `tracing`
+  日志。新增 `tests/watch.rs`、`watch_reset.rs`、`watch_progress.rs`、`watch_resume.rs`、`watch_restart.rs`。
+- [#30 任意节点写入：转发、同请求 id 重试与幂等](https://github.com/2nterdigital/ech0-media/issues/30)：
+  `write(txn)` 在任意节点可用：发起节点先校验上限、分配请求 id（新增公开类型 `RequestId`，ULID），是 leader 则
+  本地提议，否则经内部 RPC `ez.write`（`src/write/forward.rs`）转发给 leader；遇到 `ForwardToLeader`
+  （带或不带 leader）、远端非 leader、连接失败、RPC 超时、响应丢失、暂无 leader，都用**同一请求 id** 重试
+  （等换主或短退避，不空转），直到 `EzConfig::write_deadline`（10 s）；仍无定论返回
+  `Indeterminate { request_id }`，`write_with_id(request_id, txn)` 在账本窗口内返回第一次的真实结果。
+  Raft 日志命令改为 `Command { request_id, ledger_capacity, body }`，后续内部命令（#33 注册表）复用同一套
+  转发、重试与幂等机制。幂等账本 `Ledger`（`src/kv/ledger.rs`）记录"请求 id → 第一次的真实结果（成功或
+  冲突）"，存于 `InternalState` 并进快照（v1 布局原地扩展）；`apply` 执行前先查账本，命中则原样返回、不推进
+  revision、不产生变更组；按条数先进先出淘汰，**阈值取自提议的 leader 戳进命令里的 `ledger_capacity`
+  （默认 100000），绝不读应用节点自己的配置——淘汰是日志的纯函数**。成功后 `write` 等本节点已发布 revision
+  追上才返回（由发布事件唤醒，不轮询），否则返回 `LocalLag { revision }`；冲突返回前尽力等本地视图追到
+  `current_mod_rev`；新增 `wait_revision(rev, timeout)`。leader 本地提议同样受总时限约束（openraft 的
+  `client_write` 自身不超时，被隔离而租约尚在的 leader 否则会无限等待）。`WriteError::NotLeader` 从公开写入
+  API 移除；`LimitError` 增加 serde 派生以便经 RPC 回传。重试、`Indeterminate`、`LocalLag` 有结构化
+  `tracing` 日志。新增依赖 `ulid`，`imbl` 启用 `serde`。`/api/write`、`/api/read` 已于 #27 删除（确认）。
+  `tests/crash_recovery.rs` 改为经从不崩溃的那个 voter 写入（依赖同请求 id 重试跨越 leader 崩溃）。新增
+  `tests/write_forward.rs`、`tests/idempotency.rs`。
 
 ## 验证命令
 
