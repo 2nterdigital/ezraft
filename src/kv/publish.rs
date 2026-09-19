@@ -11,8 +11,10 @@
 //! ech0-media#32): the hub's own lock is what makes "swap the view, append to the retained window,
 //! hand the group to every subscriber" one atomic step, so a `watch`/`view_and_watch` registration
 //! can never land between a transaction's view becoming visible and its group reaching the window.
-//! [`Publisher`] itself stays the single source both sides read from - the hub never gets its own,
-//! separately-updated copy of "the current view" to disagree with what [`ViewReceiver`] answers.
+//! [`Publisher`] itself stays the single source both sides read from. The hub does keep the view
+//! it was last handed, for the one task of its own that has no sender to read (rate-limited
+//! `Progress`) - written under that same lock, in the same step as the sender, so it can never
+//! disagree with what [`ViewReceiver`] answers.
 
 use tokio::sync::watch;
 
