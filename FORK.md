@@ -53,6 +53,22 @@
   `truncate_after` 在截断点超出日志末尾时把 `last_log_id` 推过了实际存储位置）。进程内集群测试与示例全部改用
   `RedbStorage`（临时目录）。**删除**原版样例文件存储 `FileStorage`（`src/storage/file_storage.rs`）及其
   专属测试，以及只有它用到的 tokio `fs`/`io-util` feature。
+- [#27 EzKv 核心：条件事务、revision 与本地视图（leader 上写入）](https://github.com/2nterdigital/ech0-media/issues/27)：
+  分两步合入。**(a)** 新增纯状态机库 `src/kv/`：`Txn { conditions, ops }` 全有或全无（条件针对事务前状态
+  按序求值，首个失败者连同该 key 当前 `mod_rev` 作为 `Conflict` 返回）；KV 自有的 `revision`，条件成立的事务
+  一律加一；每个 key 带 `create_rev`/`mod_rev`；`apply` 同时产出按 op 顺序排列、删除项带旧值的变更组；状态存于
+  `imbl::OrdMap`，`View`（`revision`/`get`/`get_many`/`prefix`/`page`）是 O(1) 的不可变快照；大小上限由
+  `Txn::validate` 检查、**绝不在 `apply` 内检查**（各节点配置不同也不会使副本分叉）；value 为 `Bytes`，
+  在 JSON 中编码为 base64、在二进制格式中为原始字节。**(b)** 节点唯一的状态机换成该 KV：crate 去掉
+  `T: EzApp` 类型参数（类型配置、`EzEntry`、`Persist`、`EzStorage`、`RedbStorage`、适配层、网络、服务端），
+  Raft 日志请求为 crate 内部枚举 `Command`，回执只带 revision；公开句柄由 `EzRaft<T>` 改为 **`EzKv`**，
+  新增 `write(txn)`（先校验上限、只在本节点提议；返回 revision / `Conflict` / `NotLeader`；本节点是 leader
+  但租约未生效时在约一个选举超时内原地重试）与无锁的 `view()`；适配层持有唯一的 `Publisher`，
+  **先发布视图与变更组、再回复写入方**，安装快照后同样发布；`EzConfig` 新增 `kv_limits`；`shutdown()`
+  现在同时停止 HTTP 服务并等监听关闭，同进程内重启的节点可在原地址重新上线。快照暂为 JSON 导出，由 #28 替换。
+  **删除**（类型不复存在，故先于原定票删除）：`EzApp` 与 `src/app.rs`；`POST /api/write`、`POST /api/read`
+  与 `forward_write`（原定 #30）；`timestamp_oracle` 示例及其测试（原定 #34）；测试工具里的样例应用。
+  kvstore 示例最小化迁移到 `EzKv`（完整改写见 #35）。新增验收测试 `tests/kv_txn.rs`、`tests/kv_view.rs`。
 
 ## 验证命令
 
