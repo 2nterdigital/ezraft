@@ -11,7 +11,7 @@ use serde::Serialize;
 /// nothing, because it never waits for them.
 ///
 /// A node always *enters* a cluster as a learner, whichever role it is headed for. See
-/// [`EzRaft::join`](crate::EzRaft::join) for why that is forced rather than chosen.
+/// [`EzKv::join`](crate::EzKv::join) for why that is forced rather than chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum NodeRole {
     /// Replicates the log and answers reads, without voting

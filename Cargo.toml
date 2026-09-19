@@ -66,7 +66,6 @@ tokio       = { version = "1.39", default-features = false, features = ["macros"
 fault-injection = []
 
 [dev-dependencies]
-chrono             = { version = "0.4" }
 clap               = { version = "4.1.11", features = ["derive", "env"] }
 ezraft             = { path = ".", features = ["fault-injection"] }
 # Proves the KV vocabulary round-trips through a positional format; becomes a normal dependency
@@ -82,17 +81,9 @@ tracing-subscriber = { version = "0.3.3", features = ["env-filter"] }
 name = "kvstore"
 path = "examples/kvstore.rs"
 
-[[example]]
-name = "timestamp_oracle"
-path = "examples/timestamp_oracle.rs"
-
 [[test]]
 name = "kvstore_example"
 path = "examples/kvstore_test.rs"
-
-[[test]]
-name = "timestamp_oracle_example"
-path = "examples/timestamp_oracle_test.rs"
 
 [profile.release]
 debug = 2

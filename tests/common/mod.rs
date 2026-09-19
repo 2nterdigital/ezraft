@@ -1,8 +1,8 @@
-//! The harness these cluster tests share: a KV application, storage that survives a
-//! node instance, and the waits that make cluster state assertable.
+//! The harness these cluster tests share: a node fixture that owns its temp directory, and the
+//! waits that make cluster and KV state assertable.
 //!
-//! Each file under `tests/` is its own binary and uses a subset of this, so unused
-//! items here are expected rather than dead.
+//! Each file under `tests/` is its own binary and uses a subset of this, so unused items here
+//! are expected rather than dead.
 
 #![allow(dead_code)]
 
@@ -10,117 +10,78 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use ezraft::EzApp;
 use ezraft::EzConfig;
-use ezraft::EzRaft;
+use ezraft::EzKv;
+use ezraft::KeyValue;
 use ezraft::RedbStorage;
-use serde::Deserialize;
-use serde::Serialize;
+use ezraft::Txn;
+use ezraft::View;
+use ezraft::WriteError;
 
-#[derive(Serialize, Deserialize, Debug, Clone, derive_more::Display)]
-pub enum Request {
-    #[display("Set({key})")]
-    Set { key: String, value: String },
-    #[display("Get({key})")]
-    Get { key: String },
+/// A `Put` on `key` = `value`, the shape almost every test's transaction is
+pub fn set(key: &str, value: &str) -> Txn {
+    Txn::new().put(key.to_string(), value.to_string())
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct Response {
-    pub value: Option<String>,
+/// A `KeyValue`'s value decoded as UTF-8 text (lossily) - every value these tests write is
+/// plain text, so this is the common case when reading one back.
+pub fn text(kv: &KeyValue) -> String {
+    String::from_utf8_lossy(&kv.value).into_owned()
 }
 
-pub fn set(key: &str, value: &str) -> Request {
-    Request::Set {
-        key: key.into(),
-        value: value.into(),
-    }
+/// Every key and value currently in `view`, decoded as UTF-8 text - the shape `expected_map`
+/// compares against
+pub fn view_map(view: &View) -> BTreeMap<String, String> {
+    view.prefix("")
+        .map(|kv| {
+            let value = text(&kv);
+            (kv.key, value)
+        })
+        .collect()
 }
 
-pub fn get(key: &str) -> Request {
-    Request::Get { key: key.into() }
+pub fn expected_map(range: std::ops::Range<u32>) -> BTreeMap<String, String> {
+    range.map(|i| (format!("k{}", i), format!("v{}", i))).collect()
 }
 
-/// KV app; the framework owns the value, so tests read the applied state
-/// back through `EzRaft::read` to compare the whole state instead of
-/// sampling it key by key.
-#[derive(Default, Serialize, Deserialize)]
-pub struct KvSm {
-    pub data: BTreeMap<String, String>,
-
-    /// Which bucket of `APPLIED` this state records its applies in, empty unless a test asked
-    /// for them. Part of the serialized state, so it survives a snapshot restore and a restart
-    /// and replayed applies land in the same bucket as the originals.
-    #[serde(default)]
-    tag: String,
-}
-
-/// Every `apply` this process ran, in order, per tag
-static APPLIED: Mutex<BTreeMap<String, Vec<String>>> = Mutex::new(BTreeMap::new());
-
-pub fn tagged(tag: &str) -> KvSm {
-    KvSm {
-        tag: tag.into(),
-        ..KvSm::default()
-    }
-}
-
-pub fn applied(tag: &str) -> Vec<String> {
-    APPLIED.lock().unwrap().get(tag).cloned().unwrap_or_default()
-}
-
-#[async_trait]
-impl EzApp for KvSm {
-    type Request = Request;
-    type Response = Response;
-
-    async fn apply(&mut self, req: Request) -> Response {
-        if !self.tag.is_empty() {
-            APPLIED.lock().unwrap().entry(self.tag.clone()).or_default().push(req.to_string());
-        }
-
-        match req {
-            Request::Set { key, value } => {
-                self.data.insert(key, value);
-                Response { value: None }
-            }
-            Request::Get { key } => Response {
-                value: self.data.get(&key).cloned(),
-            },
-        }
-    }
-
-    type ReadRequest = String;
-    type ReadResponse = Option<String>;
-
-    fn read(&self, key: String) -> Option<String> {
-        self.data.get(&key).cloned()
-    }
-}
-
-/// A fresh temp directory for one node's redb file, kept on disk rather than deleted on drop:
-/// a restart test shuts a node down, drops it, and opens [`RedbStorage`] again on this same
-/// path, which redb allows only once the previous `Database` is fully closed. `TempDir::keep`
-/// hands back the bare path so callers that never restart do not have to carry a guard around;
-/// leftover directories are cleaned up the same way `examples/harness.rs` leaves failed runs
-/// behind, by the OS's own temp directory housekeeping.
-pub fn node_data_path() -> PathBuf {
-    tempfile::tempdir().expect("temp dir for a node's redb file").keep().join("node.redb")
-}
-
-/// Storage for a fresh node: a redb file under its own temp directory.
+/// A node's own temp directory for its redb file, owned for the fixture's lifetime
 ///
-/// Restart tests that need to reopen the same file after shutdown call
-/// `RedbStorage::open(&path)` directly with a path from [`node_data_path`] they kept.
-pub async fn node_storage() -> io::Result<RedbStorage> {
-    RedbStorage::open(node_data_path()).await
+/// Kept alive by whoever holds the fixture - a `let` binding for the length of the test is
+/// enough - and deleted when it drops, so a passing run leaves nothing behind (the debt
+/// `tests/common::node_data_path()` used to leave: it called `TempDir::keep()` and never deleted
+/// anything). A restart test keeps one `NodeData` alive across the shutdown and calls
+/// [`Self::open`] again to reopen the same file.
+pub struct NodeData {
+    dir: tempfile::TempDir,
 }
 
-/// Grab a free port; the listener is dropped so EzRaft can bind it.
+impl Default for NodeData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NodeData {
+    pub fn new() -> Self {
+        Self {
+            dir: tempfile::tempdir().expect("temp dir for a node's redb file"),
+        }
+    }
+
+    /// This fixture's redb file path, stable for its whole lifetime
+    pub fn path(&self) -> PathBuf {
+        self.dir.path().join("node.redb")
+    }
+
+    /// Open (or reopen) this fixture's redb file
+    pub async fn open(&self) -> io::Result<RedbStorage> {
+        RedbStorage::open(self.path()).await
+    }
+}
+
+/// Grab a free port; the listener is dropped so `EzKv` can bind it.
 pub fn free_addr() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().to_string()
@@ -137,62 +98,74 @@ pub fn config() -> EzConfig {
 /// Upper bound for every cluster-state wait in these tests
 pub const WAIT: Option<Duration> = Some(Duration::from_secs(30));
 
-pub fn expected_map(range: std::ops::Range<u32>) -> BTreeMap<String, String> {
-    range.map(|i| (format!("k{}", i), format!("v{}", i))).collect()
-}
+/// How often a polling wait re-checks its condition
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Write through a node's HTTP API, whichever node it is.
+/// Write `txn` through whichever of `nodes` currently leads
 ///
-/// `EzRaft::write` only writes where it is called and fails elsewhere with
-/// `ForwardToLeader`; finding the leader belongs to the server layer, and this
-/// is the path that exercises it. So any test that does not know which node
-/// leads - after a failover, a transfer, or a demotion - writes through here.
-///
-/// A write refused for want of a leader lease is retried. openraft alpha.33 accepts a write only
-/// while the leader holds a lease acknowledged by a quorum, and a leader has none for a moment
-/// after it is elected or after the voter set changes under it: it answers with a
-/// `ForwardToLeader` naming nobody, which the sample `/api/write` handler passes on as a 500.
-/// That moment ends with the next heartbeat round, so it is waited out here rather than failing
-/// whichever test happens to write during it.
-pub async fn http_write(addr: &str, req: Request) -> io::Result<Response> {
-    const NO_LEASE_YET: &str = "has to forward request to: None";
-
-    let client = reqwest::Client::new();
+/// `EzKv::write` only succeeds on the leader - forwarding is ech0-media#30 - and answers
+/// [`WriteError::NotLeader`] everywhere else, including briefly right after an election or a
+/// membership change while the new leader's lease is not yet valid (openraft alpha.33, see
+/// OPENRAFT-A33.md §3; `EzKv::write` itself already waits out that particular gap on the node
+/// that is about to lead). This is the harness's replacement for the old `/api/write`-based
+/// "write through whoever leads, whichever node that is": it retries every handle in turn until
+/// one accepts the write or the wait budget runs out.
+pub async fn write_through_leader(nodes: &[&EzKv], txn: Txn) -> io::Result<u64> {
     let deadline = tokio::time::Instant::now() + WAIT.expect("cluster waits are bounded");
 
     loop {
-        let resp = client
-            .post(format!("http://{}/api/write", addr))
-            .json(&req)
-            .send()
-            .await
-            .map_err(io::Error::other)?;
-
-        let status = resp.status();
-        let text = resp.text().await.map_err(io::Error::other)?;
-
-        if !status.is_success() && text.contains(NO_LEASE_YET) && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            continue;
+        for node in nodes {
+            match node.write(txn.clone()).await {
+                Ok(revision) => return Ok(revision),
+                Err(WriteError::NotLeader(_)) => continue,
+                Err(e) => return Err(io::Error::other(e.to_string())),
+            }
         }
 
-        assert!(status.is_success(), "POST /api/write responded {}: {}", status, text);
+        if tokio::time::Instant::now() >= deadline {
+            return Err(io::Error::other("no node accepted the write within the wait budget"));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
 
-        return Ok(serde_json::from_str(&text)?);
+/// Wait until `node`'s local view has reached at least `revision`, and return that view
+pub async fn wait_for_revision(node: &EzKv, revision: u64) -> io::Result<View> {
+    let deadline = tokio::time::Instant::now() + WAIT.expect("cluster waits are bounded");
+
+    loop {
+        let view = node.view();
+        if view.revision() >= revision {
+            return Ok(view);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "node {} never reached revision {} (stuck at {})",
+                node.node_id(),
+                revision,
+                view.revision()
+            )));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
 /// Serve a node in the background, which is also where a join's promotion is
 /// collected - a joined node reaches the voter set only once this is running.
-pub fn spawn_serve(node: &EzRaft<KvSm>) {
+pub fn spawn_serve(node: &EzKv) {
     let node = node.clone();
     tokio::spawn(async move { node.serve().await });
 }
 
-/// A founding node, serving and leading.
-pub async fn founding_node() -> io::Result<(String, EzRaft<KvSm>)> {
+/// Build a node from `config`: the founding member of a new cluster
+///
+/// The one way every node-building helper in this harness bottoms out in a config; the fault
+/// handle a `fault-injection` test needs is just a field on it
+/// (`tests/common/faults.rs::config_with_faults`).
+pub async fn founding_node_with(config: EzConfig) -> io::Result<(String, EzKv, NodeData)> {
     let addr = free_addr();
-    let node = EzRaft::create(&addr, KvSm::default(), node_storage().await?, config()).await?;
+    let data = NodeData::new();
+    let node = EzKv::create(&addr, data.open().await?, config).await?;
     spawn_serve(&node);
 
     // Leading is not enough. `create` writes the founding membership and winning the election
@@ -204,24 +177,42 @@ pub async fn founding_node() -> io::Result<(String, EzRaft<KvSm>)> {
         "founding node leads, with its own membership committed",
     )
     .await?;
-    Ok((addr, node))
+    Ok((addr, node, data))
 }
 
-/// A node that joined asking to be a voter, serving. Returns before the
-/// promotion lands, so callers wait on the voter set.
-pub async fn joined_voter(seed: &str) -> io::Result<(String, EzRaft<KvSm>)> {
-    let addr = free_addr();
-    let node = EzRaft::join(&addr, seed, KvSm::default(), node_storage().await?, config()).await?;
-    spawn_serve(&node);
-    Ok((addr, node))
+/// A founding node, serving and leading, with the harness's usual short-heartbeat config
+pub async fn founding_node() -> io::Result<(String, EzKv, NodeData)> {
+    founding_node_with(config()).await
 }
 
-/// A node that joined as a learner, serving.
-pub async fn joined_learner(seed: &str) -> io::Result<(String, EzRaft<KvSm>)> {
+/// A node that joined asking to be a voter, serving, built with an explicit config
+///
+/// Returns before the promotion lands, so callers wait on the voter set.
+pub async fn joined_voter_with(seed: &str, config: EzConfig) -> io::Result<(String, EzKv, NodeData)> {
     let addr = free_addr();
-    let node = EzRaft::join_as_learner(&addr, seed, KvSm::default(), node_storage().await?, config()).await?;
+    let data = NodeData::new();
+    let node = EzKv::join(&addr, seed, data.open().await?, config).await?;
     spawn_serve(&node);
-    Ok((addr, node))
+    Ok((addr, node, data))
+}
+
+/// A node that joined asking to be a voter, serving, with the harness's usual config
+pub async fn joined_voter(seed: &str) -> io::Result<(String, EzKv, NodeData)> {
+    joined_voter_with(seed, config()).await
+}
+
+/// A node that joined as a learner, serving, built with an explicit config
+pub async fn joined_learner_with(seed: &str, config: EzConfig) -> io::Result<(String, EzKv, NodeData)> {
+    let addr = free_addr();
+    let data = NodeData::new();
+    let node = EzKv::join_as_learner(&addr, seed, data.open().await?, config).await?;
+    spawn_serve(&node);
+    Ok((addr, node, data))
+}
+
+/// A node that joined as a learner, serving, with the harness's usual config
+pub async fn joined_learner(seed: &str) -> io::Result<(String, EzKv, NodeData)> {
+    joined_learner_with(seed, config()).await
 }
 
 /// Wait until `node` has *committed* exactly `voters`, as a uniform config.
@@ -230,7 +221,7 @@ pub async fn joined_learner(seed: &str) -> io::Result<(String, EzRaft<KvSm>)> {
 /// flight, and the next one a test asks for is refused while it is. Uniform,
 /// not joint: a joint config still counts the old voter set, so a test that
 /// killed a node on the strength of it would be racing.
-pub async fn wait_for_voters(node: &EzRaft<KvSm>, voters: BTreeSet<u64>, reason: &str) -> io::Result<()> {
+pub async fn wait_for_voters(node: &EzKv, voters: BTreeSet<u64>, reason: &str) -> io::Result<()> {
     node.wait_metrics(
         WAIT,
         |m| *m.committed_membership_config.membership().get_joint_config() == [voters.clone()],
@@ -245,7 +236,7 @@ pub async fn wait_for_voters(node: &EzRaft<KvSm>, voters: BTreeSet<u64>, reason:
 /// Anchored to the leader's index, because a node that has replicated nothing
 /// has its own `last_applied` and `last_log_index` both unset, and comparing
 /// those two would pass instantly.
-pub async fn wait_for_applied(node: &EzRaft<KvSm>, leader: &EzRaft<KvSm>) -> io::Result<()> {
+pub async fn wait_for_applied(node: &EzKv, leader: &EzKv) -> io::Result<()> {
     let target = leader.metrics().await.last_log_index.expect("the leader has written entries");
     node.wait_metrics(
         WAIT,

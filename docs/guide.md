@@ -1,5 +1,10 @@
 # EzRaft Guide
 
+> **Out of date.** This guide still describes the original `EzApp`/`EzRaft` API.
+> ech0-media#27 replaced it with the built-in `EzKv` model; ech0-media#37 rewrites this
+> guide for it. Until then, see the [README](../README.md) and `examples/kvstore.rs` for
+> the current API.
+
 Running a cluster, writing a service against it, and the API and endpoints that
 make it up. The [README](../README.md) is the short version.
 

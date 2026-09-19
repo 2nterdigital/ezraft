@@ -2,7 +2,7 @@
 //!
 //! A [`Txn`] evaluates its [`Condition`]s against the state before the transaction and, only if
 //! every one holds, applies its [`Op`]s in order. Evaluating conditions and applying ops is
-//! `KvState::apply`'s job (crate-internal until ech0-media#27b); this module owns the request
+//! `KvState::apply`'s job (crate-internal); this module owns the request
 //! shape, the result of a failed evaluation ([`Conflict`]), and the size limits ([`KvLimits`]) a
 //! caller checks before ever proposing the transaction.
 
@@ -126,12 +126,10 @@ impl Txn {
 
     /// Check this transaction against `limits`, without touching any state
     ///
-    /// This is a separate, explicit step from `KvState::apply` (crate-internal until
-    /// ech0-media#27b wires it in), which never validates limits itself: nodes may run with
-    /// different configured limits (`EzConfig` is per-node), so checking inside `apply` would let
-    /// that difference make replicas diverge.
-    /// Every call site that can propose a transaction - the node a write arrives on, and again the
-    /// leader before it enters the log - calls `validate` itself.
+    /// This is a separate, explicit step from `KvState::apply` (crate-internal), which never
+    /// validates limits itself: nodes may run with different configured limits (`EzConfig` is
+    /// per-node), so checking inside `apply` would let that difference make replicas diverge.
+    /// `EzKv::write` calls this itself before ever proposing a transaction.
     ///
     /// Checks, in order: the op count, then each condition's and op's key (and each `Put`'s
     /// value) against the per-item limits, accumulating the transaction's total size; finally the
@@ -234,7 +232,7 @@ impl std::fmt::Display for Txn {
 /// Size and count limits a [`Txn`] is checked against before it is proposed
 ///
 /// Defaults match ech0-media#27's spec; they are provisional until benchmarked
-/// (ech0-media#36) and become configurable through `EzConfig` in ech0-media#27b.
+/// (ech0-media#36) and configurable through `EzConfig::kv_limits`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvLimits {
     /// Maximum size of a single key, in bytes. Default: 1 KiB.

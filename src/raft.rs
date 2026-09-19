@@ -1,6 +1,9 @@
-//! Main EzRaft API
+//! The node handle: `EzKv`
 //!
-//! This module provides the primary [`EzRaft`] struct that users interact with.
+//! This module provides the primary [`EzKv`] struct users interact with: cluster lifecycle
+//! (`create`/`join`/`join_as_learner`/`serve`/`shutdown`), membership, metrics and the local
+//! view. The write path lives in `crate::write` (a second `impl EzKv` block), kept separate so
+//! this file stays about lifecycle and membership as it grows.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -9,6 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use actix_web::dev::ServerHandle;
 use openraft::BasicNode;
 use openraft::ChangeMembers;
 use openraft::Raft;
@@ -21,9 +25,11 @@ use tokio::task::JoinHandle;
 
 use crate::admin::AdminClient;
 use crate::admin::MembershipChange;
-use crate::app::EzApp;
 use crate::config::EzConfig;
 use crate::entry::EzLogId;
+use crate::kv::KvLimits;
+use crate::kv::View;
+use crate::kv::ViewReceiver;
 use crate::network::EzNetworkFactory;
 use crate::node_role::NodeRole;
 use crate::storage::EzStorage;
@@ -31,31 +37,22 @@ use crate::storage::adapter::StateMachineStore;
 use crate::storage::adapter::open;
 use crate::type_config::OpenRaftTypes;
 
-/// Type alias for OpenRaft types (more readable than `OpenRaftTypes<T>`)
-type ORTypes<T> = OpenRaftTypes<T>;
+/// The internal OpenRaft instance, with the KV state machine behind it
+pub type ORRaft = Raft<OpenRaftTypes, StateMachineStore>;
 
-/// The internal OpenRaft instance, with EzRaft's state machine behind it
-///
-/// Only the state machine appears in the type: openraft carries it as a parameter because the
-/// snapshot builder is bound to it, while the log store is passed to `Raft::new` and kept
-/// behind the scenes.
-pub type ORRaft<T> = Raft<ORTypes<T>, StateMachineStore<T>>;
-
-/// A promotion in flight, handed from [`EzRaft::join`] to [`EzRaft::serve`]
+/// A promotion in flight, handed from [`EzKv::join`] to [`EzKv::serve`]
 type Promotion = Arc<Mutex<Option<JoinHandle<Result<(), io::Error>>>>>;
 
-/// EzRaft - A simplified Raft interface
+/// The HTTP server handle [`EzKv::serve_with`] hands to [`EzKv::shutdown`]
 ///
-/// This struct wraps OpenRaft's `Raft` and provides a simplified API.
-/// Users create an instance with their app and storage, then call
-/// methods to initialize the cluster, write data, and serve HTTP requests.
+/// Set once `serve`/`serve_with` has bound the node's address, and taken by `shutdown` so a node
+/// stopped that way releases the address again (wave S1 left this gap: see `FORK.md`).
+type ServeHandle = Arc<Mutex<Option<ServerHandle>>>;
+
+/// The node handle: create or join a cluster, serve it, and read and write its replicated KV
 ///
-/// # Type Parameters
-///
-/// - `T`: The application (implements `EzApp`)
-pub struct EzRaft<T>
-where T: EzApp
-{
+/// `Clone` is cheap: every clone shares the same underlying Raft node.
+pub struct EzKv {
     /// Node ID
     node_id: u64,
 
@@ -63,32 +60,40 @@ where T: EzApp
     addr: String,
 
     /// Internal OpenRaft instance
-    raft: ORRaft<T>,
+    raft: ORRaft,
 
     /// The promotion [`Self::join`] started, for [`Self::serve`] to finish
     ///
-    /// Shared and taken rather than owned, because [`EzRaft`] is cloned freely and only the one
+    /// Shared and taken rather than owned, because [`EzKv`] is cloned freely and only the one
     /// call to `serve` may await it. `None` once taken, and for a node that never asked to be
     /// promoted.
     promotion: Promotion,
+
+    /// A lock-free reader onto the KV's latest published view (DESIGN.md §5)
+    view_rx: ViewReceiver,
+
+    /// The limits [`crate::write`] checks a transaction against before proposing it
+    kv_limits: KvLimits,
+
+    /// The actix `ServerHandle` for the address `serve`/`serve_with` bound, once bound
+    serve_handle: ServeHandle,
 }
 
-impl<T> Clone for EzRaft<T>
-where T: EzApp
-{
+impl Clone for EzKv {
     fn clone(&self) -> Self {
         Self {
             node_id: self.node_id,
             addr: self.addr.clone(),
             raft: self.raft.clone(),
             promotion: self.promotion.clone(),
+            view_rx: self.view_rx.clone(),
+            kv_limits: self.kv_limits,
+            serve_handle: self.serve_handle.clone(),
         }
     }
 }
 
-impl<T> EzRaft<T>
-where T: EzApp
-{
+impl EzKv {
     /// Start a new cluster with this node as its only member
     ///
     /// Exactly one node of a cluster is created this way; every other node uses [`Self::join`].
@@ -97,22 +102,14 @@ where T: EzApp
     /// # Arguments
     ///
     /// * `http_addr` - Address to bind HTTP server (e.g., "127.0.0.1:8080")
-    /// * `app` - User's application (state machine)
-    /// * `storage` - User's storage implementation
-    /// * `config` - EzRaft configuration (use `EzConfig::default()` for sensible defaults)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let raft = EzRaft::create("127.0.0.1:8080", app, storage, config).await?;
-    /// ```
+    /// * `storage` - This node's storage
+    /// * `config` - configuration (use `EzConfig::default()` for sensible defaults)
     pub async fn create(
         http_addr: impl ToString,
-        app: T,
-        storage: impl EzStorage<T>,
+        storage: impl EzStorage,
         config: EzConfig,
     ) -> Result<Self, io::Error> {
-        Self::new(http_addr, app, storage, config, None).await
+        Self::new(http_addr, storage, config, None).await
     }
 
     /// Join the cluster that `seed_addr` belongs to, and stay a learner
@@ -123,13 +120,11 @@ where T: EzApp
     pub async fn join_as_learner(
         http_addr: impl ToString,
         seed_addr: impl ToString,
-        app: T,
-        storage: impl EzStorage<T>,
+        storage: impl EzStorage,
         config: EzConfig,
     ) -> Result<Self, io::Error> {
         Self::new(
             http_addr,
-            app,
             storage,
             config,
             Some((seed_addr.to_string(), NodeRole::Learner)),
@@ -162,25 +157,16 @@ where T: EzApp
     ///
     /// * `http_addr` - Address to bind HTTP server (e.g., "127.0.0.1:8081")
     /// * `seed_addr` - Address of any node already in the cluster
-    /// * `app` - User's application (state machine)
-    /// * `storage` - User's storage implementation
-    /// * `config` - EzRaft configuration (use `EzConfig::default()` for sensible defaults)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let raft = EzRaft::join("127.0.0.1:8081", "127.0.0.1:8080", app, storage, config).await?;
-    /// ```
+    /// * `storage` - This node's storage
+    /// * `config` - configuration (use `EzConfig::default()` for sensible defaults)
     pub async fn join(
         http_addr: impl ToString,
         seed_addr: impl ToString,
-        app: T,
-        storage: impl EzStorage<T>,
+        storage: impl EzStorage,
         config: EzConfig,
     ) -> Result<Self, io::Error> {
         Self::new(
             http_addr,
-            app,
             storage,
             config,
             Some((seed_addr.to_string(), NodeRole::Voter)),
@@ -190,8 +176,7 @@ where T: EzApp
 
     async fn new(
         http_addr: impl ToString,
-        app: T,
-        storage: impl EzStorage<T>,
+        storage: impl EzStorage,
         config: EzConfig,
         seed: Option<(String, NodeRole)>,
     ) -> Result<Self, io::Error> {
@@ -202,9 +187,11 @@ where T: EzApp
         // cluster's membership. A configuration this node cannot run with must not first cost the
         // cluster a learner that then has to be removed by hand.
         let raft_config = Arc::new(config.to_raft_config()?);
+        let kv_limits = config.kv_limits;
 
         // Open user storage as the two stores openraft asks for
-        let (log, sm) = open(storage, app).await?;
+        let (log, sm) = open(storage).await?;
+        let view_rx = sm.subscribe_view();
 
         // Determine node_id, and whether a promotion has to follow. A node that already has an id
         // has joined before, so neither the seed nor the promotion applies to it again: what it
@@ -279,87 +266,43 @@ where T: EzApp
             addr: http_addr,
             raft,
             promotion: Arc::new(Mutex::new(promotion)),
+            view_rx,
+            kv_limits,
+            serve_handle: Arc::new(Mutex::new(None)),
         })
     }
 
-    /// Write a request to the Raft log
-    ///
-    /// This proposes a client request to the Raft cluster.
-    /// The request will be replicated and applied to the state machine once committed.
-    ///
-    /// Only a leader can accept a write, and this does not go looking for one: on a follower it
-    /// fails with openraft's `ForwardToLeader`, naming the node to ask. Reaching that node is a
-    /// transport question, so it is answered where the transport lives - `POST /api/write` takes
-    /// a write on any node and forwards it, which is what a client should talk to.
-    ///
-    /// An error does not mean the request was not applied. The entry may be committed and the
-    /// answer lost on the way back, and no caller can tell that apart from a write that never
-    /// happened. Writes are therefore at-least-once: retrying one whose answer never arrived may
-    /// apply it twice. Deduplication has to live in replicated state to survive a leader change,
-    /// which puts it in [`EzApp::apply`] - make it idempotent, or carry a request id in the
-    /// request type and ignore ids the state has already seen.
-    ///
-    /// # Arguments
-    ///
-    /// * `req` - User's request type
-    ///
-    /// # Returns
-    ///
-    /// The response from the state machine's `apply()` method
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let req = Request::Set { key: "foo".into(), value: "bar".into() };
-    /// let resp = raft.write(req).await?;
-    /// ```
-    pub async fn write(&self, req: T::Request) -> Result<T::Response, io::Error> {
-        let resp = self.raft.client_write(req).await.map_err(|e| io::Error::other(e.to_string()))?;
-
-        // A user write is always answered with `Some` by `apply`; `None` exists only for
-        // framework-generated entries.
-        resp.data.ok_or_else(|| io::Error::other("write produced no response"))
+    /// The limits `crate::write` checks a transaction against before proposing it
+    pub(crate) fn kv_limits(&self) -> KvLimits {
+        self.kv_limits
     }
 
-    /// Read the applied state directly, without going through the log
+    /// This node's latest published view of the KV
     ///
-    /// Runs the closure over this node's applied application state and returns its result. The
-    /// read is local and cheap - no consensus round, no log entry - and therefore not
-    /// linearizable on its own: this node, leader included, may not have applied the latest
-    /// acknowledged write yet. Call [`Self::linearizable`] first when read-your-writes matters.
-    ///
-    /// The closure runs on the state machine's own task, so it must be `'static`: capture what it
-    /// needs by value. It errors only if this node has shut down.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let value = raft.read(|app| app.data.get("foo").cloned()).await?;
-    /// ```
-    pub async fn read<F, R>(&self, read: F) -> Result<R, io::Error>
-    where
-        F: FnOnce(&T) -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        self.raft.with_state_machine(|sm| Box::pin(sm.read(read))).await.map_err(io::Error::other)
+    /// Never awaits, never takes the state machine's lock, and never delays `apply` by more than
+    /// a pointer swap: it is a plain read of the value `crate::kv::Publisher` (crate-internal)
+    /// last published.
+    /// May lag the leader; on the leader itself, a [`Self::write`] that just returned is always
+    /// already reflected here (DESIGN.md §5's publish-before-reply).
+    pub fn view(&self) -> View {
+        self.view_rx.current()
     }
 
-    /// Wait until a local read would be linearizable
+    /// Wait until this node's metrics satisfy a linearizable-read barrier, returning the log id
+    /// it is anchored to
     ///
     /// Confirms this node still leads, then waits until the local state machine has applied
-    /// everything committed up to that point. A [`Self::read`] issued after this returns sees
-    /// every write acknowledged before this call.
-    ///
-    /// Only the leader can serve linearizable reads, so on a follower this returns an error
-    /// instead of forwarding: forwarding cannot make this node's local state current.
+    /// everything committed up to that point. Only the leader can serve this: on a follower it
+    /// returns an error instead of forwarding, since forwarding cannot make this node's local
+    /// state current.
     ///
     /// `policy` chooses how leadership is confirmed. [`ReadPolicy::ReadIndex`] asks a quorum and
     /// is correct whatever the clocks do; [`ReadPolicy::LeaseRead`] answers from the leader lease
     /// with no round trip, and trades that cost for the assumption that clock drift between nodes
     /// stays inside the lease.
     ///
-    /// Returns the log id the read is anchored to: its term identifies the leadership that
-    /// granted the read, which is what a caller comparing two reads across a leader change needs.
+    /// The returned log id's term identifies the leadership that granted the read, which is what
+    /// a caller comparing two reads across a leader change needs.
     pub async fn linearizable(&self, policy: ReadPolicy) -> Result<EzLogId, io::Error> {
         let read_log_id = self.raft.ensure_linearizable(policy).await.map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -481,9 +424,9 @@ where T: EzApp
     ///
     /// Reports this node's own state, which is what a caller asking "am I the leader" wants. It
     /// is not a guarantee that the answer is still true elsewhere: a deposed leader does not
-    /// find out until it hears from the new one. Nothing here needs that guarantee --
-    /// [`Self::write`] finds the leader on its own -- and code that does want a linearizable
-    /// read calls [`Self::linearizable`] first.
+    /// find out until it hears from the new one. Nothing here needs that guarantee -- writing
+    /// reports its own `NotLeader` when it matters, and code that does want a linearizable read
+    /// calls [`Self::linearizable`] first.
     pub fn is_leader(&self) -> bool {
         self.raft.is_leader()
     }
@@ -491,7 +434,7 @@ where T: EzApp
     /// Get the current cluster metrics
     ///
     /// Returns information about the Raft cluster state.
-    pub async fn metrics(&self) -> RaftMetrics<ORTypes<T>> {
+    pub async fn metrics(&self) -> RaftMetrics<OpenRaftTypes> {
         self.raft.metrics().borrow_watched().clone()
     }
 
@@ -506,9 +449,9 @@ where T: EzApp
         timeout: Option<Duration>,
         predicate: P,
         reason: &str,
-    ) -> Result<RaftMetrics<ORTypes<T>>, io::Error>
+    ) -> Result<RaftMetrics<OpenRaftTypes>, io::Error>
     where
-        P: Fn(&RaftMetrics<ORTypes<T>>) -> bool + Send,
+        P: Fn(&RaftMetrics<OpenRaftTypes>) -> bool + Send,
     {
         self.raft.wait(timeout).metrics(predicate, reason).await.map_err(io::Error::other)
     }
@@ -539,12 +482,21 @@ where T: EzApp
         self.raft.trigger().transfer_leader(node_id).await.map_err(io::Error::other)
     }
 
-    /// Stop this node's Raft engine and wait for it to finish
+    /// Stop this node's Raft engine and HTTP server, and wait for both to finish
     ///
-    /// The HTTP server started by [`Self::serve`] is separate and keeps running, so a caller
-    /// stopping a whole node stops that too.
+    /// Releases the address `serve`/`serve_with` bound: a node restarted **in the same
+    /// process** - exactly what the in-process cluster tests, and any real restart, need - can
+    /// bind it again immediately after this returns. A node with no address to answer on has no
+    /// business serving anyway. A node that never called `serve` simply has nothing to stop here.
     pub async fn shutdown(&self) -> Result<(), io::Error> {
-        self.raft.shutdown().await.map_err(io::Error::other)
+        self.raft.shutdown().await.map_err(io::Error::other)?;
+
+        let handle = self.serve_handle.lock().unwrap().take();
+        if let Some(handle) = handle {
+            handle.stop(true).await;
+        }
+
+        Ok(())
     }
 
     /// Start the HTTP server
@@ -554,7 +506,7 @@ where T: EzApp
     /// - Admin API (join, add learner, change membership, metrics)
     ///
     /// This method blocks until the server is stopped, so a caller with other work to do spawns
-    /// it: `tokio::spawn(raft.clone().serve())`. Start it as early as possible. Peers reach a
+    /// it: `tokio::spawn(node.clone().serve())`. Start it as early as possible. Peers reach a
     /// node only through this server, so a node that has joined a cluster but is not serving yet
     /// cannot be replicated to, and holds up every quorum it is counted in.
     ///
@@ -573,12 +525,15 @@ where T: EzApp
 
     /// Start the HTTP server with application-specific routes
     ///
-    /// The closure extends the bundled server with routes backed by the same EzRaft.
-    /// Standard Raft, application, and admin routes are installed first and cannot be replaced.
+    /// The closure extends the bundled server with routes backed by the same node handle.
+    /// Standard Raft and admin routes are installed first and cannot be replaced.
     pub async fn serve_with<F>(self, configure: F) -> Result<(), io::Error>
     where F: Fn(&mut actix_web::web::ServiceConfig) + Clone + Send + 'static {
         let promotion = self.promotion.lock().unwrap().take();
-        let mut server = tokio::spawn(crate::server::run_with(self, configure));
+
+        let server = crate::server::bind(self.clone(), configure)?;
+        *self.serve_handle.lock().unwrap() = Some(server.handle());
+        let mut server_task = tokio::spawn(server);
 
         if let Some(mut promotion) = promotion {
             // The two are raced rather than collected in turn. A promotion completes only once
@@ -586,7 +541,7 @@ where T: EzApp
             // waiting for the promotion first would sit on the bind error for the twenty attempts
             // and ninety seconds each that the promotion still has to spend.
             tokio::select! {
-                finished = &mut server => {
+                finished = &mut server_task => {
                     // The promotion has nothing left to wait for, and would keep asking the
                     // leader for half an hour if it were merely dropped.
                     promotion.abort();
@@ -596,14 +551,14 @@ where T: EzApp
                     if let Err(e) = promoted.map_err(io::Error::other)? {
                         // Nothing else will stop it: the caller is holding this call, not the
                         // server.
-                        server.abort();
+                        server_task.abort();
                         return Err(e);
                     }
                 }
             }
         }
 
-        server.await.map_err(io::Error::other)?
+        server_task.await.map_err(io::Error::other)?
     }
 
     /// Get the node ID
@@ -619,7 +574,7 @@ where T: EzApp
     /// Get a reference to the internal OpenRaft instance
     ///
     /// This provides access to advanced OpenRaft APIs if needed.
-    pub fn inner(&self) -> &ORRaft<T> {
+    pub fn inner(&self) -> &ORRaft {
         &self.raft
     }
 }

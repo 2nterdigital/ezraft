@@ -14,7 +14,7 @@
 //! Two membership endpoints rather than one, because taking an id is not a membership change: it
 //! is what lets a node exist, and run, before it is a member of anything. Joining is one of each
 //! and then a second membership change - take an id, enter as a learner, ask to be promoted - and
-//! [`EzRaft::join`](crate::EzRaft::join) does all three.
+//! [`EzKv::join`](crate::EzKv::join) does all three.
 
 pub mod client;
 pub mod membership_change;

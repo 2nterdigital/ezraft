@@ -1,11 +1,11 @@
 //! `EzKv`: the replicated key-value store (ech0-media#27)
 //!
-//! This module is the pure, self-contained state machine the foundation replicates: conditional
-//! transactions, revisions, consistent views and the change groups `watch` (ech0-media#32) will
-//! deliver. It has no knowledge of Raft, networking or storage - `KvState::apply` (crate-internal
-//! until ech0-media#27b wires it in) is a plain function from a transaction to a result,
-//! deterministic on every replica. Wiring it into the Raft state machine, and exposing the public
-//! `EzKv` handle, is ech0-media#27b.
+//! This module is the pure state machine the foundation replicates: conditional transactions,
+//! revisions, consistent views and the change groups `watch` (ech0-media#32) will deliver. It has
+//! no knowledge of Raft, networking or storage itself - `KvState::apply` (crate-internal) is a
+//! plain function from a transaction to a result, deterministic on every replica.
+//! `crate::storage::adapter::state_machine` wires this state machine into Raft, and
+//! [`crate::EzKv`] is the public handle onto it (`EzKv::write`, `EzKv::view`).
 //!
 //! # The model
 //!
@@ -28,24 +28,32 @@
 //!
 //! # Foundation-internal state
 //!
-//! `KvState` (crate-internal until ech0-media#27b) holds exactly the user's KV and the revision
+//! `KvState` (crate-internal, wired into the Raft state machine by
+//! `crate::storage::adapter::state_machine`) holds exactly the user's KV and the revision
 //! counter today. The idempotency ledger (ech0-media#30) and the node registry (ech0-media#33)
 //! are foundation-internal replicated state - never part of the user key space above - and belong
 //! in a sibling field next to the KV inside `KvState`, applied by the same `apply` call and folded
 //! into the same snapshot (ech0-media#28). See the note on `KvState` (`src/kv/state.rs`) for
 //! exactly where.
+//!
+//! # Publishing views
+//!
+//! `publish::Publisher` (crate-internal) is the one place a new [`view::View`] becomes visible
+//! to readers (DESIGN.md §5's "publish-before-reply"). The adapter owns the single instance;
+//! [`EzKv::view`](crate::EzKv::view) reads through a cloned `publish::ViewReceiver`, never
+//! touching the state machine's lock.
 
 mod bytes_codec;
 mod change;
+mod publish;
 mod state;
 mod txn;
 mod view;
 
 pub use change::Change;
 pub use change::Changes;
-// Unused until ech0-media#27b calls into the state machine from the Raft adapter; remove this
-// `allow` in the same change that adds that first caller.
-#[allow(unused_imports)]
+pub(crate) use publish::Publisher;
+pub(crate) use publish::ViewReceiver;
 pub(crate) use state::KvState;
 pub use txn::Condition;
 pub use txn::Conflict;

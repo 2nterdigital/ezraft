@@ -1,7 +1,7 @@
 //! Network fault injection (ech0-media#23): drop, delay, and partition requests between chosen
 //! node pairs, and heal them again.
 //!
-//! Every test drives EzRaft through its public API and real HTTP between nodes; the only
+//! Every test drives `EzKv` through its public API and real HTTP between nodes; the only
 //! difference from the other cluster tests is that these nodes share a [`Faults`] handle.
 
 mod common;
@@ -20,9 +20,9 @@ use ezraft::fault::Faults;
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_both_directions_to_a_follower_stalls_it_until_healed() -> io::Result<()> {
     let faults = Faults::new();
-    let (addr_a, a) = founding_node_with(config_with_faults(&faults)).await?;
-    let (_, b) = joined_voter_with(&addr_a, config_with_faults(&faults)).await?;
-    let (_, c) = joined_voter_with(&addr_a, config_with_faults(&faults)).await?;
+    let (addr_a, a, _data_a) = founding_node_with(config_with_faults(&faults)).await?;
+    let (_, b, _data_b) = joined_voter_with(&addr_a, config_with_faults(&faults)).await?;
+    let (_, c, _data_c) = joined_voter_with(&addr_a, config_with_faults(&faults)).await?;
 
     let all = BTreeSet::from([a.node_id(), b.node_id(), c.node_id()]);
     wait_for_voters(&a, all, "every joined node is a voter").await?;
@@ -32,7 +32,7 @@ async fn dropping_both_directions_to_a_follower_stalls_it_until_healed() -> io::
     faults.set(a.node_id(), b.node_id(), Fault::Drop);
     faults.set(b.node_id(), a.node_id(), Fault::Drop);
 
-    a.write(set("k1", "v1")).await?;
+    write_through_leader(&[&a], set("k1", "v1")).await?;
     wait_for_applied(&c, &a).await?;
 
     // B cannot have received a request that was dropped in both directions before it was ever
@@ -50,7 +50,7 @@ async fn dropping_both_directions_to_a_follower_stalls_it_until_healed() -> io::
     faults.clear(b.node_id(), a.node_id());
     wait_for_applied(&b, &a).await?;
 
-    assert_eq!(Some("v1".to_string()), b.read(|app| app.data.get("k1").cloned()).await?);
+    assert_eq!(Some("v1".to_string()), b.view().get("k1").map(|kv| text(&kv)));
 
     Ok(())
 }
@@ -60,9 +60,9 @@ async fn dropping_both_directions_to_a_follower_stalls_it_until_healed() -> io::
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delay_under_the_rpc_timeout_slows_replication_without_breaking_it() -> io::Result<()> {
     let faults = Faults::new();
-    let (addr_a, a) = founding_node_with(config_with_faults(&faults)).await?;
-    let (_, b) = joined_voter_with(&addr_a, config_with_faults(&faults)).await?;
-    let (_, c) = joined_voter_with(&addr_a, config_with_faults(&faults)).await?;
+    let (addr_a, a, _data_a) = founding_node_with(config_with_faults(&faults)).await?;
+    let (_, b, _data_b) = joined_voter_with(&addr_a, config_with_faults(&faults)).await?;
+    let (_, c, _data_c) = joined_voter_with(&addr_a, config_with_faults(&faults)).await?;
 
     let all = BTreeSet::from([a.node_id(), b.node_id(), c.node_id()]);
     wait_for_voters(&a, all, "every joined node is a voter").await?;
@@ -72,10 +72,10 @@ async fn a_delay_under_the_rpc_timeout_slows_replication_without_breaking_it() -
     faults.set(a.node_id(), b.node_id(), Fault::Delay(Duration::from_millis(20)));
     faults.set(b.node_id(), a.node_id(), Fault::Delay(Duration::from_millis(20)));
 
-    a.write(set("k1", "v1")).await?;
+    write_through_leader(&[&a], set("k1", "v1")).await?;
     wait_for_applied(&b, &a).await?;
 
-    assert_eq!(Some("v1".to_string()), b.read(|app| app.data.get("k1").cloned()).await?);
+    assert_eq!(Some("v1".to_string()), b.view().get("k1").map(|kv| text(&kv)));
 
     Ok(())
 }
@@ -87,9 +87,9 @@ async fn a_delay_under_the_rpc_timeout_slows_replication_without_breaking_it() -
 #[tokio::test(flavor = "multi_thread")]
 async fn isolating_the_leader_elects_a_new_one_and_drops_its_uncommitted_write() -> io::Result<()> {
     let faults = Faults::new();
-    let (addr_a, a) = founding_node_with(config_with_faults(&faults)).await?;
-    let (addr_b, b) = joined_voter_with(&addr_a, config_with_faults(&faults)).await?;
-    let (addr_c, c) = joined_voter_with(&addr_a, config_with_faults(&faults)).await?;
+    let (addr_a, a, _data_a) = founding_node_with(config_with_faults(&faults)).await?;
+    let (_, b, _data_b) = joined_voter_with(&addr_a, config_with_faults(&faults)).await?;
+    let (_, c, _data_c) = joined_voter_with(&addr_a, config_with_faults(&faults)).await?;
 
     let all = BTreeSet::from([a.node_id(), b.node_id(), c.node_id()]);
     wait_for_voters(&a, all, "every joined node is a voter").await?;
@@ -102,9 +102,9 @@ async fn isolating_the_leader_elects_a_new_one_and_drops_its_uncommitted_write()
     faults.isolate(old_leader, &[b.node_id(), c.node_id()]);
 
     // The isolated leader cannot commit. Bound the attempt: a leader that still has a moment of
-    // lease left proposes an entry it can then never get a quorum for, and openraft's
-    // `client_write` has no timeout of its own - without this bound that write would hang the
-    // test rather than fail it. Either outcome (a fast, empty `ForwardToLeader` once the lease
+    // lease left proposes an entry it can then never get a quorum for, and `EzKv::write` waits
+    // out only the no-lease-yet window, not a lost quorum - without this bound that write would
+    // hang the test rather than fail it. Either outcome (a fast `NotLeader` once the lease
     // lapses, or this timeout) proves the same thing: the write never takes effect.
     let write_on_old_leader = tokio::time::timeout(Duration::from_secs(1), a.write(set("stale", "value"))).await;
     assert!(
@@ -121,17 +121,10 @@ async fn isolating_the_leader_elects_a_new_one_and_drops_its_uncommitted_write()
     )
     .await?;
     let new_leader_id = b.metrics().await.current_leader.expect("a new leader was just observed");
-    let (new_leader, new_leader_addr) = if new_leader_id == b.node_id() {
-        (&b, &addr_b)
-    } else {
-        (&c, &addr_c)
-    };
+    let new_leader = if new_leader_id == b.node_id() { &b } else { &c };
 
     // Writes through the new leader commit normally.
-    assert_eq!(
-        Response { value: None },
-        http_write(new_leader_addr, set("k1", "v1")).await?
-    );
+    write_through_leader(&[new_leader], set("k1", "v1")).await?;
 
     // Heal the network: every node converges on the same leader.
     faults.heal();
@@ -153,7 +146,7 @@ async fn isolating_the_leader_elects_a_new_one_and_drops_its_uncommitted_write()
 
     let expected = BTreeMap::from([("k1".to_string(), "v1".to_string())]);
     for node in [&a, &b, &c] {
-        let data = node.read(|app| app.data.clone()).await?;
+        let data = view_map(&node.view());
         assert_eq!(
             expected,
             data,

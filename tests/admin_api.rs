@@ -1,6 +1,6 @@
 //! The admin HTTP API and `AdminClient`: the operator's way in, redirects included
 //!
-//! Every test drives EzRaft through its public API and real HTTP between nodes.
+//! Every test drives `EzKv` through its public API and real HTTP between nodes.
 
 mod common;
 
@@ -14,8 +14,8 @@ use ezraft::admin::AdminClient;
 /// endpoint promotes and demotes, another removes.
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_api_changes_roles_and_removes_nodes() -> io::Result<()> {
-    let (addr_a, a) = founding_node().await?;
-    let (_, b) = joined_learner(&addr_a).await?;
+    let (addr_a, a, _data_a) = founding_node().await?;
+    let (_, b, _data_b) = joined_learner(&addr_a).await?;
     let b_id = b.node_id();
 
     admin_post(
@@ -58,8 +58,8 @@ async fn admin_api_changes_roles_and_removes_nodes() -> io::Result<()> {
 /// never followed to the leader, and its own view is the point of asking it.
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_client_reads_the_metrics_of_the_node_it_asks() -> io::Result<()> {
-    let (addr_a, a) = founding_node().await?;
-    let (addr_b, b) = joined_voter(&addr_a).await?;
+    let (addr_a, a, _data_a) = founding_node().await?;
+    let (addr_b, b, _data_b) = joined_voter(&addr_a).await?;
     wait_for_voters(&a, BTreeSet::from([0, b.node_id()]), "the joining voter is promoted").await?;
     assert!(!b.is_leader(), "b has to be a follower for this to be its own view");
 
@@ -68,7 +68,7 @@ async fn admin_client_reads_the_metrics_of_the_node_it_asks() -> io::Result<()> 
     // `last_applied` between them.
     wait_for_applied(&b, &a).await?;
 
-    assert_eq!(b.metrics().await, AdminClient::new(&addr_b).metrics::<KvSm>().await?);
+    assert_eq!(b.metrics().await, AdminClient::new(&addr_b).metrics().await?);
 
     // The same client hands out ids, which is how a joining node gets one.
     let fresh = AdminClient::new(&addr_a).node_id().await?;
@@ -78,14 +78,14 @@ async fn admin_client_reads_the_metrics_of_the_node_it_asks() -> io::Result<()> 
 }
 
 /// A membership change asked of a follower must come back with the leader's
-/// address rather than being done or quietly dropped. `EzRaft` does not
+/// address rather than being done or quietly dropped. `EzKv` does not
 /// forward - it is a node, not a client - so this redirect is the whole
 /// mechanism, and it is what the join path's request loop follows.
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_api_redirects_a_follower_to_the_leader() -> io::Result<()> {
-    let (addr_a, a) = founding_node().await?;
-    let (addr_b, b) = joined_voter(&addr_a).await?;
-    let (_, c) = joined_learner(&addr_a).await?;
+    let (addr_a, a, _data_a) = founding_node().await?;
+    let (addr_b, b, _data_b) = joined_voter(&addr_a).await?;
+    let (_, c, _data_c) = joined_learner(&addr_a).await?;
     let c_id = c.node_id();
 
     wait_for_voters(&a, BTreeSet::from([0, b.node_id()]), "the joining voter is promoted").await?;

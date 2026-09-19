@@ -1,10 +1,12 @@
 //! Internal storage adapter
 //!
-//! This module bridges the user's [`EzApp`] and [`EzStorage`] traits
-//! to OpenRaft's [`RaftLogStorage`](openraft::storage::RaftLogStorage) and
-//! [`RaftStateMachine`](openraft::storage::RaftStateMachine) traits.
+//! This module bridges the user's [`EzStorage`] trait to OpenRaft's
+//! [`RaftLogStorage`](openraft::storage::RaftLogStorage) and
+//! [`RaftStateMachine`](openraft::storage::RaftStateMachine) traits, and owns the Raft state
+//! machine itself: the KV (`crate::kv`).
 //!
-//! Users don't interact with this module directly - it's used internally by [`crate::EzRaft`].
+//! Users don't interact with this module directly - it's used internally by
+//! [`crate::raft::EzKv`].
 
 #[cfg(test)]
 mod conformance;
@@ -17,7 +19,6 @@ pub use log::LogStore;
 pub use state_machine::StateMachineStore;
 use tokio::sync::Mutex;
 
-use crate::app::EzApp;
 use crate::storage::EzStorage;
 use crate::storage::Loaded;
 
@@ -27,27 +28,21 @@ use crate::storage::Loaded;
 /// through it whichever store makes it. **Take a store's own cache before this, never the
 /// reverse, and never two caches at once** - that ordering is the whole reason these cannot
 /// deadlock.
-type SharedStorage<T> = Arc<Mutex<Box<dyn EzStorage<T>>>>;
+type SharedStorage = Arc<Mutex<Box<dyn EzStorage>>>;
 
 /// Open the user's storage as the two stores openraft asks for
 ///
 /// One [`EzStorage::load`], because there is one storage behind both: the metadata it returns
 /// belongs to the log, the snapshot to the state machine.
-pub async fn open<T>(
-    mut user_storage: impl EzStorage<T>,
-    app: T,
-) -> Result<(LogStore<T>, StateMachineStore<T>), std::io::Error>
-where
-    T: EzApp,
-{
+pub async fn open(mut user_storage: impl EzStorage) -> Result<(LogStore, StateMachineStore), std::io::Error> {
     // Load initial metadata and snapshot
     let Loaded { meta, snapshot } = user_storage.load().await?;
 
-    let storage: Box<dyn EzStorage<T>> = Box::new(user_storage);
-    let storage: SharedStorage<T> = Arc::new(Mutex::new(storage));
+    let storage: Box<dyn EzStorage> = Box::new(user_storage);
+    let storage: SharedStorage = Arc::new(Mutex::new(storage));
 
     let log = LogStore::new(storage.clone(), meta);
-    let sm = StateMachineStore::new(storage, app, snapshot)?;
+    let sm = StateMachineStore::new(storage, snapshot)?;
 
     Ok((log, sm))
 }

@@ -1,6 +1,5 @@
 //! What the framework asks storage to write
 
-use crate::app::EzApp;
 use crate::entry::EzEntry;
 use crate::meta::EzMeta;
 use crate::snapshot::EzSnapshot;
@@ -10,9 +9,7 @@ use crate::snapshot::EzSnapshot;
 /// Each variant represents one atomic operation that should be persisted to disk.
 /// The framework calls [`crate::EzStorage::persist`] with these operations.
 #[derive(Debug, derive_more::Display)]
-pub enum Persist<T>
-where T: EzApp
-{
+pub enum Persist {
     /// Update Raft metadata (term, vote, log positions)
     #[display("Meta")]
     Meta(EzMeta),
@@ -24,7 +21,7 @@ where T: EzApp
     /// recording it, or between a truncation's metadata and its deletes - and the next append is
     /// what writes over them.
     #[display("LogEntry")]
-    LogEntry(EzEntry<T>),
+    LogEntry(EzEntry),
 
     /// Write a complete snapshot, replacing the previous one
     #[display("Snapshot")]

@@ -16,7 +16,6 @@ use openraft::storage::LogState;
 use openraft::storage::RaftLogStorage;
 use tokio::sync::Mutex;
 
-use crate::app::EzApp;
 use crate::meta::EzMeta;
 use crate::storage::EzStorage;
 use crate::storage::Persist;
@@ -26,20 +25,15 @@ use crate::type_config::OpenRaftTypes;
 /// The log: entries, and the metadata that bounds them
 ///
 /// Only metadata is cached in memory - entries are read from user storage on demand.
-pub struct LogStore<T>
-where T: EzApp
-{
-    storage: SharedStorage<T>,
+pub struct LogStore {
+    storage: SharedStorage,
 
     /// Raft metadata: the vote, and the positions bounding the log
     meta: Arc<Mutex<EzMeta>>,
 }
 
-// Hand-written, because deriving would demand `T: Clone` of an application that has no reason
-// to be cloneable. Both stores are handles: cloning one shares its state.
-impl<T> Clone for LogStore<T>
-where T: EzApp
-{
+// Both stores are handles: cloning one shares its state.
+impl Clone for LogStore {
     fn clone(&self) -> Self {
         Self {
             storage: self.storage.clone(),
@@ -48,10 +42,8 @@ where T: EzApp
     }
 }
 
-impl<T> LogStore<T>
-where T: EzApp
-{
-    pub(super) fn new(storage: SharedStorage<T>, meta: EzMeta) -> Self {
+impl LogStore {
+    pub(super) fn new(storage: SharedStorage, meta: EzMeta) -> Self {
         Self {
             storage,
             meta: Arc::new(Mutex::new(meta)),
@@ -82,19 +74,16 @@ where T: EzApp
 ///
 /// Takes the two guards rather than the adapter, because most callers already hold both and the
 /// mutex is not reentrant.
-async fn persist_meta<T>(meta: &mut EzMeta, storage: &mut dyn EzStorage<T>) -> Result<(), std::io::Error>
-where T: EzApp {
+async fn persist_meta(meta: &mut EzMeta, storage: &mut dyn EzStorage) -> Result<(), std::io::Error> {
     meta.last_log_id = meta.last_log_id.max(meta.last_purged);
 
     storage.persist(Persist::Meta(meta.clone())).await
 }
 
-impl<T> RaftLogStorage<OpenRaftTypes<T>> for LogStore<T>
-where T: EzApp
-{
+impl RaftLogStorage<OpenRaftTypes> for LogStore {
     type LogReader = Self;
 
-    async fn get_log_state(&mut self) -> Result<LogState<OpenRaftTypes<T>>, std::io::Error> {
+    async fn get_log_state(&mut self) -> Result<LogState<OpenRaftTypes>, std::io::Error> {
         let meta = self.meta.lock().await;
         let last = meta.last_log_id.map(|(t, i)| LogId::new_term_index(t, i));
         let last_purged = meta.last_purged.map(|(t, i)| LogId::new_term_index(t, i));
@@ -105,13 +94,13 @@ where T: EzApp
         })
     }
 
-    async fn save_vote(&mut self, vote: &<OpenRaftTypes<T> as RaftTypeConfig>::Vote) -> Result<(), std::io::Error> {
+    async fn save_vote(&mut self, vote: &<OpenRaftTypes as RaftTypeConfig>::Vote) -> Result<(), std::io::Error> {
         self.save_meta(|m| m.vote = Some(*vote)).await
     }
 
-    async fn append<I>(&mut self, entries: I, callback: IOFlushed<OpenRaftTypes<T>>) -> Result<(), std::io::Error>
+    async fn append<I>(&mut self, entries: I, callback: IOFlushed<OpenRaftTypes>) -> Result<(), std::io::Error>
     where
-        I: IntoIterator<Item = <OpenRaftTypes<T> as RaftTypeConfig>::Entry> + OptionalSend,
+        I: IntoIterator<Item = <OpenRaftTypes as RaftTypeConfig>::Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
         // Both locks for the whole batch and the metadata that describes it, so no reader can
@@ -152,7 +141,7 @@ where T: EzApp
         }
     }
 
-    async fn truncate_after(&mut self, last_log_id: Option<LogIdOf<OpenRaftTypes<T>>>) -> Result<(), std::io::Error> {
+    async fn truncate_after(&mut self, last_log_id: Option<LogIdOf<OpenRaftTypes>>) -> Result<(), std::io::Error> {
         let from = last_log_id.map(|id| id.index).next_index();
 
         // Both held across the position and the delete it bounds, so no reader sees the log
@@ -178,7 +167,7 @@ where T: EzApp
         storage.persist(Persist::DeleteLogs { from, to: u64::MAX }).await
     }
 
-    async fn purge(&mut self, log_id: LogIdOf<OpenRaftTypes<T>>) -> Result<(), std::io::Error> {
+    async fn purge(&mut self, log_id: LogIdOf<OpenRaftTypes>) -> Result<(), std::io::Error> {
         let mut meta = self.meta.lock().await;
         let mut storage = self.storage.lock().await;
 
@@ -201,17 +190,15 @@ where T: EzApp
     }
 }
 
-impl<T> RaftLogReader<OpenRaftTypes<T>> for LogStore<T>
-where T: EzApp
-{
-    async fn read_vote(&mut self) -> Result<Option<<OpenRaftTypes<T> as RaftTypeConfig>::Vote>, std::io::Error> {
+impl RaftLogReader<OpenRaftTypes> for LogStore {
+    async fn read_vote(&mut self) -> Result<Option<<OpenRaftTypes as RaftTypeConfig>::Vote>, std::io::Error> {
         Ok(self.meta.lock().await.vote)
     }
 
     async fn try_get_log_entries<RB>(
         &mut self,
         range: RB,
-    ) -> Result<Vec<<OpenRaftTypes<T> as RaftTypeConfig>::Entry>, std::io::Error>
+    ) -> Result<Vec<<OpenRaftTypes as RaftTypeConfig>::Entry>, std::io::Error>
     where
         RB: RangeBounds<u64> + Clone + Debug + OptionalSend,
     {
@@ -276,14 +263,11 @@ where T: EzApp
 /// Otherwise returns `Ok(Some(entries))` for the narrower `[first_present, end)` once the first
 /// present index is found, so the caller propagates one coherent result rather than assembling
 /// one itself.
-async fn find_present_start<T>(
-    storage: &mut dyn EzStorage<T>,
+async fn find_present_start(
+    storage: &mut dyn EzStorage,
     start: u64,
     end: u64,
-) -> Result<Option<Vec<<OpenRaftTypes<T> as RaftTypeConfig>::Entry>>, std::io::Error>
-where
-    T: EzApp,
-{
+) -> Result<Option<Vec<<OpenRaftTypes as RaftTypeConfig>::Entry>>, std::io::Error> {
     let mut probe = start;
 
     loop {
@@ -312,7 +296,6 @@ where
 mod tests {
     use std::sync::Mutex as StdMutex;
 
-    use async_trait::async_trait;
     use openraft::LogId;
 
     use super::*;
@@ -320,32 +303,14 @@ mod tests {
     use crate::storage::Loaded;
     use crate::storage::adapter::open;
 
-    #[derive(serde::Deserialize, serde::Serialize)]
-    struct Marker;
-
-    #[async_trait]
-    impl EzApp for Marker {
-        type Request = String;
-        type Response = String;
-
-        async fn apply(&mut self, req: String) -> String {
-            req
-        }
-
-        type ReadRequest = ();
-        type ReadResponse = ();
-
-        fn read(&self, _req: ()) {}
-    }
-
     /// Storage that records what it was asked to write, in the order it was asked
     #[derive(Clone, Default)]
     struct Recorder {
         ops: Arc<StdMutex<Vec<String>>>,
     }
 
-    #[async_trait]
-    impl EzStorage<Marker> for Recorder {
+    #[async_trait::async_trait]
+    impl EzStorage for Recorder {
         async fn load(&mut self) -> Result<Loaded, std::io::Error> {
             Ok(Loaded {
                 meta: EzMeta::default(),
@@ -353,20 +318,20 @@ mod tests {
             })
         }
 
-        async fn persist(&mut self, op: Persist<Marker>) -> Result<(), std::io::Error> {
+        async fn persist(&mut self, op: Persist) -> Result<(), std::io::Error> {
             self.ops.lock().unwrap().push(op.to_string());
             Ok(())
         }
 
-        async fn read_logs(&mut self, _start: u64, _end: u64) -> Result<Vec<EzEntry<Marker>>, std::io::Error> {
+        async fn read_logs(&mut self, _start: u64, _end: u64) -> Result<Vec<EzEntry>, std::io::Error> {
             unreachable!("these tests only write")
         }
     }
 
-    async fn recording_log_store() -> (LogStore<Marker>, Arc<StdMutex<Vec<String>>>) {
+    async fn recording_log_store() -> (LogStore, Arc<StdMutex<Vec<String>>>) {
         let recorder = Recorder::default();
         let ops = recorder.ops.clone();
-        let (log, _sm) = open(recorder, Marker).await.unwrap();
+        let (log, _sm) = open(recorder).await.unwrap();
         (log, ops)
     }
 

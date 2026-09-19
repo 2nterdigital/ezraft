@@ -11,23 +11,33 @@ use harness::*;
 use serde_json::Value;
 use serde_json::json;
 
-/// POST a request to a node's write API, retrying while the node's HTTP
-/// server is still binding or the cluster has no usable leader yet.
-async fn write(addr: &str, req: Value) -> io::Result<Value> {
+/// POST `req` to `/api/write` on whichever of `addrs` currently accepts it.
+///
+/// Only the leader does - `EzKv::write` has no forwarding (ech0-media#30) - so this tries every
+/// address in turn and retries the whole round while the cluster is still forming or between an
+/// election and the next write.
+async fn write(addrs: &[&str], req: Value) -> io::Result<Value> {
     let client = reqwest::Client::new();
     let deadline = Instant::now() + WAIT;
     loop {
-        let res = client.post(format!("http://{}/api/write", addr)).json(&req).send().await;
-        match res {
-            Ok(resp) if resp.status().is_success() => return resp.json().await.map_err(io::Error::other),
-            _ if Instant::now() < deadline => tokio::time::sleep(POLL_INTERVAL).await,
-            Ok(resp) => return Err(io::Error::other(format!("write to {} failed: {}", addr, resp.status()))),
-            Err(e) => return Err(io::Error::other(e)),
+        for addr in addrs {
+            if let Ok(resp) = client.post(format!("http://{}/api/write", addr)).json(&req).send().await
+                && resp.status().is_success()
+            {
+                return resp.json().await.map_err(io::Error::other);
+            }
         }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "no node in {:?} accepted {:?} within {:?}",
+                addrs, req, WAIT
+            )));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
-/// Poll a node's direct-read endpoint until `key` serves exactly `expected`,
+/// Poll a node's `/api/read` endpoint until `key` serves exactly `expected`,
 /// where `None` is a key the node does not hold - the app answers that with no
 /// entry. Getting there proves the state reached that node's own state machine.
 async fn wait_for_key(addr: &str, key: &str, expected: Option<&str>) -> io::Result<()> {
@@ -37,7 +47,7 @@ async fn wait_for_key(addr: &str, key: &str, expected: Option<&str>) -> io::Resu
     let mut last = None;
     loop {
         // An error is the node's HTTP server still binding; retry until the deadline.
-        let get = json!({"Get": {"key": key}});
+        let get = json!({"op": "Get", "key": key});
         if let Ok(resp) = client.post(format!("http://{}/api/read", addr)).json(&get).send().await {
             let status = resp.status();
             if !status.is_success() {
@@ -71,10 +81,11 @@ async fn three_node_kvstore_cluster_writes_and_reads() -> io::Result<()> {
     let a = example.spawn(&addr_a, None)?;
 
     // The first write doubles as the readiness wait: it only succeeds once the
-    // founding node serves HTTP and leads.
+    // founding node serves HTTP and leads. A brand-new cluster's first
+    // transaction always lands at revision 1.
     assert_eq!(
-        json!({"value": null}),
-        write(&addr_a, json!({"Set": {"key": "k1", "value": "v1"}})).await?
+        json!({"revision": 1}),
+        write(&[&addr_a], json!({"op": "Set", "key": "k1", "value": "v1"})).await?
     );
 
     let addr_b = free_addr();
@@ -86,26 +97,17 @@ async fn three_node_kvstore_cluster_writes_and_reads() -> io::Result<()> {
     wait_for_key(&addr_b, "k1", Some("v1")).await?;
     wait_for_key(&addr_c, "k1", Some("v1")).await?;
 
-    // Writes sent to joiners are forwarded to the leader: a set through one,
-    // and a delete through the other returning the removed value.
-    assert_eq!(
-        json!({"value": null}),
-        write(&addr_b, json!({"Set": {"key": "k2", "value": "v2"}})).await?
-    );
-    assert_eq!(
-        json!({"value": "v1"}),
-        write(&addr_c, json!({"Delete": {"key": "k1"}})).await?
-    );
-
-    // Overwriting a key hands back the value it replaced.
-    assert_eq!(
-        json!({"value": "v2"}),
-        write(&addr_a, json!({"Set": {"key": "k2", "value": "v2b"}})).await?
-    );
+    // Only the leader accepts a write, and which node that is may have changed
+    // since the first write (joining two more voters can trigger an election),
+    // so every write below is tried against all three addresses.
+    let addrs = [addr_a.as_str(), addr_b.as_str(), addr_c.as_str()];
+    write(&addrs, json!({"op": "Set", "key": "k2", "value": "v2"})).await?;
+    write(&addrs, json!({"op": "Delete", "key": "k1"})).await?;
+    write(&addrs, json!({"op": "Set", "key": "k2", "value": "v2b"})).await?;
 
     // Every node converges on the exact final state: the overwritten key reads
     // back everywhere, and the deleted key answers with no entry at all.
-    for addr in [&addr_a, &addr_b, &addr_c] {
+    for addr in &addrs {
         wait_for_key(addr, "k2", Some("v2b")).await?;
         wait_for_key(addr, "k1", None).await?;
     }
@@ -114,7 +116,7 @@ async fn three_node_kvstore_cluster_writes_and_reads() -> io::Result<()> {
     // request cannot express.
     let prefixed: Value = reqwest::Client::new()
         .post(format!("http://{}/api/read", addr_a))
-        .json(&json!({"Prefix": {"prefix": "k"}}))
+        .json(&json!({"op": "Prefix", "prefix": "k"}))
         .send()
         .await
         .map_err(io::Error::other)?
