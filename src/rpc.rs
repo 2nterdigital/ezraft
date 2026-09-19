@@ -106,14 +106,9 @@ impl Rpc {
 
     /// Register a handler under a name in the foundation's own reserved `ez.` prefix
     ///
-    /// The crate-internal counterpart to [`Self::register`], for later tickets (forwarded writes
-    /// ech0-media#30, ReadIndex ech0-media#31) to install their own handlers on this same
-    /// mechanism. This milestone builds only the reservation and this entry point - nothing in
-    /// the crate calls it yet.
-    #[allow(
-        dead_code,
-        reason = "wired up by ech0-media#30's forwarded-write and #31's ReadIndex handlers"
-    )]
+    /// The crate-internal counterpart to [`Self::register`]: the foundation's own machinery
+    /// (ReadIndex for linearizable reads today; forwarded writes, ech0-media#30) installs its
+    /// handlers on the same mechanism applications use, under names applications cannot take.
     pub(crate) fn register_internal<Req, Resp, E, F, Fut>(
         &self,
         name: impl Into<String>,
