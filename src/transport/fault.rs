@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use reqwest::Client;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -94,9 +95,14 @@ impl Transport {
     }
 
     /// Apply `fault` instead of - or, for [`Fault::DropResponse`], in addition to - the normal
-    /// send `Transport::send` would otherwise make
+    /// send `Transport::send`/`Transport::send_rpc` would otherwise make
+    ///
+    /// `client` is whichever pool the caller (`send` or `send_rpc`) was about to use, so a
+    /// faulted request that ends up sent "for real" (`Delay`, `DropResponse`) still goes out on
+    /// the right traffic class.
     pub(super) async fn send_faulty<Req, Resp, Err>(
         &self,
+        client: &Client,
         fault: Fault,
         target: u64,
         addr: &str,
@@ -117,21 +123,24 @@ impl Transport {
 
             Fault::Delay(delay) if delay >= timeout => {
                 // The delay alone exhausts the caller's budget, so the peer never sees the
-                // request: report it exactly like a send that timed out.
+                // request: reported as `Timeout`, not `Unreachable` - the peer is not the
+                // problem here, the caller's own budget ran out. openraft does not need the
+                // difference (`crate::network` maps both to one `RPCError::Unreachable`), but
+                // `crate::rpc::RpcError` does.
                 tokio::time::sleep(timeout).await;
-                Err(TransportError::Unreachable(format!(
+                Err(TransportError::Timeout(format!(
                     "fault-injection: delay {delay:?} at or past the {timeout:?} timeout {} -> {target}",
                     self.from
                 )))
             }
             Fault::Delay(delay) => {
                 tokio::time::sleep(delay).await;
-                self.send_now(target, addr, path, timeout - delay, req).await
+                self.send_now(client, target, addr, path, timeout - delay, req).await
             }
 
             Fault::DropResponse => {
                 // The peer applies the request; only this side's view of the outcome is lost.
-                let _ = self.send_now::<Req, Resp, Err>(target, addr, path, timeout, req).await;
+                let _ = self.send_now::<Req, Resp, Err>(client, target, addr, path, timeout, req).await;
                 Err(TransportError::Other(format!(
                     "fault-injection: response dropped {} -> {target}",
                     self.from
@@ -208,7 +217,7 @@ mod tests {
     async fn a_dropped_request_is_unreachable_without_being_sent() {
         let faults = Faults::new();
         faults.set(1, 2, Fault::Drop);
-        let transport = Transport::new(1).unwrap().with_faults(Some(faults));
+        let transport = Transport::new(1, "test-token").unwrap().with_faults(Some(faults));
 
         // Nothing is listening at this address: a real send would itself fail, but a dropped
         // request must fail before it ever gets that far.
@@ -220,18 +229,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_delay_at_or_past_the_timeout_is_reported_as_unreachable() {
+    async fn a_delay_at_or_past_the_timeout_is_reported_as_a_timeout() {
         let faults = Faults::new();
         let delay = Duration::from_millis(50);
         faults.set(1, 2, Fault::Delay(delay));
-        let transport = Transport::new(1).unwrap().with_faults(Some(faults));
+        let transport = Transport::new(1, "test-token").unwrap().with_faults(Some(faults));
 
         let start = std::time::Instant::now();
         let err = transport
             .send::<_, (), Infallible>(2, "127.0.0.1:1", "x", delay, ())
             .await
             .expect_err("a delay at least as long as the timeout is a timeout");
-        assert!(matches!(err, TransportError::Unreachable(_)), "{err}");
+        assert!(matches!(err, TransportError::Timeout(_)), "{err}");
         assert!(start.elapsed() >= delay);
     }
 
@@ -239,7 +248,7 @@ mod tests {
     async fn a_dropped_response_is_reported_as_a_failure() {
         let faults = Faults::new();
         faults.set(1, 2, Fault::DropResponse);
-        let transport = Transport::new(1).unwrap().with_faults(Some(faults));
+        let transport = Transport::new(1, "test-token").unwrap().with_faults(Some(faults));
 
         let err = transport
             .send::<_, (), Infallible>(2, "127.0.0.1:1", "x", Duration::from_millis(50), ())

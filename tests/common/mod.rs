@@ -87,10 +87,18 @@ pub fn free_addr() -> String {
     listener.local_addr().unwrap().to_string()
 }
 
+/// The shared cluster token every node this harness builds authenticates with
+///
+/// One fixed value for the whole test suite: every node in one test cluster is built from
+/// [`config`] (or a config that starts from it), so they all agree on it and every request this
+/// harness itself sends (`admin_post`, `admin_answer`) carries it.
+pub const CLUSTER_TOKEN: &str = "test-cluster-token";
+
 /// Short heartbeat so elections and failovers finish in test time.
 pub fn config() -> EzConfig {
     EzConfig {
         heartbeat_interval: Duration::from_millis(100),
+        cluster_token: CLUSTER_TOKEN.to_string(),
         ..EzConfig::default()
     }
 }
@@ -248,9 +256,14 @@ pub async fn wait_for_applied(node: &EzKv, leader: &EzKv) -> io::Result<()> {
 }
 
 /// Ask a node for a membership change and return its answer, redirect and all.
+///
+/// Carries [`CLUSTER_TOKEN`], like every request a real node would send: this is the "legitimate
+/// operator" path. A request that deliberately omits or mismatches the token belongs in
+/// `tests/auth.rs`, driven directly over `reqwest` instead.
 pub async fn admin_answer(addr: &str, body: serde_json::Value) -> io::Result<Redirect> {
     let resp = reqwest::Client::new()
         .post(format!("http://{}/api/membership", addr))
+        .bearer_auth(CLUSTER_TOKEN)
         .json(&body)
         .send()
         .await
@@ -279,6 +292,48 @@ pub async fn admin_post(addr: &str, body: serde_json::Value) -> io::Result<()> {
     admin_answer(addr, body)
         .await?
         .map_err(|leader| io::Error::other(format!("/api/membership redirected to {:?}", leader)))
+}
+
+/// `POST http://{addr}/{path}` with `body` and, if given, `Authorization: Bearer {token}` -
+/// deliberately raw, for `tests/auth.rs` to drive requests with a missing, wrong, or mismatched
+/// token straight at a route (`raft/*`, `api/*`, `rpc/*`) and inspect the HTTP status itself.
+pub async fn raw_post(
+    addr: &str,
+    path: &str,
+    token: Option<&str>,
+    body: &serde_json::Value,
+) -> io::Result<reqwest::Response> {
+    let mut req = reqwest::Client::new().post(format!("http://{addr}/{path}")).json(body);
+    if let Some(token) = token {
+        req = req.bearer_auth(token);
+    }
+    req.send().await.map_err(io::Error::other)
+}
+
+/// Wait until `addr`'s HTTP server answers `GET /api/metrics` with the right token
+///
+/// A lone founding node can commit its own membership - what `founding_node`'s own wait checks -
+/// without its HTTP server having finished binding yet: a single voter needs no network round
+/// trip to reach a quorum of itself. A test that fires a *raw*, unauthenticated request right
+/// after `founding_node` (rather than joining, which already retries through `AdminClient`) needs
+/// this instead, so a `401` it observes is the auth check and not a connection that never landed.
+pub async fn wait_until_serving(addr: &str) -> io::Result<()> {
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + WAIT.expect("cluster waits are bounded");
+
+    loop {
+        if let Ok(resp) = client.get(format!("http://{addr}/api/metrics")).bearer_auth(CLUSTER_TOKEN).send().await
+            && resp.status().is_success()
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "{addr} never started serving HTTP within the wait budget"
+            )));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Cluster helpers for the `fault-injection` hook: see `tests/common/faults.rs`.

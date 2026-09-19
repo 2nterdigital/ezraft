@@ -68,10 +68,13 @@ async fn admin_client_reads_the_metrics_of_the_node_it_asks() -> io::Result<()> 
     // `last_applied` between them.
     wait_for_applied(&b, &a).await?;
 
-    assert_eq!(b.metrics().await, AdminClient::new(&addr_b).metrics().await?);
+    assert_eq!(
+        b.metrics().await,
+        AdminClient::new(&addr_b, CLUSTER_TOKEN).metrics().await?
+    );
 
     // The same client hands out ids, which is how a joining node gets one.
-    let fresh = AdminClient::new(&addr_a).node_id().await?;
+    let fresh = AdminClient::new(&addr_a, CLUSTER_TOKEN).node_id().await?;
     assert!(fresh > b.node_id(), "an id past every one handed out so far");
 
     Ok(())

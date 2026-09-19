@@ -13,7 +13,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use actix_web::dev::ServerHandle;
-use openraft::BasicNode;
 use openraft::ChangeMembers;
 use openraft::Raft;
 use openraft::RaftMetrics;
@@ -32,9 +31,12 @@ use crate::kv::View;
 use crate::kv::ViewReceiver;
 use crate::network::EzNetworkFactory;
 use crate::node_role::NodeRole;
+use crate::rpc::Rpc;
 use crate::storage::EzStorage;
 use crate::storage::adapter::StateMachineStore;
 use crate::storage::adapter::open;
+use crate::transport::Transport;
+use crate::type_config::Node;
 use crate::type_config::OpenRaftTypes;
 
 /// The internal OpenRaft instance, with the KV state machine behind it
@@ -77,6 +79,14 @@ pub struct EzKv {
 
     /// The actix `ServerHandle` for the address `serve`/`serve_with` bound, once bound
     serve_handle: ServeHandle,
+
+    /// The cluster token every route on the internal port checks `Authorization: Bearer` against
+    /// (ech0-media#29); `Arc<str>` so cloning this handle - which happens often, in every test
+    /// harness helper - never reallocates it.
+    cluster_token: Arc<str>,
+
+    /// The typed inter-node RPC facade this node hands out through [`Self::rpc`]
+    rpc: Rpc,
 }
 
 impl Clone for EzKv {
@@ -89,6 +99,8 @@ impl Clone for EzKv {
             view_rx: self.view_rx.clone(),
             kv_limits: self.kv_limits,
             serve_handle: self.serve_handle.clone(),
+            cluster_token: self.cluster_token.clone(),
+            rpc: self.rpc.clone(),
         }
     }
 }
@@ -182,6 +194,18 @@ impl EzKv {
     ) -> Result<Self, io::Error> {
         let http_addr = http_addr.to_string();
 
+        // Fail closed before anything else happens: like `to_raft_config` below, this can fail
+        // on nothing but the caller's own arguments, and every route on the internal port
+        // (`crate::auth`) is unauthenticated until this passes, so a node must never come up far
+        // enough to answer one with an empty token.
+        if config.cluster_token.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "EzConfig::cluster_token must not be empty: refusing to start a node with an unauthenticated internal port",
+            ));
+        }
+        let cluster_token: Arc<str> = Arc::from(config.cluster_token.as_str());
+
         // Converted first, because it is the only step that can fail on nothing but its
         // arguments, and everything below it either takes an id from the cluster or changes the
         // cluster's membership. A configuration this node cannot run with must not first cost the
@@ -206,7 +230,10 @@ impl EzKv {
             // learner. Always a learner, whichever role was asked for - a node cannot be added
             // straight to the voter set, because the new configuration's quorum would count a
             // node that is not answering yet, and the change would wait forever on its own ack.
-            let admin = AdminClient::new(seed_addr);
+            //
+            // The seed is asked before this node has an id, so `AdminClient` carries the token
+            // itself rather than going through the per-node `Transport` built below.
+            let admin = AdminClient::new(seed_addr, cluster_token.as_ref());
 
             let id = admin.node_id().await?;
             let enter = MembershipChange::Add {
@@ -227,12 +254,16 @@ impl EzKv {
             id
         };
 
-        // Create network factory. `with_faults` only exists under the `fault-injection`
-        // feature; shadowing rather than a `mut` binding keeps a non-feature build from
-        // warning about a binding that is never mutated.
-        let network = EzNetworkFactory::new(node_id)?;
+        // The single outbound Transport (DESIGN.md §4): Raft networking below and this node's
+        // own `Rpc` facade both send through it, so both carry this cluster token and, in test
+        // builds, the same fault-injection rules. `with_faults` only exists under the
+        // `fault-injection` feature; shadowing rather than a `mut` binding keeps a non-feature
+        // build from warning about a binding that is never mutated.
+        let transport = Transport::new(node_id, cluster_token.clone())?;
         #[cfg(feature = "fault-injection")]
-        let network = network.with_faults(config.faults.clone());
+        let transport = transport.with_faults(config.faults.clone());
+
+        let network = EzNetworkFactory::new(transport.clone());
 
         // Create OpenRaft instance
         let raft = Raft::new(node_id, raft_config, network, log, sm)
@@ -243,12 +274,14 @@ impl EzKv {
         // id 0 from storage and comes back here, where initializing is rightly refused; every
         // other refusal means the node cannot run.
         if node_id == 0 {
-            let nodes = BTreeMap::from_iter([(node_id, BasicNode::new(http_addr.clone()))]);
+            let nodes = BTreeMap::from_iter([(node_id, Node::new(http_addr.clone()))]);
             match raft.initialize(nodes).await {
                 Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {}
                 Err(e) => return Err(io::Error::other(e.to_string())),
             }
         }
+
+        let rpc = Rpc::new(node_id, raft.clone(), transport);
 
         // Asking now, answered later. The leader holds the request until this node has caught up,
         // which cannot happen until `serve` is running, so the wait belongs there and not here.
@@ -269,6 +302,8 @@ impl EzKv {
             view_rx,
             kv_limits,
             serve_handle: Arc::new(Mutex::new(None)),
+            cluster_token,
+            rpc,
         })
     }
 
@@ -327,7 +362,7 @@ impl EzKv {
     /// * `node_id` - ID of the new learner node
     /// * `addr` - Address of the new learner node
     pub(crate) async fn add_learner(&self, node_id: u64, addr: String) -> Result<(), io::Error> {
-        let node = BasicNode::new(addr);
+        let node = Node::new(addr);
         self.raft.add_learner(node_id, node, false).await.map_err(|e| io::Error::other(e.to_string()))?;
 
         Ok(())
@@ -415,7 +450,7 @@ impl EzKv {
     /// `ForwardToLeader` and that comes straight back. Reaching the leader belongs to whoever
     /// speaks the network - the admin endpoints answer with the leader's address, and
     /// [`crate::admin`] describes that protocol.
-    async fn change_members(&self, change: ChangeMembers<u64, BasicNode>, retain: bool) -> Result<(), io::Error> {
+    async fn change_members(&self, change: ChangeMembers<u64, Node>, retain: bool) -> Result<(), io::Error> {
         self.raft.change_membership(change, retain).await.map_err(|e| io::Error::other(e.to_string()))?;
         Ok(())
     }
@@ -576,5 +611,19 @@ impl EzKv {
     /// This provides access to advanced OpenRaft APIs if needed.
     pub fn inner(&self) -> &ORRaft {
         &self.raft
+    }
+
+    /// The typed inter-node RPC facade: register a handler here, or call one on another node by
+    /// id
+    ///
+    /// Cheap to clone (it is one internally); calling this repeatedly costs nothing beyond that
+    /// clone.
+    pub fn rpc(&self) -> Rpc {
+        self.rpc.clone()
+    }
+
+    /// This node's cluster token, for [`crate::server::bind`]'s auth middleware
+    pub(crate) fn cluster_token(&self) -> &str {
+        &self.cluster_token
     }
 }

@@ -47,17 +47,24 @@
 //!     //    is the production `EzStorage` this crate ships.
 //!     let storage = RedbStorage::open("./data/node1.redb").await?;
 //!
-//!     // 2. The first node of a cluster creates it; every other node joins
+//!     // 2. Every node on the same internal port needs the same cluster token - a
+//!     //    node refuses to start without one.
+//!     let config = EzConfig {
+//!         cluster_token: "change-me-to-a-real-secret".to_string(),
+//!         ..EzConfig::default()
+//!     };
+//!
+//!     // 3. The first node of a cluster creates it; every other node joins
 //!     //    through any node already in it:
 //!     //      EzKv::join("127.0.0.1:8081", "127.0.0.1:8080", storage, config)
-//!     let node = EzKv::create("127.0.0.1:8080", storage, EzConfig::default()).await?;
+//!     let node = EzKv::create("127.0.0.1:8080", storage, config).await?;
 //!
-//!     // 3. Write a key, then read it back from this node's own local view - no
+//!     // 4. Write a key, then read it back from this node's own local view - no
 //!     //    consensus round for the read, and it already reflects the write.
 //!     node.write(Txn::new().put("hello", "world")).await.map_err(io::Error::other)?;
 //!     println!("{:?}", node.view().get("hello"));
 //!
-//!     // 4. Serve the Raft RPCs peers need, plus the admin API. This blocks;
+//!     // 5. Serve the Raft RPCs peers need, plus the admin API. This blocks;
 //!     //    `tokio::spawn` it when the caller has other work to do.
 //!     node.serve().await
 //! }
@@ -73,6 +80,7 @@
 //! originate, and those are I/O errors already.
 
 pub mod admin;
+mod auth;
 mod command;
 pub mod config;
 pub mod entry;
@@ -81,6 +89,7 @@ pub mod meta;
 mod network;
 pub mod node_role;
 pub mod raft;
+mod rpc;
 pub mod server;
 pub mod snapshot;
 pub mod storage;
@@ -110,6 +119,9 @@ pub use openraft::RaftTypeConfig;
 pub use openraft::ReadPolicy;
 pub use openraft::ServerState;
 pub use raft::EzKv;
+pub use rpc::Rpc;
+pub use rpc::RpcError;
+pub use rpc::RpcRegisterError;
 pub use snapshot::EzSnapshot;
 pub use snapshot::EzSnapshotMeta;
 pub use storage::EzStorage;
@@ -119,6 +131,7 @@ pub use storage::RedbStorage;
 #[cfg(feature = "fault-injection")]
 pub use transport::fault;
 pub use type_config::EzVote;
+pub use type_config::Node;
 pub use type_config::OpenRaftTypes;
 pub use write::NotLeader;
 pub use write::WriteError;

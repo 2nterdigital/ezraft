@@ -55,8 +55,15 @@ redb        = { version = "4.3.0" }
 reqwest     = { version = "0.12", features = ["json"] }
 serde       = { version = "1.0.114", features = ["derive"] }
 serde_json  = { version = "1.0.57" }
+# Constant-time comparison of the presented `Authorization: Bearer` credential against the
+# cluster token (ech0-media#29): an audited primitive instead of `==`, so a byte-by-byte timing
+# difference can never leak how much of the token an attacker already guessed.
+subtle      = { version = "2.6" }
 thiserror   = { version = "2.0.20" }
 tokio       = { version = "1.39", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+# Structured logging on the paths ech0-media#29 added (auth rejections, RPC failures): the first
+# package to log moves this out of dev-dependencies.
+tracing     = { version = "0.1" }
 
 [features]
 # Test-only network fault injection (ech0-media#23): drop, delay, or hide the response of
@@ -74,7 +81,6 @@ postcard           = { version = "1.1.3", default-features = false, features = [
 # One redb file per node under its own temp directory, for the in-process cluster tests
 # (`tests/common/`) and `RedbStorage`'s own unit tests.
 tempfile           = { version = "3" }
-tracing            = { version = "0.1" }
 tracing-subscriber = { version = "0.3.3", features = ["env-filter"] }
 
 [[example]]

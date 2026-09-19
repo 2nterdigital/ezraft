@@ -28,6 +28,7 @@ use crate::admin::Redirect;
 use crate::network::SnapshotTransfer;
 use crate::node_role::NodeRole;
 use crate::raft::EzKv;
+use crate::rpc::RPC_PATH_PREFIX;
 use crate::type_config::OpenRaftTypes;
 
 /// Type alias for OpenRaft types
@@ -199,9 +200,27 @@ impl EzServer {
             return Ok(&ez.raft);
         }
 
-        Err(metrics
-            .current_leader
-            .and_then(|leader_id| metrics.membership_config.membership().get_node(&leader_id).map(|n| n.addr.clone())))
+        Err(metrics.current_leader.and_then(|leader_id| {
+            metrics.membership_config.membership().get_node(&leader_id).map(|n| n.internal_addr.clone())
+        }))
+    }
+
+    /// Inter-node RPC handler: dispatch `POST /{RPC_PATH_PREFIX}/{name}` to whatever this node
+    /// has registered under `name`
+    ///
+    /// [`crate::rpc::Rpc::dispatch`] never fails - an unknown name, a request that would not
+    /// decode, and a handler's own error all travel back inside the JSON body, exactly like every
+    /// other route here answers a peer's [`crate::network::Network`] - so this always answers
+    /// `200` with `Ok(..)`, and lets [`crate::rpc::Rpc::call`] on the caller's side decode what
+    /// actually happened.
+    async fn handle_rpc(
+        path: web::Path<String>,
+        body: web::Bytes,
+        ez: Data<Self>,
+    ) -> Result<web::Json<Result<serde_json::Value, Infallible>>, actix_web::Error> {
+        let name = path.into_inner();
+        let outcome = ez.raft.rpc().dispatch(&name, body.to_vec()).await;
+        Ok(web::Json(Ok(outcome)))
     }
 }
 
@@ -215,12 +234,19 @@ impl EzServer {
 pub(crate) fn bind<F>(raft: EzKv, configure: F) -> std::io::Result<Server>
 where F: Fn(&mut ServiceConfig) + Clone + Send + 'static {
     let addr = raft.addr().to_string();
+    let token = raft.cluster_token().to_string();
+    let rpc_route = format!("/{RPC_PATH_PREFIX}/{{name}}");
     let server_data = Data::new(EzServer::new(raft));
 
     let server = HttpServer::new(move || {
         let configure = configure.clone();
         App::new()
             .app_data(server_data.clone())
+            // Every route below - Raft, admin, RPC, and anything `configure` adds - requires
+            // `Authorization: Bearer <cluster token>` (ech0-media#29): wrapping the whole `App`
+            // is what makes that hold for an embedder's own routes too, with nothing for the
+            // embedder to remember to do.
+            .wrap(crate::auth::require_token(token.clone()))
             // Raft internal RPC
             .route("/raft/append", web::post().to(EzServer::handle_append))
             .route("/raft/vote", web::post().to(EzServer::handle_vote))
@@ -233,6 +259,8 @@ where F: Fn(&mut ServiceConfig) + Clone + Send + 'static {
             .route("/api/node_id", web::post().to(EzServer::handle_node_id))
             .route("/api/membership", web::post().to(EzServer::handle_membership))
             .route("/api/metrics", web::get().to(EzServer::handle_metrics))
+            // Typed inter-node RPC (crate::rpc)
+            .route(&rpc_route, web::post().to(EzServer::handle_rpc))
             .configure(configure)
     })
     .bind(&addr)?;

@@ -36,16 +36,25 @@ const MEMBERSHIP_CHANGE_TIMEOUT: Duration = Duration::from_secs(90);
 /// holding the one slot a cluster admits at a time.
 ///
 /// [`Self::metrics`] is the exception: it asks one node and reports what that node said.
+///
+/// Every request carries `Authorization: Bearer <token>` (ech0-media#29): this client is used
+/// before a joining node has an id of its own - and so before it has a `Transport` - which is why
+/// it carries the token itself rather than going through that.
 #[derive(Debug, Clone)]
 pub struct AdminClient {
     /// The node to ask
     addr: String,
+    /// The cluster token every request presents as `Authorization: Bearer <token>`
+    token: String,
 }
 
 impl AdminClient {
-    /// An admin client that asks the node serving `addr`
-    pub fn new(addr: impl ToString) -> Self {
-        Self { addr: addr.to_string() }
+    /// An admin client that asks the node serving `addr`, authenticating as `token`
+    pub fn new(addr: impl ToString, token: impl ToString) -> Self {
+        Self {
+            addr: addr.to_string(),
+            token: token.to_string(),
+        }
     }
 
     /// Take a fresh node id from the cluster
@@ -72,7 +81,7 @@ impl AdminClient {
     pub async fn metrics(&self) -> Result<RaftMetrics<OpenRaftTypes>, io::Error> {
         let url = format!("http://{}/api/metrics", self.addr);
 
-        answer(&url, client(ADMIN_TIMEOUT)?.get(&url)).await
+        answer(&url, client(ADMIN_TIMEOUT)?.get(&url).bearer_auth(&self.token)).await
     }
 
     /// Drive one admin endpoint to an answer
@@ -81,6 +90,9 @@ impl AdminClient {
     /// conditions a starting cluster is full of: a seed still binding its socket, no leader
     /// elected yet, or another node's membership change still in flight. A cluster admits one
     /// change at a time, so nodes started together take turns here instead of failing.
+    ///
+    /// A `401` is not one of those transient conditions - the token is not going to start
+    /// matching on the next attempt - so it is returned immediately rather than retried away.
     async fn request<Req, Resp>(&self, endpoint: &str, req: &Req, timeout: Duration) -> Result<Resp, io::Error>
     where
         Req: Serialize,
@@ -97,14 +109,16 @@ impl AdminClient {
             // Every way an attempt can fail is as transient as the rest here: the seed may still
             // be binding its HTTP socket, since serving starts concurrently with cluster
             // formation.
-            let redirect: Redirect<Resp> = match answer(&url, client.post(&url).json(req)).await {
-                Ok(redirect) => redirect,
-                Err(e) => {
-                    last_err = e.to_string();
-                    sleep(ADMIN_RETRY_INTERVAL).await;
-                    continue;
-                }
-            };
+            let redirect: Redirect<Resp> =
+                match answer(&url, client.post(&url).json(req).bearer_auth(&self.token)).await {
+                    Ok(redirect) => redirect,
+                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
+                    Err(e) => {
+                        last_err = e.to_string();
+                        sleep(ADMIN_RETRY_INTERVAL).await;
+                        continue;
+                    }
+                };
 
             match redirect {
                 Ok(resp) => return Ok(resp),
@@ -129,10 +143,22 @@ impl AdminClient {
 /// Send one request to one endpoint, and read what it answered
 ///
 /// Errors on anything that is not an answer - an unreachable node, a non-success status, a body
-/// that will not parse - and leaves it to the caller whether that is worth another attempt.
+/// that will not parse - and leaves it to the caller whether that is worth another attempt. A
+/// `401` is reported as [`io::ErrorKind::PermissionDenied`] with a message that says why, and
+/// without reading the response body: a token mismatch never carries anything else worth logging.
 async fn answer<Resp>(url: &str, req: reqwest::RequestBuilder) -> Result<Resp, io::Error>
 where Resp: DeserializeOwned {
     let resp = req.send().await.map_err(|e| io::Error::other(format!("request to {} failed: {}", url, e)))?;
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} rejected the request: cluster token mismatch (401 Unauthorized)",
+                url
+            ),
+        ));
+    }
 
     if !resp.status().is_success() {
         let status = resp.status();

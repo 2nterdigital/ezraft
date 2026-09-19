@@ -38,6 +38,18 @@ pub struct EzConfig {
     /// Default: 500
     pub snapshot_interval: u64,
 
+    /// The shared secret every request on the internal port must present as
+    /// `Authorization: Bearer <cluster_token>` - `/raft/*`, `/api/*`, the RPC prefix, and any
+    /// route an embedder adds through [`crate::EzKv::serve_with`] alike - compared in constant
+    /// time (DECISIONS.md ech0-media#15 item 4). Exactly one token is supported at a time:
+    /// rotating it means restarting the whole cluster with the new value.
+    ///
+    /// **Mandatory, with no sensible default**: [`EzKv::create`](crate::EzKv::create) and its
+    /// siblings refuse to start a node whose token is empty, so there is no way to accidentally
+    /// run an unauthenticated internal port. `EzConfig::default()` leaves this empty on purpose -
+    /// set a real value before starting a node with it.
+    pub cluster_token: String,
+
     /// Size and count limits every transaction is checked against before it is proposed - on the
     /// node that accepts the call, and again on the leader before it enters the log - so that a
     /// node with different limits than the rest can never make replicas diverge.
@@ -61,6 +73,7 @@ impl Default for EzConfig {
     fn default() -> Self {
         Self {
             heartbeat_interval: Duration::from_millis(500),
+            cluster_token: String::new(),
             snapshot_interval: 500,
             kv_limits: KvLimits::default(),
             #[cfg(feature = "fault-injection")]

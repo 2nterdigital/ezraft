@@ -11,6 +11,10 @@ use harness::*;
 use serde_json::Value;
 use serde_json::json;
 
+/// The cluster token every spawned `kvstore` node authenticates with - `kvstore.rs`'s own
+/// `--token` default, unchanged here since this test never passes `--token` itself.
+const TOKEN: &str = "dev-cluster-token";
+
 /// POST `req` to `/api/write` on whichever of `addrs` currently accepts it.
 ///
 /// Only the leader does - `EzKv::write` has no forwarding (ech0-media#30) - so this tries every
@@ -21,7 +25,8 @@ async fn write(addrs: &[&str], req: Value) -> io::Result<Value> {
     let deadline = Instant::now() + WAIT;
     loop {
         for addr in addrs {
-            if let Ok(resp) = client.post(format!("http://{}/api/write", addr)).json(&req).send().await
+            if let Ok(resp) =
+                client.post(format!("http://{}/api/write", addr)).bearer_auth(TOKEN).json(&req).send().await
                 && resp.status().is_success()
             {
                 return resp.json().await.map_err(io::Error::other);
@@ -48,7 +53,7 @@ async fn wait_for_key(addr: &str, key: &str, expected: Option<&str>) -> io::Resu
     loop {
         // An error is the node's HTTP server still binding; retry until the deadline.
         let get = json!({"op": "Get", "key": key});
-        if let Ok(resp) = client.post(format!("http://{}/api/read", addr)).json(&get).send().await {
+        if let Ok(resp) = client.post(format!("http://{}/api/read", addr)).bearer_auth(TOKEN).json(&get).send().await {
             let status = resp.status();
             if !status.is_success() {
                 return Err(io::Error::other(format!(
@@ -116,6 +121,7 @@ async fn three_node_kvstore_cluster_writes_and_reads() -> io::Result<()> {
     // request cannot express.
     let prefixed: Value = reqwest::Client::new()
         .post(format!("http://{}/api/read", addr_a))
+        .bearer_auth(TOKEN)
         .json(&json!({"op": "Prefix", "prefix": "k"}))
         .send()
         .await

@@ -100,7 +100,7 @@ impl EzKv {
 
                     return Err(WriteError::NotLeader(NotLeader {
                         leader_id: to_leader.leader_id,
-                        leader_addr: to_leader.leader_node.map(|node| node.addr),
+                        leader_addr: to_leader.leader_node.map(|node| node.internal_addr),
                     }));
                 }
                 Err(e) => return Err(WriteError::Fatal(e.to_string())),

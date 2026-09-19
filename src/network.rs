@@ -19,9 +19,7 @@
 
 use std::fmt::Display;
 use std::future::Future;
-use std::io;
 
-use openraft::BasicNode;
 use openraft::OptionalSend;
 use openraft::error::Infallible;
 use openraft::error::NetworkError;
@@ -49,6 +47,7 @@ use crate::snapshot::EzSnapshotMeta;
 use crate::transport::Transport;
 use crate::transport::TransportError;
 use crate::type_config::EzVote;
+use crate::type_config::Node;
 use crate::type_config::OpenRaftTypes;
 
 /// Type alias for OpenRaft types
@@ -57,34 +56,29 @@ type C = OpenRaftTypes;
 /// HTTP network factory
 ///
 /// Creates the per-peer [`Network`] openraft asks for. Every one of them shares one
-/// [`Transport`], and so one connection pool - and, in test builds, one fault-injection handle.
-/// Implements OpenRaft's `RaftNetworkFactory` trait.
+/// [`Transport`] - and so one connection pool, one cluster token, and, in test builds, one
+/// fault-injection handle. Implements OpenRaft's `RaftNetworkFactory` trait.
 pub struct EzNetworkFactory {
     transport: Transport,
 }
 
 impl EzNetworkFactory {
-    /// Create a new network factory for the node whose id is `from`
-    pub fn new(from: u64) -> Result<Self, io::Error> {
-        Ok(Self {
-            transport: Transport::new(from)?,
-        })
-    }
-
-    /// Attach the test cluster's shared fault-injection handle
-    #[cfg(feature = "fault-injection")]
-    pub(crate) fn with_faults(mut self, faults: Option<crate::transport::fault::Faults>) -> Self {
-        self.transport = self.transport.with_faults(faults);
-        self
+    /// Build the network factory around an already-configured [`Transport`]
+    ///
+    /// The caller ([`crate::raft::EzKv::new`]) builds one `Transport` per node and shares it with
+    /// this factory and with [`crate::rpc::Rpc`] alike (DESIGN.md §4): both send through the same
+    /// choke point, so both carry the same cluster token and see the same fault-injection rules.
+    pub(crate) fn new(transport: Transport) -> Self {
+        Self { transport }
     }
 }
 
 impl RaftNetworkFactory<C> for EzNetworkFactory {
     type Network = Network;
 
-    async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, target: u64, node: &Node) -> Self::Network {
         Network {
-            addr: node.addr.clone(),
+            addr: node.internal_addr.clone(),
             target,
             transport: self.transport.clone(),
         }
@@ -119,11 +113,15 @@ impl Network {
             .send(self.target, &self.addr, uri, option.soft_ttl(), req)
             .await
             .map_err(|e| match &e {
-                // A peer that does not answer in time - or, in test builds, one a fault dropped the
-                // request to - is treated like one that cannot be reached, so replication backs off
-                // instead of hammering it.
-                TransportError::Unreachable(_) => RPCError::Unreachable(Unreachable::new(&e)),
-                TransportError::Other(_) => RPCError::Network(NetworkError::new(&e)),
+                // A peer that does not answer in time, one that cannot be reached at all, or -
+                // in test builds - one a fault dropped the request to, are all the same to
+                // openraft: "the peer could not be reached, or did not answer in time", so
+                // replication backs off instead of hammering it. `crate::rpc` keeps these two
+                // apart; the Raft path here does not need to.
+                TransportError::Unreachable(_) | TransportError::Timeout(_) => {
+                    RPCError::Unreachable(Unreachable::new(&e))
+                }
+                TransportError::Unauthorized(_) | TransportError::Other(_) => RPCError::Network(NetworkError::new(&e)),
             })
     }
 }
