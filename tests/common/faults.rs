@@ -12,9 +12,9 @@ use ezraft::EzRaft;
 use ezraft::fault::Faults;
 
 use super::KvSm;
-use super::MemStorage;
 use super::config;
 use super::free_addr;
+use super::node_storage;
 use super::spawn_serve;
 
 /// The harness's usual test config (short heartbeat), with `faults` attached
@@ -34,7 +34,7 @@ pub fn config_with_faults(faults: &Faults) -> EzConfig {
 /// [`config_with_faults`] instead of the plain test config.
 pub async fn founding_node_with(config: EzConfig) -> io::Result<(String, EzRaft<KvSm>)> {
     let addr = free_addr();
-    let node = EzRaft::create(&addr, KvSm::default(), MemStorage::default(), config).await?;
+    let node = EzRaft::create(&addr, KvSm::default(), node_storage().await?, config).await?;
     spawn_serve(&node);
 
     // See `super::founding_node`: leading is not enough, the founding membership must be
@@ -53,7 +53,7 @@ pub async fn founding_node_with(config: EzConfig) -> io::Result<(String, EzRaft<
 /// The `_with` sibling of [`super::joined_voter`].
 pub async fn joined_voter_with(seed: &str, config: EzConfig) -> io::Result<(String, EzRaft<KvSm>)> {
     let addr = free_addr();
-    let node = EzRaft::join(&addr, seed, KvSm::default(), MemStorage::default(), config).await?;
+    let node = EzRaft::join(&addr, seed, KvSm::default(), node_storage().await?, config).await?;
     spawn_serve(&node);
     Ok((addr, node))
 }
@@ -63,7 +63,7 @@ pub async fn joined_voter_with(seed: &str, config: EzConfig) -> io::Result<(Stri
 /// The `_with` sibling of [`super::joined_learner`].
 pub async fn joined_learner_with(seed: &str, config: EzConfig) -> io::Result<(String, EzRaft<KvSm>)> {
     let addr = free_addr();
-    let node = EzRaft::join_as_learner(&addr, seed, KvSm::default(), MemStorage::default(), config).await?;
+    let node = EzRaft::join_as_learner(&addr, seed, KvSm::default(), node_storage().await?, config).await?;
     spawn_serve(&node);
     Ok((addr, node))
 }

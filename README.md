@@ -29,8 +29,8 @@ deserves, that is worth reporting.
   request and a response type you choose. That is the whole application interface.
 - **Your own types**: requests, responses and state are your structs. Serde moves them
   between nodes; nothing here deals in byte vectors.
-- **Storage included**: `FileStorage` persists to disk out of the box. Writing your own
-  is three methods.
+- **Storage included**: `RedbStorage` persists to disk (redb) out of the box. Writing your
+  own is three methods.
 - **Networking included**: every node serves the Raft RPCs its peers need and an HTTP
   API for your app. There is no transport to write.
 
@@ -74,7 +74,7 @@ impl EzApp for KvApp {
 }
 ```
 
-Then `main`, which is where the cluster comes from. `FileStorage` is the bundled
+Then `main`, which is where the cluster comes from. `RedbStorage` is the bundled
 `EzStorage`, so there is nothing else to implement:
 
 ```rust
@@ -85,7 +85,7 @@ async fn main() -> std::io::Result<()> {
     let addr = args.next().expect("usage: kvstore <addr> [seed_addr]");
     let seed = args.next();
 
-    let storage = FileStorage::new(format!("./data/{addr}")).await?;
+    let storage = RedbStorage::open(format!("./data/{addr}.redb")).await?;
     let (app, config) = (KvApp::default(), EzConfig::default());
 
     // The first node creates the cluster; every other one joins through a node in it

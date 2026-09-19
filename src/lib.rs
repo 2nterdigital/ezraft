@@ -40,7 +40,7 @@
 //! use ezraft::EzApp;
 //! use ezraft::EzConfig;
 //! use ezraft::EzRaft;
-//! use ezraft::FileStorage;
+//! use ezraft::RedbStorage;
 //! use serde::Deserialize;
 //! use serde::Serialize;
 //!
@@ -91,9 +91,9 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> io::Result<()> {
-//!     // 4. Where this node's state goes. One directory per node. `FileStorage`
-//!     //    is the bundled `EzStorage`; read its caveats before keeping it.
-//!     let storage = FileStorage::new("./data/node1").await?;
+//!     // 4. Where this node's state goes. One redb file per node. `RedbStorage`
+//!     //    is the production `EzStorage` this crate ships.
+//!     let storage = RedbStorage::open("./data/node1.redb").await?;
 //!
 //!     // 5. The first node of a cluster creates it; every other node joins
 //!     //    through any node already in it:
@@ -156,9 +156,9 @@ pub use raft::EzRaft;
 pub use snapshot::EzSnapshot;
 pub use snapshot::EzSnapshotMeta;
 pub use storage::EzStorage;
-pub use storage::FileStorage;
 pub use storage::Loaded;
 pub use storage::Persist;
+pub use storage::RedbStorage;
 #[cfg(feature = "fault-injection")]
 pub use transport::fault;
 pub use type_config::EzVote;

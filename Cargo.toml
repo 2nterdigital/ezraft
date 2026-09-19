@@ -48,11 +48,15 @@ futures     = { version = "0.3" }
 # The KV state machine is an immutable persistent ordered map: taking a view clones the root,
 # O(1), and readers never block `apply`.
 imbl        = { version = "7.0.2" }
+# The production `EzStorage`: one database, three tables (log, meta, snapshot), one
+# `Durability::Immediate` write transaction per `persist`. 4.3.0 or newer, per the storage decision
+# recorded in FORK.md; only the default `std` feature is needed.
+redb        = { version = "4.3.0" }
 reqwest     = { version = "0.12", features = ["json"] }
 serde       = { version = "1.0.114", features = ["derive"] }
 serde_json  = { version = "1.0.57" }
 thiserror   = { version = "2.0.20" }
-tokio       = { version = "1.39", default-features = false, features = ["fs", "io-util", "macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio       = { version = "1.39", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [features]
 # Test-only network fault injection (ech0-media#23): drop, delay, or hide the response of
@@ -68,6 +72,9 @@ ezraft             = { path = ".", features = ["fault-injection"] }
 # Proves the KV vocabulary round-trips through a positional format; becomes a normal dependency
 # with the snapshot codec (ech0-media#28). `alloc` is all `to_allocvec`/`from_bytes` need.
 postcard           = { version = "1.1.3", default-features = false, features = ["alloc"] }
+# One redb file per node under its own temp directory, for the in-process cluster tests
+# (`tests/common/`) and `RedbStorage`'s own unit tests.
+tempfile           = { version = "3" }
 tracing            = { version = "0.1" }
 tracing-subscriber = { version = "0.3.3", features = ["env-filter"] }
 

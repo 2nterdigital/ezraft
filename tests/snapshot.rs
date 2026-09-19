@@ -1,7 +1,9 @@
 //! Snapshots and the log they replace: persistence, restart, replay, catching a
 //! lagging node up, and purging what a snapshot covers
 //!
-//! Every test drives EzRaft through its public API and real HTTP between nodes.
+//! Every test drives EzRaft through its public API and real HTTP between nodes; a few also
+//! shut a node down and read its redb file directly through `RedbStorage`'s own public
+//! `load`/`read_logs` to confirm what actually reached disk, never through a private field.
 
 mod common;
 
@@ -11,16 +13,18 @@ use std::io;
 use common::*;
 use ezraft::EzConfig;
 use ezraft::EzRaft;
+use ezraft::EzStorage;
 use ezraft::ReadPolicy;
+use ezraft::RedbStorage;
 
 /// A snapshot must land on disk when built, and a restarted node must rebuild
 /// the full state from that snapshot plus the log entries after it.
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_survives_restart() -> io::Result<()> {
     let addr = free_addr();
-    let storage = MemStorage::default();
+    let path = node_data_path();
 
-    let a = EzRaft::create(&addr, KvSm::default(), storage.clone(), config()).await?;
+    let a = EzRaft::create(&addr, KvSm::default(), RedbStorage::open(&path).await?, config()).await?;
     a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "single node leads").await?;
 
     for i in 0..10 {
@@ -30,16 +34,6 @@ async fn snapshot_survives_restart() -> io::Result<()> {
     a.trigger_snapshot().await?;
     a.wait_metrics(WAIT, |m| m.snapshot.is_some(), "snapshot built").await?;
 
-    // The snapshot must be on disk with the full applied state: a restart
-    // reads only the disk, so an unpersisted snapshot is lost data.
-    {
-        let disk = storage.disk.lock().unwrap();
-        let (meta, data) = disk.snapshot.as_ref().expect("snapshot persisted to storage");
-        let snapshot_state: KvSm = serde_json::from_slice(data)?;
-        assert_eq!(expected_map(0..10), snapshot_state.data);
-        assert!(meta.last_log_id.is_some());
-    }
-
     // More writes after the snapshot: the restart must replay these on top.
     for i in 10..15 {
         a.write(set(&format!("k{}", i), &format!("v{}", i))).await?;
@@ -48,8 +42,20 @@ async fn snapshot_survives_restart() -> io::Result<()> {
     a.shutdown().await?;
     drop(a);
 
-    // Restart on the same disk with an empty state machine.
-    let restarted = EzRaft::create(&addr, KvSm::default(), storage.clone(), config()).await?;
+    // The snapshot must be on disk with the full pre-restart state, exactly as it was when
+    // built - later writes never change what an already-built snapshot holds. Loaded through
+    // `RedbStorage`'s own public seam, the same one a restart uses - never a private field.
+    {
+        let mut probe = RedbStorage::open(&path).await?;
+        let loaded = EzStorage::<KvSm>::load(&mut probe).await?;
+        let snapshot = loaded.snapshot.expect("snapshot persisted to storage");
+        let snapshot_state: KvSm = serde_json::from_slice(snapshot.snapshot.get_ref())?;
+        assert_eq!(expected_map(0..10), snapshot_state.data);
+        assert!(snapshot.meta.last_log_id.is_some());
+    }
+
+    // Restart on the same file with an empty state machine.
+    let restarted = EzRaft::create(&addr, KvSm::default(), RedbStorage::open(&path).await?, config()).await?;
     restarted.wait_metrics(WAIT, |m| m.current_leader == Some(0), "restarted node leads").await?;
     restarted
         .wait_metrics(
@@ -81,9 +87,9 @@ async fn snapshot_survives_restart() -> io::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restart_reapplies_the_entries_after_the_snapshot() -> io::Result<()> {
     let addr = free_addr();
-    let storage = MemStorage::default();
+    let path = node_data_path();
 
-    let a = EzRaft::create(&addr, tagged("replay"), storage.clone(), config()).await?;
+    let a = EzRaft::create(&addr, tagged("replay"), RedbStorage::open(&path).await?, config()).await?;
     a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "single node leads").await?;
 
     for i in 0..10 {
@@ -104,9 +110,9 @@ async fn a_restart_reapplies_the_entries_after_the_snapshot() -> io::Result<()> 
     a.shutdown().await?;
     drop(a);
 
-    // Restart on the same disk with an empty state machine: the snapshot restores the state up
+    // Restart on the same file with an empty state machine: the snapshot restores the state up
     // to k9, and the log carries k10..k15 back through `apply`.
-    let restarted = EzRaft::create(&addr, tagged("replay"), storage.clone(), config()).await?;
+    let restarted = EzRaft::create(&addr, tagged("replay"), RedbStorage::open(&path).await?, config()).await?;
     restarted.wait_metrics(WAIT, |m| m.current_leader == Some(0), "restarted node leads").await?;
     restarted
         .wait_metrics(
@@ -135,7 +141,7 @@ async fn a_restart_reapplies_the_entries_after_the_snapshot() -> io::Result<()> 
 #[tokio::test(flavor = "multi_thread")]
 async fn lagging_joiner_catches_up_from_snapshot() -> io::Result<()> {
     let addr_a = free_addr();
-    let a = EzRaft::create(&addr_a, KvSm::default(), MemStorage::default(), config()).await?;
+    let a = EzRaft::create(&addr_a, KvSm::default(), node_storage().await?, config()).await?;
     tokio::spawn({
         let a = a.clone();
         async move { a.serve().await }
@@ -160,7 +166,7 @@ async fn lagging_joiner_catches_up_from_snapshot() -> io::Result<()> {
     .await?;
 
     let addr_b = free_addr();
-    let b = EzRaft::join(&addr_b, &addr_a, KvSm::default(), MemStorage::default(), config()).await?;
+    let b = EzRaft::join(&addr_b, &addr_a, KvSm::default(), node_storage().await?, config()).await?;
     tokio::spawn({
         let b = b.clone();
         async move { b.serve().await }
@@ -190,13 +196,13 @@ async fn lagging_joiner_catches_up_from_snapshot() -> io::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn automatic_snapshot_purges_old_logs() -> io::Result<()> {
     let addr = free_addr();
-    let storage = MemStorage::default();
+    let path = node_data_path();
 
     let config = EzConfig {
         snapshot_interval: 5,
         ..config()
     };
-    let a = EzRaft::create(&addr, KvSm::default(), storage.clone(), config).await?;
+    let a = EzRaft::create(&addr, KvSm::default(), RedbStorage::open(&path).await?, config).await?;
     a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "single node leads").await?;
 
     for i in 0..12 {
@@ -211,22 +217,27 @@ async fn automatic_snapshot_purges_old_logs() -> io::Result<()> {
         )
         .await?;
 
-    let disk = storage.disk.lock().unwrap();
-    let (meta, data) = disk.snapshot.as_ref().expect("snapshot persisted to storage");
-    assert!(meta.last_log_id.is_some());
-    let snapshot_state: KvSm = serde_json::from_slice(data)?;
+    a.shutdown().await?;
+    drop(a);
+
+    // DeleteLogs must have reached storage: the snapshot itself is there with the full applied
+    // state, the purged index itself is gone, and the entry right above it survives. Checked
+    // through `RedbStorage`'s own public seam - the same one a restart uses - never a private
+    // field.
+    let mut probe = RedbStorage::open(&path).await?;
+    let loaded = EzStorage::<KvSm>::load(&mut probe).await?;
+    let snapshot = loaded.snapshot.expect("snapshot persisted to storage");
+    assert!(snapshot.meta.last_log_id.is_some());
+    let snapshot_state: KvSm = serde_json::from_slice(snapshot.snapshot.get_ref())?;
     assert!(!snapshot_state.data.is_empty());
 
-    // DeleteLogs must have reached storage: every entry at or below the purged
-    // index is gone, and entries above it survive.
     let purged_index = metrics.purged.unwrap().index;
-    let min_kept = *disk.logs.keys().next().expect("entries above the purge point remain");
     assert!(
-        min_kept > purged_index,
-        "min kept index {} must be above purged index {}",
-        min_kept,
-        purged_index
+        EzStorage::<KvSm>::read_logs(&mut probe, purged_index, purged_index + 1).await.is_err(),
+        "the purged index itself must be gone"
     );
+    let survivor = EzStorage::<KvSm>::read_logs(&mut probe, purged_index + 1, purged_index + 2).await?;
+    assert_eq!(1, survivor.len(), "the entry right above the purge point survives");
 
     Ok(())
 }
@@ -249,8 +260,15 @@ async fn restart_after_a_snapshot_with_no_log_after_it() -> io::Result<()> {
 
     // A learner, so `a` keeps a quorum by itself while this node stays dark.
     let addr_c = free_addr();
-    let disk_c = MemStorage::default();
-    let c = EzRaft::join_as_learner(&addr_c, &addr_a, KvSm::default(), disk_c.clone(), config()).await?;
+    let path_c = node_data_path();
+    let c = EzRaft::join_as_learner(
+        &addr_c,
+        &addr_a,
+        KvSm::default(),
+        RedbStorage::open(&path_c).await?,
+        config(),
+    )
+    .await?;
 
     for i in 0..10 {
         a.write(set(&format!("k{}", i), &format!("v{}", i))).await?;
@@ -278,20 +296,33 @@ async fn restart_after_a_snapshot_with_no_log_after_it() -> io::Result<()> {
     wait_for_applied(&c, &a).await?;
     assert_eq!(expected_map(0..10), c.read(|app| app.data.clone()).await?);
 
-    let meta = disk_c.disk.lock().unwrap().meta.clone();
+    c.shutdown().await?;
+    drop(c);
+
+    // The persisted metadata's log positions must be ordered the right way round - checked
+    // through `RedbStorage`'s own public load(), never a private field - or the next start
+    // reads back an inverted pair and openraft refuses it as a corrupted store.
+    let mut probe = RedbStorage::open(&path_c).await?;
+    let loaded = EzStorage::<KvSm>::load(&mut probe).await?;
     assert!(
-        meta.last_purged <= meta.last_log_id,
+        loaded.meta.last_purged <= loaded.meta.last_log_id,
         "persisted an inverted log range: last_purged={:?} last_log_id={:?}",
-        meta.last_purged,
-        meta.last_log_id
+        loaded.meta.last_purged,
+        loaded.meta.last_log_id
     );
+    drop(probe);
 
     // Opening the store again is the real check: it is where openraft reads
     // both positions back and refuses an inverted pair. A fresh address because
     // this node is only constructed, never served.
-    c.shutdown().await?;
-    drop(c);
-    EzRaft::join_as_learner(&free_addr(), &addr_a, KvSm::default(), disk_c, config()).await?;
+    EzRaft::join_as_learner(
+        &free_addr(),
+        &addr_a,
+        KvSm::default(),
+        RedbStorage::open(&path_c).await?,
+        config(),
+    )
+    .await?;
 
     Ok(())
 }

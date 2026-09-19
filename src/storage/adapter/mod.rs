@@ -6,6 +6,8 @@
 //!
 //! Users don't interact with this module directly - it's used internally by [`crate::EzRaft`].
 
+#[cfg(test)]
+mod conformance;
 mod log;
 mod state_machine;
 

@@ -16,7 +16,7 @@ use ezraft::EzRaft;
 #[tokio::test(flavor = "multi_thread")]
 async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Result<()> {
     let addr_a = free_addr();
-    let a = EzRaft::create(&addr_a, KvSm::default(), MemStorage::default(), config()).await?;
+    let a = EzRaft::create(&addr_a, KvSm::default(), node_storage().await?, config()).await?;
     tokio::spawn({
         let a = a.clone();
         async move { a.serve().await }
@@ -24,14 +24,14 @@ async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Resul
     a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "founding node leads").await?;
 
     let addr_b = free_addr();
-    let b = EzRaft::join(&addr_b, &addr_a, KvSm::default(), MemStorage::default(), config()).await?;
+    let b = EzRaft::join(&addr_b, &addr_a, KvSm::default(), node_storage().await?, config()).await?;
     tokio::spawn({
         let b = b.clone();
         async move { b.serve().await }
     });
 
     let addr_c = free_addr();
-    let c = EzRaft::join(&addr_c, &addr_a, KvSm::default(), MemStorage::default(), config()).await?;
+    let c = EzRaft::join(&addr_c, &addr_a, KvSm::default(), node_storage().await?, config()).await?;
     tokio::spawn({
         let c = c.clone();
         async move { c.serve().await }
@@ -95,7 +95,7 @@ async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Resul
 #[tokio::test(flavor = "multi_thread")]
 async fn learner_joins_and_stays_a_learner_until_promoted() -> io::Result<()> {
     let addr_a = free_addr();
-    let a = EzRaft::create(&addr_a, KvSm::default(), MemStorage::default(), config()).await?;
+    let a = EzRaft::create(&addr_a, KvSm::default(), node_storage().await?, config()).await?;
     tokio::spawn({
         let a = a.clone();
         async move { a.serve().await }
@@ -103,7 +103,7 @@ async fn learner_joins_and_stays_a_learner_until_promoted() -> io::Result<()> {
     a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "founding node leads").await?;
 
     let addr_b = free_addr();
-    let b = EzRaft::join_as_learner(&addr_b, &addr_a, KvSm::default(), MemStorage::default(), config()).await?;
+    let b = EzRaft::join_as_learner(&addr_b, &addr_a, KvSm::default(), node_storage().await?, config()).await?;
     tokio::spawn({
         let b = b.clone();
         async move { b.serve().await }

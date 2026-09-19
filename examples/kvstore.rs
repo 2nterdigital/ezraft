@@ -36,7 +36,7 @@ use clap::Parser;
 use ezraft::EzApp;
 use ezraft::EzConfig;
 use ezraft::EzRaft;
-use ezraft::FileStorage;
+use ezraft::RedbStorage;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
@@ -163,10 +163,9 @@ async fn main() -> io::Result<()> {
     // Create app and storage (use addr for directory name)
     let base_dir = PathBuf::from(format!("./data/{}", addr.replace(':', "-")));
 
-    // The bundled storage: readable JSON files, no fsync. A deployment implements
-    // `EzStorage` itself - see the caveats on `FileStorage`.
+    // The production storage: one redb file for this node's vote, log, meta and snapshot.
     let app = KvApp::default();
-    let storage = FileStorage::new(base_dir).await?;
+    let storage = RedbStorage::open(base_dir.join("node.redb")).await?;
 
     // Create EzRaft instance: the first node starts the cluster, the rest join it
     let config = EzConfig::default();

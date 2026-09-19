@@ -53,8 +53,8 @@ use clap::Parser;
 use ezraft::EzApp;
 use ezraft::EzConfig;
 use ezraft::EzRaft;
-use ezraft::FileStorage;
 use ezraft::ReadPolicy;
+use ezraft::RedbStorage;
 use ezraft::ServerState;
 use serde::Deserialize;
 use serde::Serialize;
@@ -259,7 +259,7 @@ async fn main() -> io::Result<()> {
 
     let args = Args::parse();
     let data_dir = PathBuf::from(format!("./data/timestamp-oracle/{}", args.addr.replace(':', "-")));
-    let storage = FileStorage::new(data_dir).await?;
+    let storage = RedbStorage::open(data_dir.join("node.redb")).await?;
     let config = EzConfig::default();
     let app = TimeState::default();
 

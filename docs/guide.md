@@ -115,7 +115,7 @@ use async_trait::async_trait;
 use ezraft::EzApp;
 use ezraft::EzConfig;
 use ezraft::EzRaft;
-use ezraft::FileStorage;
+use ezraft::RedbStorage;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -166,8 +166,8 @@ impl EzApp for KvApp {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    // One directory per node. `FileStorage` is the bundled `EzStorage`.
-    let storage = FileStorage::new("./data/node1").await?;
+    // One redb file per node. `RedbStorage` is the bundled `EzStorage`.
+    let storage = RedbStorage::open("./data/node1.redb").await?;
 
     // The first node of a cluster creates it; every other node joins through
     // any node already in it:
@@ -252,10 +252,10 @@ Raft's safety rests on three assumptions the implementation must keep: `persist`
 only once the data would survive a machine crash, operations become durable in the order
 they arrive, and `read_logs` reflects everything `persist` has written, deletions included.
 
-`FileStorage` implements this over JSON files in a directory, so a first cluster
-runs without writing storage code. It does not `fsync`, so a machine crash can
-lose a vote or a log entry the node already acknowledged - implement `EzStorage`
-yourself for anything past a demo. Its source is the worked example of doing so.
+`RedbStorage` implements this over a redb database - one file, three tables for the log,
+metadata and snapshot. Every `persist` call is one `Durability::Immediate` write
+transaction, so a machine crash does not lose a vote or a log entry the node already
+acknowledged. Its source is the worked example of doing so.
 
 ## The EzRaft API
 

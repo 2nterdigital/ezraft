@@ -160,11 +160,20 @@ where T: EzApp
         let mut meta = self.meta.lock().await;
         let mut storage = self.storage.lock().await;
 
-        // The position first. A crash between the two then leaves entries past the recorded
-        // `last_log_id`, which no read reaches and the next append overwrites; deleting first
-        // would leave metadata promising entries that are already gone.
-        meta.last_log_id = last_log_id.map(|id| id.to_type());
-        persist_meta(&mut meta, &mut **storage).await?;
+        // A caller may ask to truncate after a point the log has not reached yet - there is
+        // nothing there to remove. Recording that higher position anyway would advance
+        // `last_log_id` past what is actually stored, which the next read would then fail to
+        // find: truncation only ever lowers `last_log_id`, matching what `DeleteLogs` removes,
+        // so it is skipped once the log already ends at or before the requested position.
+        let nothing_to_truncate = meta.last_log_id.is_some_and(|(_, index)| from > index);
+
+        if !nothing_to_truncate {
+            // The position first. A crash between the two then leaves entries past the recorded
+            // `last_log_id`, which no read reaches and the next append overwrites; deleting
+            // first would leave metadata promising entries that are already gone.
+            meta.last_log_id = last_log_id.map(|id| id.to_type());
+            persist_meta(&mut meta, &mut **storage).await?;
+        }
 
         storage.persist(Persist::DeleteLogs { from, to: u64::MAX }).await
     }
@@ -235,9 +244,68 @@ where T: EzApp
             return Ok(Vec::new());
         }
 
-        // Load only the requested range from user storage
-        storage.read_logs(start, end).await
+        // The common case: the clamped range is exactly what the log has, in one read.
+        match storage.read_logs(start, end).await {
+            Ok(entries) => Ok(entries),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match find_present_start(&mut **storage, start, end).await? {
+                    Some(entries) => Ok(entries),
+                    // No leading gap to trim: the failure is a hole after real entries, which
+                    // must stay an error rather than be silently narrowed away.
+                    None => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
+}
+
+/// Find where log entries actually begin inside `[start, end)`, after a read of the whole range
+/// reported one missing.
+///
+/// `last_purged` only tracks purges this adapter itself performed; a direct
+/// [`RaftLogStorage::append`] call - openraft's own storage-conformance suite does this on
+/// purpose, to probe exactly this boundary - can start a fresh log above `last_purged` without
+/// ever purging what came before. [`EzStorage::read_logs`] then reports the untouched entries
+/// below it as missing, which [`RaftLogReader::try_get_log_entries`] must tolerate at the front
+/// of the range rather than fail on.
+///
+/// Probes index by index from `start`, and returns `None` - the original error is a real
+/// "hole after real data" - as soon as the very first probe already finds `start` itself
+/// present: `read_logs(start, end)` would not have failed on a leading gap that is zero wide.
+/// Otherwise returns `Ok(Some(entries))` for the narrower `[first_present, end)` once the first
+/// present index is found, so the caller propagates one coherent result rather than assembling
+/// one itself.
+async fn find_present_start<T>(
+    storage: &mut dyn EzStorage<T>,
+    start: u64,
+    end: u64,
+) -> Result<Option<Vec<<OpenRaftTypes<T> as RaftTypeConfig>::Entry>>, std::io::Error>
+where
+    T: EzApp,
+{
+    let mut probe = start;
+
+    loop {
+        if probe >= end {
+            return Ok(None);
+        }
+
+        match storage.read_logs(probe, probe + 1).await {
+            Ok(found) if !found.is_empty() => break,
+            Ok(_) => probe += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => probe += 1,
+            Err(e) => return Err(e),
+        }
+    }
+
+    if probe == start {
+        // The full-range read failed on something other than a leading gap - a hole after real
+        // entries - which must stay an error, not be silently trimmed away.
+        return Ok(None);
+    }
+
+    storage.read_logs(probe, end).await.map(Some)
 }
 
 #[cfg(test)]
