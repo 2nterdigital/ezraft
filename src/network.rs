@@ -209,8 +209,8 @@ impl RaftNetworkV2<C> for Network {
     ///
     /// Refuses outright, before sending anything, if `snapshot` is larger than this node's own
     /// [`EzConfig::snapshot_max_bytes`](crate::EzConfig::snapshot_max_bytes): logged, and
-    /// reported to openraft as `Unreachable` - see [`to_rpc_error`] for why nothing else will do
-    /// - so replication backs off and retries rather than spinning or wedging. Raising the
+    /// reported to openraft as `Unreachable`, so replication backs off and retries rather than
+    /// spinning or wedging ([`to_rpc_error`] says why nothing else will do). Raising the
     /// configured maximum (and this attempt eventually being retried) is what lets a lagging
     /// node catch up.
     async fn full_snapshot(
