@@ -96,6 +96,7 @@ pub mod snapshot;
 pub mod storage;
 mod transport;
 mod type_config;
+pub mod watch;
 mod write;
 
 // Re-export public API
@@ -134,5 +135,10 @@ pub use transport::fault;
 pub use type_config::EzVote;
 pub use type_config::Node;
 pub use type_config::OpenRaftTypes;
+pub use watch::ResetCause;
+pub use watch::WatchLimits;
+pub use watch::WatchStart;
+pub use watch::WatchStream;
+pub use watch::WatchUpdate;
 pub use write::NotLeader;
 pub use write::WriteError;
