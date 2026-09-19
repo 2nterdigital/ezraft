@@ -105,6 +105,18 @@
   因其崩溃还会触发换届），每次重启后断言已确认写入全部存在、三副本的值与 `create_rev`/`mod_rev` 完全一致、
   集群继续服务写入；断电点落在 vote 持久化前后时，磁盘上的 vote 与断电时机精确对应，且任一 term 至多一个
   leader。断电点按 persist 计数选取，无时序依赖。未在 `RedbStorage` 或适配层发现缺陷。
+- [#31 任意节点线性一致读（ReadIndex，follower 侧合并）](https://github.com/2nterdigital/ech0-media/issues/31)：
+  新增 `EzKv::linearizable_view(timeout) -> Result<View, ReadError>`（`src/read.rs` + `src/read/coalesce.rs`），
+  只支持 ReadIndex。leader 上取 read linearizer 并等本地 apply；follower / learner 经内部 RPC `ez.read_index`
+  向 leader 取读位置（leader 端确认 leadership，**不等待自身 apply**），再在本地等 applied 追上后返回本节点视图。
+  返回的视图不会落后于读位置：状态机在 `apply` 内部先发布视图，openraft 之后才得知该批已应用。follower 侧合并
+  由每节点一个经 channel 驱动的任务完成（无锁）：同一时刻最多一轮 RPC 在途，轮次进行中到达的请求只由**下一轮**
+  服务，N 个并发读最多两轮；放弃等待的请求不影响其他请求。错误：`NoLeader`（超时内无 leader、leader 不可达或
+  无法确认多数派）、`NotMember`、`NotCaughtUp { read_index, applied_index }`。`NotMember` 由 leader 按自己的
+  成员配置权威回答——被移出集群的节点可能永远收不到移除它的那条日志，其本地成员视图不可信。测试钩子新增按有向
+  节点对、按路径或流量类别的请求计数（`request_count` / `request_count_by_class`），验收测试据此统计 RPC 轮数，
+  非生产指标。**删除**原版遗留的 leader-only `linearizable(ReadPolicy)`，`ReadPolicy` 不再从 crate 根重导出。
+  新增 `tests/linearizable_read.rs`。
 
 ## 验证命令
 
