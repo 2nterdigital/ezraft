@@ -172,11 +172,12 @@ impl EzKv {
             let believed_leader = self.inner().metrics().borrow_watched().current_leader;
             match crate::write::attempt_command(self, request_id, body.clone(), remaining).await {
                 Attempt::Done(Ok(CommandOutcome::Registry)) => return Ok(()),
-                Attempt::Done(Ok(CommandOutcome::Txn(_))) => {
-                    unreachable!("update_node_meta only ever proposes CommandBody::RegisterNode")
-                }
-                Attempt::Done(Err(limit_err)) => {
-                    unreachable!("a registry command carries no configured limit to exceed: {limit_err}")
+                // A registry command is answered as one, and has no limit to exceed. Anything else
+                // came from a node that does not speak this one's protocol - a forwarded command's
+                // answer is a peer's to give - so it is not an outcome, and not worth a panic.
+                Attempt::Done(unexpected) => {
+                    tracing::error!(request_id = %request_id, outcome = ?unexpected, "unexpected answer to a registry command");
+                    self.wait_before_next_attempt(believed_leader, backoff, remaining).await;
                 }
                 Attempt::Retry(reason) => {
                     tracing::debug!(request_id = %request_id, %reason, "update_node_meta retry");

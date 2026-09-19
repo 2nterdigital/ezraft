@@ -2,13 +2,14 @@
 //!
 //! This module provides the primary [`EzKv`] struct users interact with: cluster lifecycle
 //! (`create`/`join`/`join_as_learner`/`serve`/`shutdown`), membership, metrics and the local
-//! view. The write path lives in `crate::write`, cluster observation in `crate::cluster`, and the
-//! node registry's handle-level half in `crate::registry` - each its own `impl EzKv` block, kept
-//! separate so this file stays about lifecycle and membership as it grows. This module still owns
-//! starting each of those (cluster observation's background task, the registry's self-registration
-//! task) from the node's own constructor, and the two membership operations that also touch the
-//! registry ([`EzKv::remove_node`]) or must stop a still-retrying registration
-//! ([`EzKv::shutdown`]).
+//! view. The write path lives in `crate::write`, cluster observation in `crate::cluster`, the
+//! node registry's handle-level half in `crate::registry`, and leader-only tasks in
+//! `crate::leader_task` - each its own `impl EzKv` block, kept separate so this file stays about
+//! lifecycle and membership as it grows. This module still owns starting each of those (cluster
+//! observation's background task, the registry's self-registration task, the leader-task
+//! supervisor and the built-in liveness task) from the node's own constructor, and the two
+//! membership operations that also touch the registry ([`EzKv::remove_node`]) or must stop a
+//! still-retrying registration ([`EzKv::shutdown`]).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -35,6 +36,7 @@ use crate::kv::Publisher;
 use crate::kv::Registry;
 use crate::kv::View;
 use crate::kv::ViewReceiver;
+use crate::leader_task::LeaderTasks;
 use crate::network::EzNetworkFactory;
 use crate::node_role::NodeRole;
 use crate::read::ReadIndexCoalescer;
@@ -142,6 +144,20 @@ pub struct EzKv {
     /// construction, if it has not finished yet - [`Self::shutdown`] aborts it, so "retries until
     /// it succeeds" does not mean "forever, even after this node has stopped" (ech0-media#33)
     self_registration: Arc<Mutex<Option<JoinHandle<()>>>>,
+
+    /// This node's leader-task supervisor (ech0-media#34): the mechanism behind
+    /// [`Self::spawn_leader_task`](crate::leader_task), holding every registered factory and
+    /// whichever leadership epoch's runs are currently active
+    leader_tasks: Arc<LeaderTasks>,
+
+    /// `EzConfig::liveness_threshold`, read by the built-in liveness task (`crate::liveness`)
+    liveness_threshold: Duration,
+
+    /// `EzConfig::liveness_grace`, read by the built-in liveness task (`crate::liveness`)
+    liveness_grace: Duration,
+
+    /// `EzConfig::liveness_check_interval`, read by the built-in liveness task (`crate::liveness`)
+    liveness_check_interval: Duration,
 }
 
 impl Clone for EzKv {
@@ -167,6 +183,10 @@ impl Clone for EzKv {
             leader_contact: self.leader_contact.clone(),
             external_addr: self.external_addr.clone(),
             self_registration: self.self_registration.clone(),
+            leader_tasks: self.leader_tasks.clone(),
+            liveness_threshold: self.liveness_threshold,
+            liveness_grace: self.liveness_grace,
+            liveness_check_interval: self.liveness_check_interval,
         }
     }
 }
@@ -272,6 +292,11 @@ impl EzKv {
         }
         let cluster_token: Arc<str> = Arc::from(config.cluster_token.as_str());
 
+        // Same "fail on nothing but the caller's own arguments" discipline as the token check
+        // above and `to_raft_config` below (ech0-media#34): a shorter grace than threshold could
+        // mark a peer `Down` before a freshly elected leader could possibly have heard from it.
+        config.validate_liveness()?;
+
         // Converted first, because it is the only step that can fail on nothing but its
         // arguments, and everything below it either takes an id from the cluster or changes the
         // cluster's membership. A configuration this node cannot run with must not first cost the
@@ -282,6 +307,9 @@ impl EzKv {
         let write_deadline = config.write_deadline;
         let json_body_limit = config.json_body_limit;
         let snapshot_max_bytes = config.snapshot_max_bytes;
+        let liveness_threshold = config.liveness_threshold;
+        let liveness_grace = config.liveness_grace;
+        let liveness_check_interval = config.liveness_check_interval;
         let watch_limits = config.watch_limits;
         // Remembered for `crate::registry::EzKv::update_node_meta` to re-register with the same
         // address later; `node_meta` is only ever needed once, for the startup registration below.
@@ -418,6 +446,10 @@ impl EzKv {
             leader_contact: LeaderContact::default(),
             external_addr,
             self_registration: Arc::new(Mutex::new(None)),
+            leader_tasks: LeaderTasks::new(),
+            liveness_threshold,
+            liveness_grace,
+            liveness_check_interval,
         };
 
         // Started last, once `ez` itself exists to hand the task a working handle: this node
@@ -425,6 +457,15 @@ impl EzKv {
         // (ech0-media#33). `Self::shutdown` aborts it if it is still retrying.
         let handle = crate::registry::spawn_self_registration(ez.clone(), ez.external_addr.to_string(), node_meta);
         *ez.self_registration.lock().unwrap() = Some(handle);
+
+        // Also started last, for the same reason: this node's leader-task supervisor needs a
+        // working `ez` to hand every run (ech0-media#34). The built-in liveness task is
+        // registered through the very same public mechanism any other leader task would use -
+        // nothing privileged about it beyond running first, and beyond a fresh single-node
+        // cluster already leading by the time this call happens, which is exactly the case
+        // `crate::leader_task::LeaderTasks::register`'s own "start at once" path exists for.
+        ez.leader_tasks.spawn_supervisor(ez.clone());
+        crate::liveness::install(&ez);
 
         Ok(ez)
     }
@@ -453,6 +494,27 @@ impl EzKv {
     /// `EzConfig::snapshot_max_bytes`, for [`crate::server::bind`]
     pub(crate) fn snapshot_max_bytes(&self) -> usize {
         self.snapshot_max_bytes
+    }
+
+    /// This node's leader-task supervisor, for [`Self::spawn_leader_task`] (defined in
+    /// `crate::leader_task`, its own `impl EzKv` block)
+    pub(crate) fn leader_tasks(&self) -> &Arc<LeaderTasks> {
+        &self.leader_tasks
+    }
+
+    /// `EzConfig::liveness_threshold`, for the built-in liveness task (`crate::liveness`)
+    pub(crate) fn liveness_threshold(&self) -> Duration {
+        self.liveness_threshold
+    }
+
+    /// `EzConfig::liveness_grace`, for the built-in liveness task (`crate::liveness`)
+    pub(crate) fn liveness_grace(&self) -> Duration {
+        self.liveness_grace
+    }
+
+    /// `EzConfig::liveness_check_interval`, for the built-in liveness task (`crate::liveness`)
+    pub(crate) fn liveness_check_interval(&self) -> Duration {
+        self.liveness_check_interval
     }
 
     /// This node's latest published view of the KV

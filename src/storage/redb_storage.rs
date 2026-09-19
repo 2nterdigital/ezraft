@@ -330,6 +330,7 @@ mod tests {
             payload: EntryPayload::Normal(Command {
                 request_id: RequestId::new(),
                 ledger_capacity: 100,
+                required_term: None,
                 body: CommandBody::Txn(Txn::new().put("k", Bytes::from(n.to_le_bytes().to_vec()))),
             }),
         }
