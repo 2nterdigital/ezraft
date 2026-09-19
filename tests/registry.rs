@@ -12,6 +12,9 @@ use bytes::Bytes;
 use common::*;
 use ezraft::EzConfig;
 use ezraft::EzKv;
+use ezraft::KvLimits;
+use ezraft::LimitError;
+use ezraft::RegistryWriteError;
 
 /// A test config with a distinguishing `external_addr`/`node_meta`, everything else the harness's
 /// usual short-heartbeat defaults.
@@ -21,6 +24,89 @@ fn config_for(external_addr: &str, meta: &str) -> EzConfig {
         node_meta: Bytes::copy_from_slice(meta.as_bytes()),
         ..config()
     }
+}
+
+/// A node's registry entry is replicated through the log like any value, so it is held to the
+/// size of one: an oversized `meta` is refused outright - on a follower before anything is sent,
+/// and at startup before the node exists - rather than committed on the leader and then refused
+/// by every follower's request body limit forever after.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_entry_larger_than_a_single_value_is_refused() -> io::Result<()> {
+    let (addr_a, a, _data_a) = founding_node_with(config_for("a.example:1", "meta-a")).await?;
+    let (_, b, _data_b) = joined_voter_with(&addr_a, config_for("b.example:1", "meta-b")).await?;
+    wait_for_voters(&a, BTreeSet::from([0, b.node_id()]), "b joined as a voter").await?;
+    wait_for_registry(&a, |r| r.len() == 2, "both nodes registered").await?;
+
+    let max = KvLimits::default().max_value_bytes;
+    for node in [&a, &b] {
+        let refused = node.update_node_meta(vec![0u8; max]).await.expect_err("the address takes it over the limit");
+        assert!(
+            matches!(
+                refused,
+                RegistryWriteError::LimitExceeded(LimitError::NodeEntryTooLarge { actual, max: limit })
+                    if actual > max && limit == max
+            ),
+            "unexpected error: {refused}"
+        );
+    }
+    let unchanged = a.registry().get(b.node_id()).map(|info| info.meta);
+    assert_eq!(
+        Some(Bytes::from_static(b"meta-b")),
+        unchanged,
+        "a refused update changes nothing"
+    );
+
+    // The same bound, met at startup: the node never comes up, and never asks the cluster for anything.
+    let oversized = EzConfig {
+        node_meta: Bytes::from(vec![0u8; max + 1]),
+        ..config()
+    };
+    let data = NodeData::new();
+    let err = EzKv::join(free_addr(), &addr_a, data.open().await?, oversized)
+        .await
+        .map(|_| ())
+        .expect_err("an entry that can never be accepted is refused at startup");
+    assert_eq!(io::ErrorKind::InvalidInput, err.kind(), "unexpected error: {err}");
+    assert!(
+        err.to_string().contains("node_meta"),
+        "the error names the setting: {err}"
+    );
+
+    Ok(())
+}
+
+/// Only a member has an entry. A node that was removed but is still running must not be able to
+/// put its own entry back - not even until the leader's next reconciliation, which this test
+/// keeps from ever running.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_node_cannot_put_its_entry_back() -> io::Result<()> {
+    let never_reconciling = |external_addr: &str, meta: &str| EzConfig {
+        liveness_threshold: std::time::Duration::from_secs(3600),
+        liveness_grace: std::time::Duration::from_secs(3600),
+        liveness_check_interval: std::time::Duration::from_secs(3600),
+        ..config_for(external_addr, meta)
+    };
+    let (addr_a, a, _data_a) = founding_node_with(never_reconciling("a.example:1", "meta-a")).await?;
+    let (_, removed, _data_r) = joined_learner_with(&addr_a, never_reconciling("r.example:1", "meta-r")).await?;
+    let removed_id = removed.node_id();
+    wait_for_registry(&a, |r| r.get(removed_id).is_some(), "the learner registered itself").await?;
+
+    a.remove_node(removed_id).await.map_err(|e| io::Error::other(e.to_string()))?;
+    wait_for_registry(&a, |r| r.get(removed_id).is_none(), "its entry went with it").await?;
+
+    // Still running, and it still knows who leads: the update reaches the leader and is
+    // committed - as a command that changes nothing.
+    removed.update_node_meta("meta-r-again").await.map_err(|e| io::Error::other(e.to_string()))?;
+    let revision = a.write(set("after", "the-update")).await.map_err(|e| io::Error::other(e.to_string()))?;
+    wait_for_revision(&a, revision).await?;
+
+    assert_eq!(
+        None,
+        a.registry().get(removed_id),
+        "a removed node has no entry, whatever it proposes"
+    );
+
+    Ok(())
 }
 
 /// A new node's `external_addr` and `meta` appear in every node's registry once it has started -

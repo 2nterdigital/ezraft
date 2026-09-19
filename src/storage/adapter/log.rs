@@ -331,7 +331,7 @@ mod tests {
     async fn recording_log_store() -> (LogStore, Arc<StdMutex<Vec<String>>>) {
         let recorder = Recorder::default();
         let ops = recorder.ops.clone();
-        let (log, _sm) = open(recorder).await.unwrap();
+        let (log, _sm) = open(recorder, crate::watch::WatchLimits::default()).await.unwrap();
         (log, ops)
     }
 

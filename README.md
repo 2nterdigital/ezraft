@@ -102,8 +102,9 @@ curl '127.0.0.1:9082/view?key=hello'
 curl 127.0.0.1:9080/status
 ```
 
-See the [guide](docs/guide.md) for the rest of that API, every route's request and response
-shape, and the foundation's full public API and error semantics.
+Those routes are the example's own (`examples/kvstore/api.rs` documents each one's request and
+response); the crate ships none. See the [guide](docs/guide.md) for the foundation's full public
+API and error semantics.
 
 ## Status
 

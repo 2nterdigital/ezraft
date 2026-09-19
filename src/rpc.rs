@@ -13,7 +13,7 @@
 //! only this side's wait - the remote handler, once started, runs to completion regardless.
 
 mod error;
-mod registry;
+mod handlers;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -21,10 +21,10 @@ use std::time::Duration;
 
 pub use error::RpcError;
 pub use error::RpcRegisterError;
+use handlers::Handlers;
+use handlers::Outcome;
 use openraft::async_runtime::WatchReceiver;
 use openraft::error::Infallible;
-use registry::Outcome;
-use registry::Registry;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -53,7 +53,7 @@ pub struct Rpc {
     node_id: u64,
     raft: ORRaft,
     transport: Transport,
-    registry: Arc<Registry>,
+    handlers: Arc<Handlers>,
 }
 
 impl Rpc {
@@ -69,7 +69,7 @@ impl Rpc {
             node_id,
             raft,
             transport,
-            registry: Arc::new(Registry::default()),
+            handlers: Arc::new(Handlers::default()),
         }
     }
 
@@ -132,7 +132,7 @@ impl Rpc {
         F: Fn(Req) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Resp, E>> + Send + 'static,
     {
-        if self.registry.register(name.clone(), handler) {
+        if self.handlers.register(name.clone(), handler) {
             Ok(())
         } else {
             Err(RpcRegisterError::AlreadyRegistered(name))
@@ -143,9 +143,9 @@ impl Rpc {
     ///
     /// Addressed by node id: the address comes from this node's own current membership. Calling
     /// this node's own id works the same as calling any other - it dispatches straight into the
-    /// local registry, with no HTTP round trip and no token check (a node trusts itself), but the
-    /// same `timeout` and the same [`RpcError`] taxonomy apply either way, so a caller never needs
-    /// a special case for it.
+    /// local handler table, with no HTTP round trip and no token check (a node trusts itself), but
+    /// the same `timeout` and the same [`RpcError`] taxonomy apply either way, so a caller
+    /// never needs a special case for it.
     ///
     /// No automatic retry happens here, ever. Dropping the returned future cancels only this
     /// side's wait; a remote handler that has already started keeps running to completion.
@@ -156,7 +156,7 @@ impl Rpc {
     pub async fn call<Req, Resp>(&self, node_id: u64, name: &str, req: Req, timeout: Duration) -> Result<Resp, RpcError>
     where
         Req: Serialize + Send + 'static,
-        Resp: Serialize + DeserializeOwned + Send + 'static,
+        Resp: DeserializeOwned + Send + 'static,
     {
         if node_id == self.node_id {
             return self.call_local(name, req, timeout).await;
@@ -183,7 +183,11 @@ impl Rpc {
                 name: name.to_string(),
             }),
             Err(TransportError::Unauthorized(_)) => Err(RpcError::Unauthorized(node_id)),
-            Err(TransportError::Other(msg)) => Err(RpcError::Remote(format!("'{name}': {msg}"))),
+            Err(TransportError::Other(message)) => Err(RpcError::Transport {
+                node_id,
+                name: name.to_string(),
+                message,
+            }),
         }
     }
 
@@ -193,18 +197,25 @@ impl Rpc {
         Req: Serialize + Send + 'static,
         Resp: DeserializeOwned + Send + 'static,
     {
-        let body =
-            serde_json::to_vec(&req).map_err(|e| RpcError::Remote(format!("'{name}': request did not encode: {e}")))?;
+        // The same taxonomy as a call over the network, where a request that will not encode and
+        // a response that will not decode both surface from the transport.
+        let in_transit = |message: String| RpcError::Transport {
+            node_id: self.node_id,
+            name: name.to_string(),
+            message,
+        };
 
-        let value = tokio::time::timeout(timeout, self.registry.dispatch(name, body)).await.map_err(|_elapsed| {
+        let body = serde_json::to_vec(&req).map_err(|e| in_transit(format!("request did not encode: {e}")))?;
+
+        let value = tokio::time::timeout(timeout, self.handlers.dispatch(name, body)).await.map_err(|_elapsed| {
             RpcError::Timeout {
                 node_id: self.node_id,
                 name: name.to_string(),
             }
         })?;
 
-        let outcome: Outcome<Resp> = serde_json::from_value(value)
-            .map_err(|e| RpcError::Remote(format!("'{name}': response did not decode: {e}")))?;
+        let outcome: Outcome<Resp> =
+            serde_json::from_value(value).map_err(|e| in_transit(format!("response did not decode: {e}")))?;
 
         outcome.into_rpc_result(name)
     }
@@ -224,8 +235,8 @@ impl Rpc {
     ///
     /// Used by [`crate::server`]'s `/rpc/{name}` route, which owns turning the returned JSON
     /// value into an HTTP response; this method itself never fails, an unknown name included -
-    /// see [`registry::Registry::dispatch`].
+    /// see [`handlers::Handlers::dispatch`].
     pub(crate) async fn dispatch(&self, name: &str, body: Vec<u8>) -> serde_json::Value {
-        self.registry.dispatch(name, body).await
+        self.handlers.dispatch(name, body).await
     }
 }

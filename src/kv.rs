@@ -1,7 +1,7 @@
 //! `EzKv`: the replicated key-value store (ech0-media#27)
 //!
 //! This module is the pure state machine the foundation replicates: conditional transactions,
-//! revisions, consistent views and the change groups `watch` (ech0-media#32) will deliver. It has
+//! revisions, consistent views and the change groups `watch` (ech0-media#32) delivers. It has
 //! no knowledge of Raft, networking or storage itself - `KvState::apply` (crate-internal) is a
 //! plain function from a transaction to a result, deterministic on every replica.
 //! `crate::storage::adapter::state_machine` wires this state machine into Raft, and
@@ -24,7 +24,7 @@
 //! - **[`view::View`]** is a cheap, lock-free, point-in-time read handle: cloning it clones only
 //!   the persistent map's root, never blocking `KvState::apply` and never blocking other readers.
 //! - **[`change::Changes`]** is the group of [`change::Change`]s one successful transaction
-//!   produced, in op order - what a future `watch` (ech0-media#32) delivers per revision.
+//!   produced, in op order - what `watch` (ech0-media#32) delivers per revision.
 //!
 //! # Foundation-internal state
 //!
@@ -80,6 +80,7 @@ pub(crate) use registry::RemoveNode;
 pub(crate) use registry::SetStatus;
 pub(crate) use snapshot_codec::decode_snapshot;
 pub(crate) use snapshot_codec::encode_snapshot;
+pub(crate) use state::InternalState;
 pub(crate) use state::KvState;
 pub use txn::Condition;
 pub use txn::Conflict;

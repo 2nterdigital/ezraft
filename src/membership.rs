@@ -94,7 +94,7 @@ impl EzKv {
     /// entry (ech0-media#33), best-effort within one `EzConfig::write_deadline` -
     /// `crate::registry::remove_entry`'s own docs cover why that is never reported back as this
     /// call's own error, and the window a leader crash between the two steps leaves (reconciled by
-    /// a future leader-only task, ech0-media#34).
+    /// the built-in liveness task, `crate::liveness`).
     pub async fn remove_node(&self, node_id: u64) -> Result<(), io::Error> {
         let metrics = self.metrics().await;
         let node = BTreeSet::from([node_id]);

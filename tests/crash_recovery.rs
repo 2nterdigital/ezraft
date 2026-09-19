@@ -293,6 +293,14 @@ async fn build_trial(victim: Victim) -> io::Result<Trial> {
     let voters = BTreeSet::from([a.node_id(), b.node_id(), c.node_id()]);
     wait_for_voters(&a, voters, "every joined node is a voter").await?;
 
+    // Every node registers itself in the background, retrying until it lands - a log entry, and
+    // so a persist on every node, at a moment no test controls. A crash point is addressed by
+    // counting persists from a baseline, so the last of those has to be behind every node before
+    // any baseline is taken: from here on, nothing but the test's own actions persists anything.
+    for node in [&a, &b, &c] {
+        wait_for_registry(node, |r| r.len() == 3, "every node's self-registration has landed").await?;
+    }
+
     let handle = handle_a.or(handle_b).expect("exactly one slot is wrapped in a CrashStorage");
     let victim_index = if victim == Victim::Leader { 0 } else { 1 };
 

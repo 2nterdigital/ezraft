@@ -3,6 +3,7 @@
 //! EzRaft provides sensible defaults for all Raft timing parameters.
 //! Users can optionally customize a few key parameters.
 
+use std::fmt;
 use std::io;
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use crate::watch::WatchLimits;
 /// Most users can use `EzConfig::default()` directly.
 ///
 /// Election timeout is automatically calculated as 3-6x the heartbeat interval.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EzConfig {
     /// Heartbeat interval
     ///
@@ -119,12 +120,13 @@ pub struct EzConfig {
     /// this node will ever attempt to *send* (ech0-media#26).
     ///
     /// Exceeding it is an explicit error on both sides: the sending node refuses to start a
-    /// transfer over its own configured maximum (logged, and reported to openraft as a network
-    /// error, so replication backs off and retries rather than wedging - raising the limit is what
-    /// lets a later retry succeed); the receiving node's `/raft/snapshot` route answers a body over
-    /// its own configured maximum with `413` (`actix_web::web::PayloadConfig`) before ever
-    /// attempting to decode it. A cluster where nodes disagree on this value can have a leader
-    /// whose snapshots are too small to trip its own check but too large for a stricter follower's
+    /// transfer over its own configured maximum (logged, and reported to openraft as an
+    /// unreachable peer, so replication backs off and retries rather than wedging - raising the
+    /// limit is what lets a later retry succeed); the receiving node's `/raft/snapshot` route
+    /// answers a body over its own configured maximum with `413`
+    /// (`actix_web::web::PayloadConfig`) before ever attempting to decode it. A cluster where
+    /// nodes disagree on this value can have a leader whose snapshots are too small to trip its
+    /// own check but too large for a stricter follower's
     /// - configure it the same on every node.
     ///
     /// Default: provisional until benchmarked (ech0-media#36); 64 MiB. The snapshot design
@@ -240,6 +242,59 @@ pub struct EzConfig {
     /// `ezraft::fault`. Default: `None`.
     #[cfg(feature = "fault-injection")]
     pub faults: Option<crate::transport::fault::Faults>,
+}
+
+/// Written out rather than derived, for one field: [`EzConfig::cluster_token`] is a secret, and a
+/// configuration is exactly the kind of value that gets logged whole at startup.
+impl fmt::Debug for EzConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured in full, so that a field added later cannot be left out of this by
+        // accident - or, were it another secret, shown by default.
+        let Self {
+            heartbeat_interval,
+            snapshot_interval,
+            snapshot_log_to_keep,
+            replication_lag_threshold,
+            cluster_token: _,
+            kv_limits,
+            watch_limits,
+            json_body_limit,
+            snapshot_max_bytes,
+            snapshot_timeout,
+            ledger_capacity,
+            write_deadline,
+            external_addr,
+            node_meta,
+            liveness_threshold,
+            liveness_grace,
+            liveness_check_interval,
+            #[cfg(feature = "fault-injection")]
+            faults,
+        } = self;
+
+        let mut shown = f.debug_struct("EzConfig");
+        shown
+            .field("heartbeat_interval", heartbeat_interval)
+            .field("snapshot_interval", snapshot_interval)
+            .field("snapshot_log_to_keep", snapshot_log_to_keep)
+            .field("replication_lag_threshold", replication_lag_threshold)
+            .field("cluster_token", &"<redacted>")
+            .field("kv_limits", kv_limits)
+            .field("watch_limits", watch_limits)
+            .field("json_body_limit", json_body_limit)
+            .field("snapshot_max_bytes", snapshot_max_bytes)
+            .field("snapshot_timeout", snapshot_timeout)
+            .field("ledger_capacity", ledger_capacity)
+            .field("write_deadline", write_deadline)
+            .field("external_addr", external_addr)
+            .field("node_meta", node_meta)
+            .field("liveness_threshold", liveness_threshold)
+            .field("liveness_grace", liveness_grace)
+            .field("liveness_check_interval", liveness_check_interval);
+        #[cfg(feature = "fault-injection")]
+        shown.field("faults", faults);
+        shown.finish()
+    }
 }
 
 impl Default for EzConfig {
@@ -470,6 +525,25 @@ mod tests {
 
     /// The defaults keep the grace period at least as long as the threshold, matching the
     /// documented minimum.
+    /// A configuration gets logged whole; the cluster token must not go with it.
+    #[test]
+    fn debug_output_never_contains_the_cluster_token() {
+        let config = EzConfig {
+            cluster_token: "s3cret-cluster-token".to_string(),
+            ..EzConfig::default()
+        };
+        let shown = format!("{config:?} {config:#?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(
+            shown.contains("cluster_token") && shown.contains("<redacted>"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("heartbeat_interval"),
+            "every other field is still shown: {shown}"
+        );
+    }
+
     #[test]
     fn the_default_liveness_grace_is_at_least_the_default_threshold() {
         assert!(EzConfig::default().validate_liveness().is_ok());

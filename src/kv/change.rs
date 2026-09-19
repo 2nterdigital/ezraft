@@ -1,7 +1,7 @@
 //! `Changes`: the group of changes one successful transaction produced
 //!
 //! `KvState::apply` (crate-internal) returns a `Changes` alongside every
-//! successful transaction. It is the unit `watch` (ech0-media#32) will deliver per revision:
+//! successful transaction. It is the unit `watch` (ech0-media#32) delivers per revision:
 //! everything one transaction changed, sharing that transaction's revision, in the order its ops
 //! ran.
 

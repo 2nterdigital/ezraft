@@ -42,8 +42,7 @@ struct Subscriber {
     prefix: String,
     /// Items ready for this subscriber's [`WatchStream`] to pop, in delivery order
     queue: VecDeque<WatchUpdate>,
-    /// [`WatchLimits::subscriber_queue_len`] at the time this subscriber registered (or was last
-    /// reconfigured) - see [`Hub::configure`]
+    /// [`WatchLimits::subscriber_queue_len`]
     max_queue_len: usize,
     /// The revision this subscriber has been given something for (a `Changes`, `Reset` or
     /// `Progress`), or its registration revision if nothing has been sent yet. `Progress` is only
@@ -117,22 +116,6 @@ impl Hub {
             handle.spawn(progress_loop(Arc::downgrade(&hub)));
         }
         hub
-    }
-
-    /// Replace the retention and delivery limits this hub was created with
-    ///
-    /// Called exactly once, by `crate::raft::EzKv::new`, before this node's Raft engine starts -
-    /// so before any transaction can be applied and before any caller could have registered a
-    /// subscription yet. `Hub::new` itself has to use *some* limits (it is constructed before
-    /// `EzConfig` reaches it), so this only ever narrows or widens an otherwise-unused hub, never
-    /// changes behavior a subscriber has already observed.
-    pub(crate) fn configure(&self, limits: WatchLimits) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.window.reconfigure(limits.max_window_groups, limits.max_window_bytes);
-        for sub in inner.subscribers.values_mut() {
-            sub.max_queue_len = limits.subscriber_queue_len;
-        }
-        inner.limits = limits;
     }
 
     /// Record one applied transaction's changes and hand each subscriber whatever of it matches
@@ -249,10 +232,12 @@ impl Hub {
     pub(crate) fn poll_subscriber(&self, id: u64, cx: &mut Context<'_>) -> Poll<Option<WatchUpdate>> {
         let mut inner = self.inner.lock().unwrap();
         let closed = inner.closed;
-        let sub = inner
-            .subscribers
-            .get_mut(&id)
-            .expect("a WatchStream polls only while its own subscriber entry is registered - Drop removes it last");
+        // A `WatchStream` polls only while its own subscriber entry is registered - `Drop` removes
+        // it last - so there is always one. Were there not, the stream has nothing left to
+        // deliver: that is an ended stream, not a reason to panic in the consumer's task.
+        let Some(sub) = inner.subscribers.get_mut(&id) else {
+            return Poll::Ready(None);
+        };
 
         match sub.queue.pop_front() {
             Some(item) => Poll::Ready(Some(item)),

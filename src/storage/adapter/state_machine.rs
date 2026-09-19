@@ -5,7 +5,6 @@
 //! and installing a snapshot or finishing startup recovery publishes again ([`Self::new`],
 //! [`RaftStateMachine::install_snapshot`]).
 
-use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Seek;
@@ -29,12 +28,11 @@ use openraft::storage::EntryResponder;
 use openraft::storage::RaftStateMachine;
 use tokio::sync::Mutex;
 
-use crate::command::Command;
-use crate::command::CommandBody;
-use crate::command::CommandOutcome;
+use crate::kv::InternalState;
 use crate::kv::KvState;
 use crate::kv::Publisher;
 use crate::kv::Registry;
+use crate::kv::View;
 use crate::kv::ViewReceiver;
 use crate::kv::decode_snapshot;
 use crate::kv::encode_snapshot;
@@ -44,6 +42,7 @@ use crate::snapshot::EzSnapshotMeta;
 use crate::storage::Persist;
 use crate::storage::adapter::SharedStorage;
 use crate::type_config::OpenRaftTypes;
+use crate::watch::WatchLimits;
 
 /// Internal state machine wrapper that tracks Raft metadata alongside the KV
 struct StateMachineState {
@@ -116,7 +115,11 @@ impl StateMachineStore {
     /// reported here as a plain `Err`, which is exactly how `crate::raft::EzKv::new` (via
     /// `crate::storage::adapter::open`) already propagates every other startup failure: it makes
     /// `create`/`join` fail outright rather than starting a node on a snapshot it cannot read.
-    pub(super) fn new(storage: SharedStorage, snapshot: Option<EzSnapshot>) -> Result<Self, std::io::Error> {
+    pub(super) fn new(
+        storage: SharedStorage,
+        snapshot: Option<EzSnapshot>,
+        watch_limits: WatchLimits,
+    ) -> Result<Self, std::io::Error> {
         let (last_applied, membership, kv) = match &snapshot {
             Some(snap) => {
                 let decoded = decode_snapshot(snap.snapshot.get_ref())
@@ -139,7 +142,7 @@ impl StateMachineStore {
             None => (None, StoredMembership::new(None, Membership::default()), KvState::new()),
         };
 
-        let (publisher, view_rx, registry_rx) = Publisher::new(kv.view(), kv.registry());
+        let (publisher, view_rx, registry_rx) = Publisher::new(kv.view(), kv.registry(), watch_limits);
 
         let sm_state = StateMachineState {
             kv,
@@ -221,117 +224,22 @@ impl RaftStateMachine<OpenRaftTypes> for StateMachineStore {
             sm.last_applied = Some(log_id);
 
             let resp = match entry.payload {
-                // A command fenced to a term takes effect only if this very entry was appended in
-                // that term (ech0-media#34). Decided from the entry alone - its own log term
-                // against the term it carries - so every replica refuses it identically, and
-                // before anything else looks at it: a refused command touches neither the state
-                // nor the ledger.
-                EntryPayload::Normal(Command {
-                    required_term: Some(required),
-                    ..
-                }) if required != term => Some(CommandOutcome::StaleTerm),
-                EntryPayload::Normal(Command {
-                    request_id,
-                    ledger_capacity,
-                    body: CommandBody::Txn(txn),
-                    ..
-                }) => {
-                    // The idempotency ledger (ech0-media#30) is consulted *inside*
-                    // `apply_idempotent`, before `txn` ever runs: a retried request id comes back
-                    // as the outcome already recorded for it, with `changes: None`. Publish before
-                    // answering the writer (ech0-media#16) only applies to a freshly executed
-                    // command - a deduplicated one changed nothing, so there is nothing new to
-                    // publish.
-                    let applied = sm.kv.apply_idempotent(request_id, ledger_capacity as usize, &txn);
+                // What a command means is `Command::apply`'s to decide, from the log and the
+                // replicated state alone; this only publishes what it reports changed - before
+                // answering the writer (ech0-media#16), so a write is already visible on this
+                // node's own view and watches by the time its caller hears of it.
+                EntryPayload::Normal(command) => {
+                    let sm = &mut *sm;
+                    let membership = sm.membership.membership();
+                    let applied = command.apply(term, |id| membership.get_node(&id).is_some(), &mut sm.kv);
+
                     if let Some(changes) = applied.changes {
                         self.publisher.publish(sm.kv.view(), changes);
                     }
-                    Some(CommandOutcome::Txn(applied.outcome))
-                }
-                EntryPayload::Normal(Command {
-                    request_id,
-                    ledger_capacity,
-                    body: CommandBody::RegisterNode(cmd),
-                    ..
-                }) => {
-                    // Same idempotency discipline as a transaction, consulting the same ledger
-                    // (ech0-media#33): a retried registration is a no-op here, not a second
-                    // publish. Never touches `kv`/`revision`/`Changes` - the registry is
-                    // foundation-internal state, not the user's key space.
-                    let applied = sm.kv.apply_registry_command(request_id, ledger_capacity as usize, |registry| {
-                        registry.set(cmd.node_id, crate::kv::NodeInfo {
-                            external_addr: cmd.external_addr,
-                            meta: cmd.meta,
-                            status: crate::kv::NodeStatus::Up,
-                        });
-                    });
                     if let Some(registry) = applied.registry {
                         self.publisher.publish_registry(registry);
                     }
-                    Some(CommandOutcome::Registry)
-                }
-                EntryPayload::Normal(Command {
-                    request_id,
-                    ledger_capacity,
-                    body: CommandBody::RemoveNode(cmd),
-                    ..
-                }) => {
-                    let applied = sm.kv.apply_registry_command(request_id, ledger_capacity as usize, |registry| {
-                        registry.remove(cmd.node_id);
-                    });
-                    if let Some(registry) = applied.registry {
-                        self.publisher.publish_registry(registry);
-                    }
-                    Some(CommandOutcome::Registry)
-                }
-                EntryPayload::Normal(Command {
-                    request_id,
-                    ledger_capacity,
-                    body: CommandBody::SetStatus(cmd),
-                    ..
-                }) => {
-                    // Ledger-guarded the same way every other registry command is (ech0-media#34):
-                    // a retried request id changes nothing and publishes nothing. An entry that no
-                    // longer exists (concurrently reconciled away) is a silent no-op, not an
-                    // error - the leader's own decision to set this status can be stale by the
-                    // time it is applied, and there is nothing left to correct.
-                    let applied = sm.kv.apply_registry_command(request_id, ledger_capacity as usize, |registry| {
-                        if let Some(mut info) = registry.get(cmd.node_id) {
-                            info.status = cmd.status;
-                            registry.set(cmd.node_id, info);
-                        }
-                    });
-                    if let Some(registry) = applied.registry {
-                        self.publisher.publish_registry(registry);
-                    }
-                    Some(CommandOutcome::Registry)
-                }
-                EntryPayload::Normal(Command {
-                    request_id,
-                    ledger_capacity,
-                    body: CommandBody::ReconcileRegistry,
-                    ..
-                }) => {
-                    // Deterministic by construction (ech0-media#34's determinism rule): every
-                    // replica applies the very same `EntryPayload::Membership` entries in the same
-                    // order before reaching this one, so `sm.membership` here is identical on
-                    // every replica - no value from this node's own configuration enters the
-                    // decision of which entries are stale.
-                    let member_ids: BTreeSet<u64> = {
-                        let membership = sm.membership.membership();
-                        membership.voter_ids().chain(membership.learner_ids()).collect()
-                    };
-                    let applied = sm.kv.apply_registry_command(request_id, ledger_capacity as usize, |registry| {
-                        let stale: Vec<u64> =
-                            registry.iter().map(|(id, _)| id).filter(|id| !member_ids.contains(id)).collect();
-                        for node_id in stale {
-                            registry.remove(node_id);
-                        }
-                    });
-                    if let Some(registry) = applied.registry {
-                        self.publisher.publish_registry(registry);
-                    }
-                    Some(CommandOutcome::Registry)
+                    Some(applied.outcome)
                 }
                 EntryPayload::Membership(membership) => {
                     sm.membership = StoredMembership::new(Some(log_id), membership);
@@ -441,50 +349,87 @@ impl RaftSnapshotBuilder<OpenRaftTypes> for StateMachineStore {
     async fn build_snapshot(&mut self) -> Result<EzSnapshot, std::io::Error> {
         let start = Instant::now();
 
-        // Hold the lock only long enough to clone O(1) state: the persistent map's root
-        // (`KvState::view`), the (today empty) internal state block, `last_applied` and the
-        // membership. Encoding - O(n) over every key, and CPU work once the state is large -
-        // happens after the lock is released, off this async worker thread: `apply` and `view()`
-        // proceed at full speed while a snapshot is being encoded.
-        let (view, internal, last_applied, last_membership) = {
-            let sm = self.sm_state.lock().await;
-            (
-                sm.kv.view(),
-                sm.kv.internal_state(),
-                sm.last_applied,
-                sm.membership.clone(),
-            )
-        };
-
-        let snapshot_data = tokio::task::spawn_blocking(move || encode_snapshot(&view, &internal))
+        // Encoding - O(n) over every key, and CPU work once the state is large - happens with no
+        // lock held, off this async worker thread: `apply` and `view()` proceed at full speed
+        // while a snapshot is being encoded.
+        let SnapshotSource { view, internal, meta } = self.capture_snapshot_source().await;
+        let data = tokio::task::spawn_blocking(move || encode_snapshot(&view, &internal))
             .await
             .map_err(|e| std::io::Error::other(format!("snapshot encoding task panicked: {e}")))?
             .map_err(std::io::Error::other)?;
+        let size_bytes = data.len();
 
-        let snapshot_meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership,
-        };
-
-        // Persist before returning: openraft purges logs covered by this snapshot right after,
-        // and a durable purge point with no durable snapshot is an unrecoverable state.
-        {
-            let mut cached = self.snapshot.lock().await;
-            let mut storage = self.storage.lock().await;
-            storage.persist(Persist::Snapshot(new_snapshot(&snapshot_meta, &snapshot_data))).await?;
-            *cached = Some(new_snapshot(&snapshot_meta, &snapshot_data));
-        }
+        let stored = self.store_built_snapshot(meta, data).await?;
 
         tracing::info!(
             node_id = ?self.node_id(),
-            last_log_id = ?last_applied,
-            size_bytes = snapshot_data.len(),
+            last_log_id = ?stored.meta.last_log_id,
+            size_bytes,
             elapsed_ms = start.elapsed().as_millis(),
             outcome = "ok",
             "built a snapshot",
         );
 
-        Ok(new_snapshot(&snapshot_meta, &snapshot_data))
+        Ok(stored)
+    }
+}
+
+/// What a snapshot is built from: the state machine as of one applied log position
+struct SnapshotSource {
+    view: View,
+    internal: InternalState,
+    meta: EzSnapshotMeta,
+}
+
+impl StateMachineStore {
+    /// Capture what a snapshot is built from, holding the state machine lock only long enough
+    /// to clone O(1) state: the persistent map's root ([`KvState::view`]), the internal state
+    /// block, `last_applied` and the membership.
+    async fn capture_snapshot_source(&self) -> SnapshotSource {
+        let sm = self.sm_state.lock().await;
+        SnapshotSource {
+            view: sm.kv.view(),
+            internal: sm.kv.internal_state(),
+            meta: SnapshotMeta {
+                last_log_id: sm.last_applied,
+                last_membership: sm.membership.clone(),
+            },
+        }
+    }
+
+    /// Store a snapshot this node built, unless one at least as recent is already in place, and
+    /// return whichever is in place afterwards
+    ///
+    /// openraft runs a build in a task of its own, concurrently with everything else the state
+    /// machine does - including installing a snapshot the leader sent. That install can land
+    /// between this build capturing its source and getting here, and it is always the newer of
+    /// the two: a leader only sends a snapshot beyond what this node has committed. Storing the
+    /// built one over it would leave storage holding a snapshot *behind* the point openraft
+    /// already purged the log to on the install's behalf, and the next restart would restore
+    /// that older state and silently skip the purged entries in between.
+    ///
+    /// Persisted before returning: openraft purges the log covered by a built snapshot right
+    /// after, and a durable purge point with no durable snapshot is an unrecoverable state.
+    async fn store_built_snapshot(&self, meta: EzSnapshotMeta, data: Vec<u8>) -> Result<EzSnapshot, std::io::Error> {
+        let mut cached = self.snapshot.lock().await;
+
+        if let Some(current) = cached.as_ref()
+            && current.meta.last_log_id >= meta.last_log_id
+        {
+            tracing::info!(
+                node_id = ?self.node_id(),
+                built = ?meta.last_log_id,
+                in_place = ?current.meta.last_log_id,
+                "discarded a built snapshot: one at least as recent is already in place",
+            );
+            return Ok(new_snapshot(&current.meta, current.snapshot.get_ref()));
+        }
+
+        let mut storage = self.storage.lock().await;
+        storage.persist(Persist::Snapshot(new_snapshot(&meta, &data))).await?;
+        *cached = Some(new_snapshot(&meta, &data));
+
+        Ok(new_snapshot(&meta, &data))
     }
 }
 
@@ -505,6 +450,8 @@ mod tests {
     use openraft::Membership;
 
     use super::*;
+    use crate::command::Command;
+    use crate::command::CommandBody;
     use crate::kv::KeyValue;
     use crate::kv::Txn;
     use crate::storage::EzStorage;
@@ -578,6 +525,74 @@ mod tests {
         bytes
     }
 
+    /// openraft builds a snapshot in a task of its own, so an install can land between the build
+    /// capturing its source and storing its result. Run exactly that interleaving, one step at a
+    /// time: the older, built snapshot must not replace the newer, installed one - openraft has
+    /// already purged the log up to the installed one, so a restart from the older snapshot would
+    /// silently skip every entry in between.
+    #[tokio::test]
+    async fn a_snapshot_built_from_older_state_never_replaces_a_newer_installed_one() {
+        let store = SnapshotStore::default();
+        let persisted = store.snapshot.clone();
+        let (_log, mut sm) = open(store, WatchLimits::default()).await.unwrap();
+        sm.install_snapshot(
+            &snapshot_meta(10),
+            Cursor::new(valid_snapshot_bytes(1, &[("a", b"1", 1, 1)])),
+        )
+        .await
+        .unwrap();
+
+        // The build captures the state machine at index 10 ...
+        let SnapshotSource { view, internal, meta } = sm.capture_snapshot_source().await;
+        let built = encode_snapshot(&view, &internal).unwrap();
+
+        // ... the leader's snapshot at index 20 is installed while it is still encoding ...
+        let installed = valid_snapshot_bytes(2, &[("a", b"1", 1, 1), ("b", b"2", 2, 2)]);
+        sm.install_snapshot(&snapshot_meta(20), Cursor::new(installed.clone())).await.unwrap();
+
+        // ... and only then does the build get to store its result.
+        let in_place = sm.store_built_snapshot(meta, built).await.unwrap();
+
+        assert_eq!(
+            snapshot_meta(20),
+            in_place.meta,
+            "the build reports the snapshot that is in place"
+        );
+        assert_eq!(
+            Some((snapshot_meta(20), installed.clone())),
+            persisted.lock().unwrap().clone(),
+            "storage still holds the installed snapshot",
+        );
+        let served = sm.get_current_snapshot().await.unwrap().unwrap();
+        assert_eq!(
+            snapshot_meta(20),
+            served.meta,
+            "a lagging follower is still served the installed snapshot"
+        );
+        assert_eq!(installed, served.snapshot.into_inner());
+    }
+
+    /// The guard above must not get in the way of the ordinary case: a snapshot built from
+    /// state beyond the one in place replaces it.
+    #[tokio::test]
+    async fn a_snapshot_built_from_newer_state_replaces_the_one_in_place() {
+        let store = SnapshotStore::default();
+        let persisted = store.snapshot.clone();
+        let (_log, mut sm) = open(store, WatchLimits::default()).await.unwrap();
+        sm.install_snapshot(
+            &snapshot_meta(10),
+            Cursor::new(valid_snapshot_bytes(1, &[("a", b"1", 1, 1)])),
+        )
+        .await
+        .unwrap();
+
+        let newer = valid_snapshot_bytes(2, &[("a", b"1", 1, 1), ("b", b"2", 2, 2)]);
+        let in_place = sm.store_built_snapshot(snapshot_meta(11), newer.clone()).await.unwrap();
+
+        assert_eq!(snapshot_meta(11), in_place.meta);
+        assert_eq!(Some((snapshot_meta(11), newer)), persisted.lock().unwrap().clone());
+    }
+
     /// A snapshot whose bytes do not decode must be refused whole. Keeping it would outlive the
     /// failed transfer: startup restores from the stored snapshot, so the next start would fail
     /// on the same bytes - with the state they replaced already gone.
@@ -585,7 +600,7 @@ mod tests {
     async fn an_invalid_snapshot_leaves_the_last_valid_one_in_place() {
         let store = SnapshotStore::default();
         let persisted = store.snapshot.clone();
-        let (_log, mut sm) = open(store).await.unwrap();
+        let (_log, mut sm) = open(store, WatchLimits::default()).await.unwrap();
 
         let valid = valid_snapshot_bytes(1, &[("a", b"1", 1, 1)]);
         sm.install_snapshot(&snapshot_meta(10), Cursor::new(valid.clone())).await.unwrap();
@@ -618,7 +633,7 @@ mod tests {
     async fn an_unknown_version_at_install_time_leaves_the_last_valid_one_in_place() {
         let store = SnapshotStore::default();
         let persisted = store.snapshot.clone();
-        let (_log, mut sm) = open(store).await.unwrap();
+        let (_log, mut sm) = open(store, WatchLimits::default()).await.unwrap();
 
         let valid = valid_snapshot_bytes(1, &[("a", b"1", 1, 1)]);
         sm.install_snapshot(&snapshot_meta(10), Cursor::new(valid.clone())).await.unwrap();
@@ -650,7 +665,10 @@ mod tests {
         let future_version = with_unsupported_version(valid_snapshot_bytes(1, &[("a", b"1", 1, 1)]));
         store.persist(Persist::Snapshot(new_snapshot(&snapshot_meta(10), &future_version))).await.unwrap();
 
-        let err = open(store).await.map(|_| ()).expect_err("an unknown snapshot version must refuse to open");
+        let err = open(store, WatchLimits::default())
+            .await
+            .map(|_| ())
+            .expect_err("an unknown snapshot version must refuse to open");
         assert_eq!(std::io::ErrorKind::InvalidData, err.kind(), "unexpected error: {}", err);
         assert!(
             err.to_string().contains("version"),
@@ -667,7 +685,7 @@ mod tests {
     #[tokio::test]
     async fn a_command_fenced_to_another_term_changes_nothing() {
         let store = SnapshotStore::default();
-        let (_log, mut sm) = open(store).await.unwrap();
+        let (_log, mut sm) = open(store, WatchLimits::default()).await.unwrap();
 
         let fenced = |entry_term: u64, index: u64, required_term: u64, key: &str| crate::entry::EzEntry {
             log_id: (entry_term, index),
@@ -703,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn build_snapshot_then_install_it_reproduces_the_same_view() {
         let store = SnapshotStore::default();
-        let (_log, mut sm) = open(store).await.unwrap();
+        let (_log, mut sm) = open(store, WatchLimits::default()).await.unwrap();
 
         {
             let mut state = sm.sm_state.lock().await;
