@@ -240,8 +240,9 @@ impl std::fmt::Display for Txn {
 
 /// Size and count limits a [`Txn`] is checked against before it is proposed
 ///
-/// Defaults match ech0-media#27's spec; they are provisional until benchmarked
-/// (ech0-media#36) and configurable through `EzConfig::kv_limits`.
+/// Defaults are ech0-media#27's, configurable through `EzConfig::kv_limits`. ech0-media#36
+/// measured what depends on them (the request body limit, snapshot size and timing) and left
+/// them as they are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvLimits {
     /// Maximum size of a single key, in bytes. Default: 1 KiB.

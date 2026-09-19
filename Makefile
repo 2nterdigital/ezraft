@@ -5,6 +5,13 @@ check_all: lint doc unused_dep typos
 test:
 	cargo test
 
+# ech0-media#36: the repeatable benchmark driver, real processes, release profile. Prints one
+# JSON report to stdout (the leading `@` keeps `make`'s own echo of this command off stdout, so
+# `make bench > report.json` captures pure JSON); progress goes to stderr. Not part of `test` or
+# `check_all` - it takes minutes, not seconds, and its numbers belong in FORK.md, not in CI.
+bench:
+	@cargo run --release --example bench
+
 # Format, then lint exactly as CI does, so `make lint` fails where CI would.
 lint:
 	cargo fmt
@@ -52,4 +59,4 @@ clean:
 	@# log instead of forming a fresh cluster. Mirrors the .gitignore entry.
 	rm -rf data
 
-.PHONY: all check_all test lint fmt doc check unused_dep typos audit publish_check clean
+.PHONY: all check_all test bench lint fmt doc check unused_dep typos audit publish_check clean

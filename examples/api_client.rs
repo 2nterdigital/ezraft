@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -17,6 +18,18 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::harness::POLL_INTERVAL;
+
+/// One `reqwest::Client` reused by every function in this module, instead of a fresh one per
+/// call: `Client` owns a connection pool, and a caller that polls or writes thousands of times
+/// (ech0-media#36's benchmark driver does) would otherwise open and tear down that many
+/// short-lived TCP connections instead of reusing keep-alive ones - each closed connection lingers
+/// in `TIME_WAIT`, and enough of them in a short window can exhaust the local ephemeral port
+/// range outright. `Client::clone()` is cheap (it shares the pool via an inner `Arc`), so every
+/// caller keeps its own owned value without extra synchronization on the hot path.
+fn client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new).clone()
+}
 
 /// Base64-encode `text` the way `POST /tx` expects a `Put`'s value (matching
 /// `ezraft::Op::Put`'s own JSON convention)
@@ -55,7 +68,7 @@ pub enum TxOutcome {
 /// idempotency ledger recognizes the id and returns the first real outcome instead of executing
 /// `txn` again. This is this example's own demonstration of that pattern, not part of the crate.
 pub async fn write(addrs: &[&str], mut txn: Value, deadline: Instant) -> io::Result<TxOutcome> {
-    let client = reqwest::Client::new();
+    let client = client();
     let request_id = RequestId::new();
     txn["request_id"] = json!(request_id);
 
@@ -97,7 +110,7 @@ pub fn text(value: &Bytes) -> String {
 /// Poll `addr`'s local view (`GET /view?key=`) until `key` reads back exactly `expected`
 /// (`None` for "absent"), or `deadline` passes. Tolerates the node not serving yet.
 pub async fn wait_for_value(addr: &str, key: &str, expected: Option<&str>, deadline: Instant) -> io::Result<()> {
-    let client = reqwest::Client::new();
+    let client = client();
     let mut last: Option<String> = None;
     loop {
         if let Ok(resp) = client.get(format!("http://{addr}/view")).query(&[("key", key)]).send().await {
@@ -134,7 +147,7 @@ pub async fn wait_for_value(addr: &str, key: &str, expected: Option<&str>, deadl
 
 /// One `GET /status` reading
 pub async fn status(addr: &str) -> io::Result<Value> {
-    reqwest::Client::new()
+    client()
         .get(format!("http://{addr}/status"))
         .send()
         .await
@@ -244,7 +257,7 @@ impl WatchClient {
             url.push_str(&format!("&after={after}"));
         }
 
-        let resp = reqwest::Client::new().get(url).send().await.map_err(io::Error::other)?;
+        let resp = client().get(url).send().await.map_err(io::Error::other)?;
         if !resp.status().is_success() {
             return Err(io::Error::other(format!(
                 "GET /watch on {addr} failed: {}",

@@ -77,7 +77,7 @@
   `install_snapshot_timeout`——此前整份快照 POST 只有 150 ms 预算）；超限在两端都是明确错误（发送端拒发并
   记日志，接收端 `413`）。openraft 的 `max_payload_entries` 改由 body 上限与 `kv_limits.max_txn_bytes` 推导
   （默认值下为 4），保证单次 `/raft/append` 不会超过上限；body 上限装不下一个最大事务时启动即报错，而不是日后
-  卡死复制。以上默认值均待 #36 实测。`Transport` 新增 `TrafficClass`（Heartbeat / Replication / Snapshot），
+  卡死复制。以上默认值经 #36 实测后维持不变。`Transport` 新增 `TrafficClass`（Heartbeat / Replication / Snapshot），
   经 openraft 的 `new_heartbeat_client` / `new_snapshot_client` 钩子各用独立 `reqwest` 连接池，心跳与
   ReadIndex 探测不会排在大快照或大批量 append 之后。测试钩子新增按流量类别的规则（`set_class` /
   `clear_class`），验收测试据此在快照被延迟数个选举超时期间断言各节点 term 不变。快照构建、发送、安装有结构化
@@ -144,7 +144,7 @@
   （`SnapshotInstalled`）时先发 Reset；`After(rev)` 指向尚未到达的 revision 时等待。`Progress` 与 `Changes`
   走同一有序队列、同一把锁，按订阅者限速，保证不会早于 revision 不大于它的 `Changes`，且 revision 停止推进后
   仍会送达。节点 `shutdown()` 后流在交付已有内容后结束（`None`），不会永久挂起。`EzConfig` 新增
-  `watch_limits`（默认 10000 组 / 64 MiB / 队列 1024 / 1 秒，待 #36 实测）。每次 Reset 有结构化 `tracing`
+  `watch_limits`（默认 10000 组 / 64 MiB / 队列 1024 / 1 秒，经 #36 实测后维持不变）。每次 Reset 有结构化 `tracing`
   日志。新增 `tests/watch.rs`、`watch_reset.rs`、`watch_progress.rs`、`watch_resume.rs`、`watch_restart.rs`。
 - [#30 任意节点写入：转发、同请求 id 重试与幂等](https://github.com/2nterdigital/ech0-media/issues/30)：
   `write(txn)` 在任意节点可用：发起节点先校验上限、分配请求 id（新增公开类型 `RequestId`，ULID），是 leader 则
@@ -209,7 +209,7 @@
   结构化 `tracing` 日志。同一任务用 `CommandBody::ReconcileRegistry` 清理已不在成员配置中的注册表条目
   （`remove_node` 两步之间 leader 崩溃留下的窗口），`apply` 依据状态机自己已应用的成员配置判定，与节点配置
   无关。`EzConfig` 新增 `liveness_threshold` / `liveness_grace` / `liveness_check_interval`（5 s / 5 s /
-  1 s，待 #36 实测）。对转发命令收到形状不符的应答时记录错误并按"无应答"处理，不再 panic（该应答来自对端）。
+  1 s，经 #36 实测后维持不变）。对转发命令收到形状不符的应答时记录错误并按"无应答"处理，不再 panic（该应答来自对端）。
   原版 `timestamp_oracle` 示例已于 #27 删除（确认）。新增 `tests/leader_task.rs`、`tests/liveness.rs`。
 - [#37 底座使用指南](https://github.com/2nterdigital/ech0-media/issues/37)：
   用新 API 重写 `docs/guide.md`（中文），**替换**原版英文指南，并同步重写 `README.md`。覆盖全部公开 API
@@ -223,6 +223,23 @@
   内存缓存层经 RPC 同步、媒体面致命错误时进程退出。**指南里的每个 Rust 代码块都是 doctest**：`src/lib.rs`
   以 `#[cfg(doctest)]` 模块 `include_str!` 整份指南，`cargo test`（或 `cargo test --doc`）会编译它们，
   API 变了而指南没跟上会直接让测试失败；该模块只在 rustdoc 收集 doctest 时存在，不进入任何构建产物。
+- [#36 基准测试与参数定值](https://github.com/2nterdigital/ech0-media/issues/36)：
+  新增真实进程三节点集群上的可重复基准测试驱动 `examples/bench.rs` + `examples/bench/`（`make bench`；
+  `Cargo.toml` 新增 `[[example]] bench`，不参与 `cargo test`），测定快照超时与体积上限、请求体上限与
+  `max_payload_entries`、幂等账本容量、watch 环形缓冲与订阅队列、存活判定阈值与宽限期、每批写入的 fsync
+  成本、ReadIndex 对 leader 的负载、HTTP/1.1 并发开连接行为共 8 项，方法、数值与取舍写入本文件「参数定值」
+  一节；`EzConfig`、`WatchLimits`、`KvLimits` 的文档注释去掉 "provisional"、改为引用测得结果。**数值全部
+  维持原样**（`snapshot_timeout` 30 s、`snapshot_max_bytes` 64 MiB、`json_body_limit` 8 MiB、
+  `ledger_capacity` 100000、`liveness_threshold` / `liveness_grace` 5 s、`liveness_check_interval` 1 s、
+  `WatchLimits` 四项）：测得结果都落在既有默认值的安全边际内，而 localhost 单机基准测不出真实网络与磁盘
+  并发，故不下调任何一项。`examples/kvstore.rs` 为此新增六个可选 CLI 覆盖（`--snapshot-interval`、
+  `--json-body-limit`、`--liveness-threshold-ms` / `--liveness-grace-ms` / `--liveness-check-interval-ms`、
+  `--log-filter`，默认值与 `EzConfig::default()` 一致）；`examples/harness.rs` 的 `Example` 新增
+  `build_release` 与 `log_path` 并派生 `Clone`；`examples/api_client.rs` 改为共享一个 `reqwest::Client`
+  （此前每次调用新建一个，基准的数万次调用会耗尽本机临时端口）。**三项设计变更建议只记录证据、未实施**，
+  留待另行决定：按字节切分 append（`PartialSuccess`）、组提交、leader 侧 ReadIndex 合并或 LeaseRead。
+  其中最需要上游留意的是**写入吞吐**：每条日志一次 `Durability::Immediate` 事务、不做组提交，本机
+  （APFS，单次 fsync 约 27 ms）整个集群的写入吞吐约 55–75 次/秒，且与并发度无关。
 - 里程碑收尾评审（对照 [spec](https://github.com/2nterdigital/ech0-media/issues/21) 与各票验收条件、对照编码规范各做一遍）
   发现并修复的问题，按所属票登记。**正确性**：(#28) openraft 把快照构建放在独立任务里、与安装并发；构建在锁外
   编码期间若 leader 发来的更新的快照先装好，构建完成后会把它覆盖成旧的，而日志已清理到新快照的位置——重启后
@@ -331,3 +348,152 @@ ezraft = { path = "../ezraft" }
 ```
 
 升级底座 = 把 `rev` 换成新的 `dev` SHA，跑 ech0-media 的全部测试后提交。
+
+## 参数定值（ech0-media#36）
+
+在真实进程三节点集群（`examples/kvstore` 示例，release 构建，本机磁盘上的真实 `RedbStorage`）上测定此前
+各票留下的全部暂定默认值。测定方法与数值的机读版本见新增的基准测试驱动 `examples/bench.rs`（`make bench`，
+或 `cargo run --release --example bench`；`cargo run --release --example bench -- --only <name>`
+单跑一个场景，用于迭代）。
+
+**测定环境**：Apple M3 Max（14 逻辑核）、macOS（Darwin 25.6.0 arm64）、APFS 文件系统、release
+profile、commit `437a87d2e4e5e1405f79a8ee41c59b78375c55b4`。基准脚本已确认可重复运行：连续跑三次，各项
+数量级与结论一致，例如 fsync 并发吞吐分别为 58.25 / 53.86 / 58.78 次/秒，follower 失联判定分别为
+5167ms / 5157ms / 5172ms，转发写入在并发 50 下的连接数三次都恰好是 50、线性读在任意并发下都恰好是 1。
+
+**本机基准的局限**（适用于以下每一项，具体影响见各小节自身说明）：localhost 没有真实网络延迟，三个
+voter 共用同一块物理磁盘；凡是网络往返或磁盘并发相关的结论，真实部署可能更差。以下每一项在这个方向上都
+偏保守：测得的余量即使很大，也不下调既有默认值，除非有独立证据支持更小的值仍然安全。
+
+### 快照超时与体积上限（`snapshot_timeout` / `snapshot_max_bytes`）
+
+**方法**：为三个体积档位（约 0.4 MiB / 8 MiB / 51 MiB，通过 `--snapshot-interval` 与写入值大小控制）
+各起一个全新三 voter 集群，写满一档后加入一个全新的第四节点（必然需要完整快照，因为它之前的日志已被清
+除）。分别从各节点自身的结构化 `tracing` 日志（ech0-media#26 已有的 "built a snapshot" / "sent a
+snapshot" / "installed a snapshot" 三条事件）读取 `elapsed_ms`/`size_bytes`。
+
+**结果**（最大档，约 51 MiB / 800 条 64 KiB 值）：构建 91ms，发送+安装（发送方视角，含接收方安装耗时）
+81ms，安装本身 61ms。三档均远低于当前 30 秒超时（最大档约 370 倍余量），64 MiB 体积上限亦留有余量。
+
+**决定**：`snapshot_timeout`（30 秒）与 `snapshot_max_bytes`（64 MiB）均维持默认值不变——余量很大，但
+localhost 没有真实网络延迟、三节点共用一块磁盘，测不出真实部署的传输耗时，保守起见不下调。
+
+### 请求体上限与 `max_payload_entries`（`json_body_limit`）
+
+**方法**：ech0-media#26 由 `json_body_limit / (2 × kv_limits.max_txn_bytes)` 推导
+`max_payload_entries`，默认值下为 4（openraft 自身默认 300）。分别以推导默认值（4，`json_body_limit`
+8 MiB）与把 `json_body_limit` 设到能推出 300 的等效值（约 600 MiB）各起一个三 voter 集群，测（a）32
+并发小事务写入的吞吐，（b）SIGKILL 一个 follower、补 300 条小事务（低于 `replication_lag_threshold`
+默认值 500，走日志重放而非装快照）、重启该 follower 后追平集群所需时间。
+
+**结果**：吞吐 73.6 次/秒 vs 59.0 次/秒，追赶耗时 2063ms vs 1754ms——重复运行里默认值有时更快、有时更
+慢，量级相当，未见稳定差异。原因：本机的写入路径受限于每条日志一次 `Durability::Immediate` fsync（见
+「fsync 成本」一节），批内条数从 4 提到 300 并不改变需要做多少次 fsync，只改变一次网络往返能带几条。
+
+**决定**：`json_body_limit`（8 MiB，`max_payload_entries` 推导为 4）维持默认值不变。
+
+**设计变更建议（未实现，仅记录）**：如果生产环境的往返延迟明显（真实网络 RTT）或存储明显快于本机的
+fsync 成本，条数上限为 4 就可能成为真实瓶颈；此时应在 `Network::append_entries`（crate 内部）里按*字
+节*而非按条数切分超大 append，并用 openraft 的 `AppendEntriesResponse::PartialSuccess` 应答，使小事
+务仍能按上百条打包，同时不破坏 body 上限对最坏情况的约束。本票只记录证据与方案，不改动已定设计。
+
+按字节切分还有一个与吞吐无关的理由（里程碑收尾评审发现）：`max_payload_entries` 的推导假设一条事务编码
+成 JSON 后不超过其原始字节数的 2 倍。value 的 base64（4/3 倍）加结构开销满足这个假设，但 key 是 JSON
+字符串，控制字符会被转义成 6 个字节——一批 4 条、key 几乎全由控制字符组成的最大事务可以超过
+`json_body_limit`，follower 会一直以 413 拒绝这一批。条件数与注册表条目的上限已经补上（见改动清单的评审
+条目），这一条需要刻意构造的输入才会触发，未单独处理；按字节切分后只要求「单条能装进一个请求」，该假设
+随之消失。
+
+### 幂等账本容量（`ledger_capacity`）
+
+**方法**：每次写入无论内容都会新增一条账本记录（即使是空事务），因此以 2000 个空事务
+（`{"conditions": [], "ops": []}`）压满一个新集群 leader 的账本，用 `ps -o rss=` 采样写入前后的常驻
+内存，取平均每次写入的增量。
+
+**结果**：约 2.2 KB/条——这是账本与 watch 环形缓冲的合并增量（两者在同一次写入里一起增长，外部 HTTP
+API 无法单独拆开，见下一节），因此是偏保守的上界；按此推算账本满载（10 万条）约占 214 MiB。以本机测得
+的持续并发写入速率（约 55-75 次/秒，见「fsync 成本」一节）、`write_deadline`（10 秒）与 3 倍余量计
+算，覆盖所需的容量约 1764 条，远小于当前 10 万的默认值。
+
+**决定**：`ledger_capacity`（100,000）维持默认值不变——本机测得的所需容量远小于默认值，但生产环境的实
+际写入速率本基准无法代表，保守起见不下调。
+
+### watch 环形缓冲与订阅队列（`WatchLimits`）
+
+**方法**：与账本类似，先写 1500 个真实 Put（16 字节值）到未超过环形缓冲默认组数上限（1 万组）的规
+模，测同一节点写入前后的常驻内存增量（同样是账本与环形缓冲的合并增量，作为环形缓冲自身开销的保守上
+界）；再对同一 leader 用 1/20/100 个并发 `GET /watch` 订阅者，测每次写入到全部订阅者收到该行的端到端
+延迟（扇出成本）。
+
+**结果**：合并每次写入的内存增量约 3.9 KB；扇出延迟在 1/20/100 个订阅者下都停留在几十毫秒量级（约
+40ms/30ms/27ms），未随订阅者数增长——按典型小体积变更推算，组数上限（1 万）会先于字节上限（64 MiB）
+生效，字节上限主要防的是异常大 value 的场景。
+
+**决定**：`WatchLimits` 的四项默认值（1 万组 / 64 MiB / 队列 1024 / 1 秒 `Progress` 间隔）均维持不
+变。
+
+### 存活判定阈值与宽限期（`liveness_threshold` / `liveness_grace` / `liveness_check_interval`）
+
+**方法**：SIGKILL 一个 follower，测另一节点的注册表把它标记 `Down` 所需时间；持续写入负载下确认没有
+健康节点被误判 `Down`；SIGKILL leader，测新一轮选举耗时，并在新 leader 的宽限期内确认幸存的健康
+follower 不被误判——分别在默认阈值（5s/5s/1s）与一组更紧的候选值（1.5s/1.5s/0.3s）下各跑一次。
+
+**结果**：follower 失联后约 5.17 秒被判定 `Down`（阈值 + 一个检查周期内，符合预期）；两种配置下选举都
+在约 5.3-5.6 秒完成——与按本仓库的 `heartbeat_interval`/`election_timeout`/租约默认值手工推算的理论
+下限（失主后需等租约 3s、再等 1.5-3s 的选举超时，即约 4.5-6s）一致；两种配置、写入负载下，均未观测到
+误判 `Down`。
+
+**决定**：`liveness_threshold`（5 秒）、`liveness_grace`（5 秒）、`liveness_check_interval`（1 秒）
+均维持默认值不变。本机测得更紧的候选值也没有误判，但 localhost 没有真实网络延迟、三节点共用一块磁
+盘，选举耗时已接近理论下限；真实部署更慢的换届恰恰是宽限期存在的原因，本基准测不出那种情形，因此不采
+用更紧的候选值。
+
+### 每批写入的 fsync 成本（`Durability::Immediate`，无独立配置项）
+
+**方法**：单写者顺序发 200 次单 key 写入，端到端计时；再以 32 并发写者跑 3 秒，统计完成吞吐。
+
+**结果**：单写者延迟中位数约 27ms（p99 约 40-58ms，视具体运行而定）；32 并发下吞吐约 55-75 次/秒——
+与并发度基本无关，提升并发几乎不提高吞吐。原因：`append` 按 ech0-media#11 的既有存储契约逐条持久化、
+不做组提交，三个 voter 各自串行执行一次 `Durability::Immediate` 事务，吞吐因而被单次 fsync 延迟主
+导，而非被并发请求数主导。
+
+**决定**：无 `EzConfig` 字段可调（fsync 策略由 ech0-media#11 的存储契约固定），本小节记录测得数值供
+其余各项计算引用。
+
+**设计变更建议（未实现，仅记录）**：若生产写入速率需要高于"1/fsync 延迟"的吞吐，组提交（把多条待持久
+化日志合并进一次 `persist` 事务）能突破这一上限——这正是本票验收标准点名的候选之一。本票只记录这一证
+据，不改动既有设计。
+
+### ReadIndex 对 leader 的负载
+
+**方法**：从 follower 发 `GET /linearizable`（空前缀扫描，走完整 ReadIndex 路径但没有数据搭建成
+本），在并发度 1/10/50/100 下各跑 2 秒记录延迟分布与吞吐；再在并发度 100 的基础上叠加 16 个并发写入
+到 leader，重复同样的读测量。
+
+**结果**：leader 空闲时，p50 延迟从并发 1 的 0.16ms 升到并发 100 的 0.93ms，吞吐从约 5800/秒升到约
+106,000/秒（未随并发线性增长，但仍随其明显上升）；leader 有并发写入负载时，同样 100 并发读的 p50 延
+迟升到约 79ms（约 85 倍于空闲时同并发度），吞吐降到约 1100/秒。
+
+**决定**：无 `EzConfig` 默认值对应 ReadIndex 负载本身（无 leader 侧合并或 LeaseRead 可调），本小节
+为信息性记录。测得数据表明 leader 的写路径与 ReadIndex 确认确实争用同一资源（很可能是同一条
+append/fsync 流水线，但外部 API 测不出两者的确切占比），并非完全解耦。
+
+**设计变更建议（未实现，仅记录）**：若生产读取速率要求 leader 忙于写入时 ReadIndex 延迟仍保持低位，
+leader 侧跨 follower 合并 ReadIndex 请求、或启用 LeaseRead（租约内跳过多数派确认）能去掉读路径对该
+流水线的依赖——ech0-media#16 的决议已把两者列为"待实测负载后再定"的候选，本票的数据即为该实测；本票
+不实现，仅记录方案。
+
+### HTTP/1.1 下客户端对并发请求的开连接行为
+
+**方法**：用 `lsof` 读取节点 OS 进程到对端内部端口的已建立 TCP 连接数。分别测：空闲基线；在
+follower 上发起并发写入（转发到 leader 的 `ez.write` RPC，`Rpc` 流量类）在并发 1/10/50 下的连接
+数；在 follower 上发起并发线性读（`ez.read_index` RPC，同样走 `Rpc` 类，但有节点内合并）在并发
+1/10/50 下的连接数；以及 leader 忙于写入时 follower 自身 `last_leader_contact_ms`（心跳新鲜度）是
+否劣化。
+
+**结果**：转发写入的连接数随并发线性增长（1→1，10→10，50→50）；线性读的连接数在并发 1/10/50 下都
+停留在 1，未随并发增长——与 follower 侧合并（同一时刻至多一轮在途）一致。心跳新鲜度空闲时约 1ms，
+leader 忙于写入负载时最坏约 106ms，仍远低于 500ms 的心跳间隔，未见心跳排队。
+
+**决定**：本节不涉及任何 `EzConfig` 默认值（`reqwest` 连接池大小本身不可配置），为信息性记录，印证
+ech0-media#26 按流量类独立连接池、ech0-media#31 的 follower 侧合并均按预期工作。
