@@ -117,6 +117,19 @@
   节点对、按路径或流量类别的请求计数（`request_count` / `request_count_by_class`），验收测试据此统计 RPC 轮数，
   非生产指标。**删除**原版遗留的 leader-only `linearizable(ReadPolicy)`，`ReadPolicy` 不再从 crate 根重导出。
   新增 `tests/linearizable_read.rs`。
+- [#28 快照：不阻塞构建、postcard 编码与格式版本号](https://github.com/2nterdigital/ech0-media/issues/28)：
+  新增 `src/kv/snapshot_codec.rs`。快照 = 6 字节头（magic `EZKV` + 小端 `u16` 格式版本，当前为 **1**，手工
+  解析，先于任何 postcard 解码校验）+ postcard body（`revision`、每个 key 的 value 字节与
+  `create_rev`/`mod_rev`、底座内部状态块 `InternalState`）。未知版本报
+  `UnknownVersion { found, supported }`；过短、损坏或带多余尾部字节的输入都是错误，从不 panic、从不部分应用。
+  `InternalState` 是独立结构体（当前为空），#30 幂等账本与 #33 注册表在其内部加字段，**本里程碑内版本号保持 1**。
+  构建快照时只在状态机锁内克隆持久化 map 的根、内部状态块、`last_applied` 与成员配置（均 O(1)），编码在锁外的
+  blocking 线程池进行，`apply` 与 `view()` 不被阻塞（对应测试在"持锁编码"时必然失败）。安装时先解码校验、再落盘与
+  替换；未知版本在启动时使 `create`/`join` 失败、在运行时使安装失败（对节点是致命错误），均以 `tracing::error!`
+  记录。`EzConfig` 新增 `snapshot_log_to_keep`（对应 openraft `max_in_snapshot_log_to_keep`）与
+  `replication_lag_threshold`，均为 `Option`：不设则随 `snapshot_interval` 推导（`/5` 与等于 interval），只改
+  interval 不会得到不一致的组合；显式设置的阈值小于 interval 时启动即报错。`postcard` 转为正式依赖。
+  **删除** #27 留下的过渡 JSON 快照格式 `KvExport`。
 
 ## 验证命令
 
