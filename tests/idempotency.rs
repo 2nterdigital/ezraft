@@ -143,7 +143,7 @@ async fn a_lost_response_is_indeterminate_until_write_with_id_resolves_it() -> i
 
     faults.heal();
 
-    let revision = b.write_with_id(id, set("k1", "v1")).await.map_err(|e| io::Error::other(e.to_string()))?;
+    let revision = write_until_definite(&b, id, set("k1", "v1")).await?;
     assert_eq!(1, revision, "write_with_id resolves to the original success");
 
     let view = wait_for_revision(&a, revision).await?;

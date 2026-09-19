@@ -16,8 +16,10 @@ use ezraft::EzConfig;
 use ezraft::EzKv;
 use ezraft::KeyValue;
 use ezraft::RedbStorage;
+use ezraft::RequestId;
 use ezraft::Txn;
 use ezraft::View;
+use ezraft::WriteError;
 
 /// A `Put` on `key` = `value`, the shape almost every test's transaction is
 pub fn set(key: &str, value: &str) -> Txn {
@@ -124,6 +126,25 @@ pub async fn write_through_leader(nodes: &[&EzKv], txn: Txn) -> io::Result<u64> 
         }
     }
     Err(last_err.unwrap_or_else(|| io::Error::other("write_through_leader called with no nodes")))
+}
+
+/// Ask under the same request id until the answer is definite, and return the revision
+///
+/// This is how a caller resolves `Indeterminate`: the idempotency ledger makes repeating the id
+/// safe, so it keeps asking. A test that heals a fault and expects one call under a short
+/// deadline to be definite is only measuring how loaded the machine is. `LocalLag` is definite
+/// too - the write committed - and carries the revision.
+pub async fn write_until_definite(node: &EzKv, request_id: RequestId, txn: Txn) -> io::Result<u64> {
+    let give_up = tokio::time::Instant::now() + WAIT.expect("cluster waits are bounded");
+
+    loop {
+        match node.write_with_id(request_id, txn.clone()).await {
+            Ok(revision) => return Ok(revision),
+            Err(WriteError::LocalLag(lag)) => return Ok(lag.revision),
+            Err(WriteError::Indeterminate { .. }) if tokio::time::Instant::now() < give_up => continue,
+            Err(other) => return Err(io::Error::other(other.to_string())),
+        }
+    }
 }
 
 /// Wait until `node`'s local view has reached at least `revision`, and return that view

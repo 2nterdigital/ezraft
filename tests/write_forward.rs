@@ -98,8 +98,11 @@ async fn a_followers_conflict_is_visible_locally_before_write_returns_it() -> io
 #[tokio::test(flavor = "multi_thread")]
 async fn a_followers_write_reports_local_lag_when_replication_to_it_is_cut() -> io::Result<()> {
     let faults = Faults::new();
+    // Long enough that the write itself - a forward to the leader and a quorum commit with real
+    // fsyncs - always finishes inside it even on a loaded machine: what runs out must be the wait
+    // for this follower's own replica, or the answer would be `Indeterminate` instead.
     let node_config = EzConfig {
-        write_deadline: Duration::from_millis(500),
+        write_deadline: Duration::from_secs(2),
         ..config_with_faults(&faults)
     };
     let (addr_a, a, _data_a) = founding_node_with(node_config.clone()).await?;
@@ -213,16 +216,7 @@ async fn an_isolated_leaders_write_honors_the_deadline_and_reports_indeterminate
     // election the isolation provoked, so one more deadline may still pass without a definite
     // answer - and asking again under the same id, until there is one, is what a caller does.
     faults.heal();
-    let settle_by = tokio::time::Instant::now() + WAIT.expect("cluster waits are bounded");
-    let revision = loop {
-        match a.write_with_id(request_id, set("stale", "value")).await {
-            Ok(revision) => break revision,
-            // `a` may still be catching up with the new leader's log when the answer arrives.
-            Err(WriteError::LocalLag(LocalLag { revision })) => break revision,
-            Err(WriteError::Indeterminate { .. }) if tokio::time::Instant::now() < settle_by => continue,
-            Err(other) => return Err(io::Error::other(other.to_string())),
-        }
-    };
+    let revision = write_until_definite(&a, request_id, set("stale", "value")).await?;
     for node in [&a, &b, &c] {
         let view = wait_for_revision(node, revision).await?;
         let kv = view.get("stale").expect("the write took effect");
