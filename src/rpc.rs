@@ -156,7 +156,7 @@ impl Rpc {
     pub async fn call<Req, Resp>(&self, node_id: u64, name: &str, req: Req, timeout: Duration) -> Result<Resp, RpcError>
     where
         Req: Serialize + Send + 'static,
-        Resp: Serialize + DeserializeOwned + Send + 'static,
+        Resp: DeserializeOwned + Send + 'static,
     {
         if node_id == self.node_id {
             return self.call_local(name, req, timeout).await;

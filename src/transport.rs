@@ -183,28 +183,11 @@ impl Transport {
         req: Req,
     ) -> Result<Result<Resp, Err>, TransportError>
     where
-        Req: Serialize + 'static,
-        Resp: Serialize + DeserializeOwned,
-        Err: std::error::Error + Serialize + DeserializeOwned,
+        Req: Serialize,
+        Resp: DeserializeOwned,
+        Err: DeserializeOwned,
     {
-        // Additive, test-only round counting (ech0-media#31): recorded before any fault check,
-        // so a coalescing guarantee like "at most N rounds" can be verified against every
-        // attempt this node actually made, whatever a fault rule then did with it.
-        #[cfg(feature = "fault-injection")]
-        if let Some(faults) = &self.faults {
-            faults.record_request(self.from, target, class, &path.to_string());
-        }
-
-        #[cfg(feature = "fault-injection")]
-        if let Some(fault) = self.fault_for(target, class) {
-            return self
-                .send_faulty(fault, target, timeout, |t| {
-                    self.send_now(class, target, addr, path, t, req)
-                })
-                .await;
-        }
-
-        self.send_now(class, target, addr, path, timeout, req).await
+        self.dispatch(class, target, addr, path, timeout, |request| request.json(&req)).await
     }
 
     /// Send an already-framed raw body to `target` at `addr`, and decode the peer's
@@ -212,8 +195,8 @@ impl Transport {
     ///
     /// The one exception to "everything is JSON" (ech0-media#26): a raw-binary snapshot body is
     /// framed by the caller (`crate::network::encode_snapshot_request`) before it ever reaches
-    /// here, because this module has no notion of what a snapshot header looks like. Subject to
-    /// the exact same token, fault-injection and timeout handling as [`Self::send`].
+    /// here, because this module has no notion of what a snapshot header looks like. Everything
+    /// else about it - token, fault injection, request counting, timeout - is [`Self::send`]'s.
     pub(crate) async fn send_raw<Resp, Err>(
         &self,
         class: TrafficClass,
@@ -224,74 +207,76 @@ impl Transport {
         body: Vec<u8>,
     ) -> Result<Result<Resp, Err>, TransportError>
     where
-        Resp: Serialize + DeserializeOwned,
-        Err: std::error::Error + Serialize + DeserializeOwned,
+        Resp: DeserializeOwned,
+        Err: DeserializeOwned,
     {
+        self.dispatch(class, target, addr, path, timeout, |request| {
+            request.header(reqwest::header::CONTENT_TYPE, "application/octet-stream").body(body)
+        })
+        .await
+    }
+
+    /// What [`Self::send`] and [`Self::send_raw`] share, which is everything but how the body is
+    /// put into the request (`with_body`): under `fault-injection`, counting the attempt and
+    /// applying whichever fault rule matches; then the round trip itself
+    async fn dispatch<Resp, Err>(
+        &self,
+        class: TrafficClass,
+        target: u64,
+        addr: &str,
+        path: impl Display,
+        timeout: Duration,
+        with_body: impl FnOnce(RequestBuilder) -> RequestBuilder,
+    ) -> Result<Result<Resp, Err>, TransportError>
+    where
+        Resp: DeserializeOwned,
+        Err: DeserializeOwned,
+    {
+        let path = path.to_string();
+
         #[cfg(feature = "fault-injection")]
-        if let Some(fault) = self.fault_for(target, class) {
-            return self
-                .send_faulty(fault, target, timeout, |t| {
-                    self.send_raw_now(class, target, addr, path, t, body)
-                })
-                .await;
+        {
+            // Additive, test-only round counting (ech0-media#31): recorded before any fault
+            // check, so a coalescing guarantee like "at most N rounds" can be verified against
+            // every attempt this node actually made, whatever a fault rule then did with it.
+            if let Some(faults) = &self.faults {
+                faults.record_request(self.from, target, class, &path);
+            }
+
+            if let Some(fault) = self.fault_for(target, class) {
+                return self
+                    .send_faulty(fault, target, timeout, |remaining| {
+                        self.round_trip(class, target, addr, &path, remaining, with_body)
+                    })
+                    .await;
+            }
         }
 
-        self.send_raw_now(class, target, addr, path, timeout, body).await
+        self.round_trip(class, target, addr, &path, timeout, with_body).await
     }
 
-    /// The actual JSON HTTP round trip, with no fault check
-    ///
-    /// [`Self::send`] is the only entry point; under `fault-injection` it is also what a `Delay`
-    /// or `DropResponse` fault calls once it has decided a request goes out for real.
-    async fn send_now<Req, Resp, Err>(
+    /// The actual HTTP round trip, with no fault check: on `class`'s own pool, bounded by
+    /// `timeout`
+    async fn round_trip<Resp, Err>(
         &self,
         class: TrafficClass,
         target: u64,
         addr: &str,
-        path: impl Display,
+        path: &str,
         timeout: Duration,
-        req: Req,
+        with_body: impl FnOnce(RequestBuilder) -> RequestBuilder,
     ) -> Result<Result<Resp, Err>, TransportError>
     where
-        Req: Serialize + 'static,
-        Resp: Serialize + DeserializeOwned,
-        Err: std::error::Error + Serialize + DeserializeOwned,
+        Resp: DeserializeOwned,
+        Err: DeserializeOwned,
     {
         let url = format!("http://{addr}/{path}");
-        let request = self.client(class).post(url.clone()).timeout(timeout).json(&req);
+        let request = with_body(self.client(class).post(url.clone()).timeout(timeout));
 
         self.execute(target, url, request).await
     }
 
-    /// The actual raw-body HTTP round trip, with no fault check - [`Self::send_raw`]'s
-    /// counterpart to [`Self::send_now`]
-    async fn send_raw_now<Resp, Err>(
-        &self,
-        class: TrafficClass,
-        target: u64,
-        addr: &str,
-        path: impl Display,
-        timeout: Duration,
-        body: Vec<u8>,
-    ) -> Result<Result<Resp, Err>, TransportError>
-    where
-        Resp: Serialize + DeserializeOwned,
-        Err: std::error::Error + Serialize + DeserializeOwned,
-    {
-        let url = format!("http://{addr}/{path}");
-        let request = self
-            .client(class)
-            .post(url.clone())
-            .timeout(timeout)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(body);
-
-        self.execute(target, url, request).await
-    }
-
-    /// Authenticate and send a built request, and decode the peer's `Result<Resp, Err>` - the
-    /// tail end both [`Self::send_now`] and [`Self::send_raw_now`] share, since neither differs
-    /// in how it is authenticated or how its response is handled, only in how it is built.
+    /// Authenticate and send a built request, and decode the peer's `Result<Resp, Err>`
     async fn execute<Resp, Err>(
         &self,
         target: u64,
@@ -299,8 +284,8 @@ impl Transport {
         request: RequestBuilder,
     ) -> Result<Result<Resp, Err>, TransportError>
     where
-        Resp: Serialize + DeserializeOwned,
-        Err: std::error::Error + Serialize + DeserializeOwned,
+        Resp: DeserializeOwned,
+        Err: DeserializeOwned,
     {
         let from = self.from;
 

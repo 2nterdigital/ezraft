@@ -145,9 +145,9 @@ impl Network {
     ) -> Result<Result<Resp, Err>, RPCError<Cfg>>
     where
         Cfg: openraft::RaftTypeConfig,
-        Req: Serialize + 'static,
-        Resp: Serialize + DeserializeOwned,
-        Err: std::error::Error + Serialize + DeserializeOwned,
+        Req: Serialize,
+        Resp: DeserializeOwned,
+        Err: DeserializeOwned,
     {
         self.transport
             .send(self.class, self.target, &self.addr, uri, option.soft_ttl(), req)
@@ -165,8 +165,8 @@ impl Network {
     ) -> Result<Result<Resp, Err>, RPCError<Cfg>>
     where
         Cfg: openraft::RaftTypeConfig,
-        Resp: Serialize + DeserializeOwned,
-        Err: std::error::Error + Serialize + DeserializeOwned,
+        Resp: DeserializeOwned,
+        Err: DeserializeOwned,
     {
         self.transport
             .send_raw(self.class, self.target, &self.addr, uri, option.soft_ttl(), body)
