@@ -137,6 +137,7 @@ pub mod raft;
 pub mod server;
 pub mod snapshot;
 pub mod storage;
+mod transport;
 mod type_config;
 
 // Re-export public API
@@ -157,5 +158,7 @@ pub use storage::EzStorage;
 pub use storage::FileStorage;
 pub use storage::Loaded;
 pub use storage::Persist;
+#[cfg(feature = "fault-injection")]
+pub use transport::fault;
 pub use type_config::EzVote;
 pub use type_config::OpenRaftTypes;

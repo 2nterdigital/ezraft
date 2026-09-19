@@ -35,6 +35,16 @@ pub struct EzConfig {
     /// lifecycle, snapshot and log deletion included, instead of leaving those paths untested.
     /// Default: 500
     pub snapshot_interval: u64,
+
+    /// The test cluster's shared network fault-injection handle, if any
+    ///
+    /// Only present in builds compiled with the `fault-injection` cargo feature (off by
+    /// default): a normal build has no such field, and pays nothing for it. Every node of one
+    /// in-process test cluster is given the same `Faults` handle, which is how a test drops,
+    /// delays, or partitions requests between chosen node pairs and heals them again - see
+    /// `ezraft::fault`. Default: `None`.
+    #[cfg(feature = "fault-injection")]
+    pub faults: Option<crate::transport::fault::Faults>,
 }
 
 impl Default for EzConfig {
@@ -42,6 +52,8 @@ impl Default for EzConfig {
         Self {
             heartbeat_interval: Duration::from_millis(500),
             snapshot_interval: 500,
+            #[cfg(feature = "fault-injection")]
+            faults: None,
         }
     }
 }

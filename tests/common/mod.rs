@@ -334,3 +334,10 @@ pub async fn admin_post(addr: &str, body: serde_json::Value) -> io::Result<()> {
         .await?
         .map_err(|leader| io::Error::other(format!("/api/membership redirected to {:?}", leader)))
 }
+
+/// Cluster helpers for the `fault-injection` hook: see `tests/common/faults.rs`.
+mod faults;
+// Not every test binary under `tests/` uses these, same as the rest of this file (see the
+// `allow(dead_code)` above) - but a glob re-export warns per binary rather than per item.
+#[allow(unused_imports)]
+pub use faults::*;

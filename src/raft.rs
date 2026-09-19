@@ -240,8 +240,12 @@ where T: EzApp
             id
         };
 
-        // Create network factory
-        let network = EzNetworkFactory::new()?;
+        // Create network factory. `with_faults` only exists under the `fault-injection`
+        // feature; shadowing rather than a `mut` binding keeps a non-feature build from
+        // warning about a binding that is never mutated.
+        let network = EzNetworkFactory::new(node_id)?;
+        #[cfg(feature = "fault-injection")]
+        let network = network.with_faults(config.faults.clone());
 
         // Create OpenRaft instance
         let raft = Raft::new(node_id, raft_config, network, log, sm)
