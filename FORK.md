@@ -69,6 +69,19 @@
   **删除**（类型不复存在，故先于原定票删除）：`EzApp` 与 `src/app.rs`；`POST /api/write`、`POST /api/read`
   与 `forward_write`（原定 #30）；`timestamp_oracle` 示例及其测试（原定 #34）；测试工具里的样例应用。
   kvstore 示例最小化迁移到 `EzKv`（完整改写见 #35）。新增验收测试 `tests/kv_txn.rs`、`tests/kv_view.rs`。
+- [#26 传输补丁：原始二进制快照、可配上限与超时、独立连接池](https://github.com/2nterdigital/ech0-media/issues/26)：
+  `POST /raft/snapshot` 改为 `application/octet-stream` 原始快照体，前置 4 字节长度 + 很小的 JSON 头
+  （vote、`SnapshotMeta`），不再把快照当作 JSON 数字数组传输；帧格式错误返回带原因的 `400`。`EzConfig` 新增
+  `json_body_limit`（8 MiB）、`snapshot_max_bytes`（64 MiB）、`snapshot_timeout`（30 s，映射到 openraft
+  `install_snapshot_timeout`——此前整份快照 POST 只有 150 ms 预算）；超限在两端都是明确错误（发送端拒发并
+  记日志，接收端 `413`）。openraft 的 `max_payload_entries` 改由 body 上限与 `kv_limits.max_txn_bytes` 推导
+  （默认值下为 4），保证单次 `/raft/append` 不会超过上限；body 上限装不下一个最大事务时启动即报错，而不是日后
+  卡死复制。以上默认值均待 #36 实测。`Transport` 新增 `TrafficClass`（Heartbeat / Replication / Snapshot），
+  经 openraft 的 `new_heartbeat_client` / `new_snapshot_client` 钩子各用独立 `reqwest` 连接池，心跳与
+  ReadIndex 探测不会排在大快照或大批量 append 之后。测试钩子新增按流量类别的规则（`set_class` /
+  `clear_class`），验收测试据此在快照被延迟数个选举超时期间断言各节点 term 不变。快照构建、发送、安装有结构化
+  `tracing` 日志，`tracing` 转为正式依赖。不启用 Pre-Vote（有意为之）。新增 `tests/large_snapshot.rs`、
+  `tests/snapshot_limits.rs`、`tests/snapshot_fault.rs`。
 
 ## 验证命令
 
