@@ -579,13 +579,22 @@ impl EzKv {
         remaining: Duration,
     ) {
         let budget = backoff.min(remaining);
-        let _ = self
+        let started = tokio::time::Instant::now();
+        let leader_changed = self
             .wait_metrics(
                 Some(budget),
                 |m| m.current_leader != believed_leader,
                 "waiting for a leadership change before retrying a forwarded write",
             )
-            .await;
+            .await
+            .is_ok();
+
+        // Only a leadership change is a reason to come back early. The wait also ends early, with
+        // an error, once this node has been shut down - its metrics are gone for good - and a
+        // caller's retry loop must not become a busy loop for the rest of its deadline on that.
+        if !leader_changed {
+            tokio::time::sleep(budget.saturating_sub(started.elapsed())).await;
+        }
     }
 
     /// After a success at `revision`: wait for this node's own view to catch up, within the

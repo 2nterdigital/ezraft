@@ -629,17 +629,18 @@ impl EzKv {
     /// bind it again immediately after this returns. A node with no address to answer on has no
     /// business serving anyway. A node that never called `serve` simply has nothing to stop here.
     pub async fn shutdown(&self) -> Result<(), io::Error> {
+        // "Retries until it succeeds" (ech0-media#33) must not mean "forever, even after this
+        // node has stopped" - a no-op if it already finished on its own. First, so that nothing
+        // below can return early and leave it retrying against a node that is gone.
+        if let Some(handle) = self.self_registration.lock().unwrap().take() {
+            handle.abort();
+        }
+
         self.raft.shutdown().await.map_err(io::Error::other)?;
 
         // Nothing will be applied again, so nothing will be published again: end every watch
         // stream rather than leave its consumer waiting on a node that is gone.
         self.watch.close_watch();
-
-        // "Retries until it succeeds" (ech0-media#33) must not mean "forever, even after this
-        // node has stopped" - a no-op if it already finished on its own.
-        if let Some(handle) = self.self_registration.lock().unwrap().take() {
-            handle.abort();
-        }
 
         let handle = self.serve_handle.lock().unwrap().take();
         if let Some(handle) = handle {

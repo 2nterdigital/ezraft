@@ -179,6 +179,77 @@ async fn no_node_is_marked_down_during_the_new_leader_grace_period() -> io::Resu
     Ok(())
 }
 
+/// A change of leader is not evidence that anyone recovered. The new leader has heard from
+/// nobody yet, so a node the previous leadership left `Down` must stay `Down` - never flip to
+/// `Up` for the length of the grace period, which would send every client that consults the
+/// registry straight back to a dead node on each failover.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_down_node_stays_down_across_a_change_of_leader() -> io::Result<()> {
+    let grace = Duration::from_secs(2);
+    let cfg = EzConfig {
+        liveness_threshold: Duration::from_millis(200),
+        liveness_grace: grace,
+        liveness_check_interval: Duration::from_millis(20),
+        ..liveness_config()
+    };
+    let (addr_a, a, _data_a) = founding_node_with(cfg.clone()).await?;
+    let (_, b, _data_b) = joined_voter_with(&addr_a, cfg.clone()).await?;
+    let (_, c, _data_c) = joined_voter_with(&addr_a, cfg.clone()).await?;
+
+    let all = BTreeSet::from([0, b.node_id(), c.node_id()]);
+    wait_for_voters(&a, all, "every joined node is a voter").await?;
+    assert!(a.is_leader());
+    wait_for_registry(
+        &a,
+        |r| r.len() == 3 && r.iter().all(|(_, info)| info.status == NodeStatus::Up),
+        "every node is registered and Up before one is stopped",
+    )
+    .await?;
+
+    let victim = c.node_id();
+    c.shutdown().await?;
+    for node in [&a, &b] {
+        wait_for_registry(
+            node,
+            |r| r.get(victim).map(|i| i.status) == Some(NodeStatus::Down),
+            "the stopped node goes Down under the first leadership",
+        )
+        .await?;
+    }
+
+    // Subscribed before the hand-over, so nothing the new leadership writes can be missed.
+    let mut registry = b.watch_registry();
+    registry.borrow_and_update();
+
+    a.transfer_leader(b.node_id()).await?;
+    wait_for_cluster(
+        &b,
+        |cs| cs.current_leader == Some(cs.node_id),
+        "the hand-over completes",
+    )
+    .await?;
+
+    // Watch every registry change for longer than the new leader's whole grace period: a wrong
+    // `Up` would be written by its very first check and stand until the grace period ended.
+    let watch_until = tokio::time::Instant::now() + grace + Duration::from_secs(1);
+    loop {
+        let status = registry.borrow_and_update().get(victim).map(|i| i.status);
+        assert_eq!(
+            Some(NodeStatus::Down),
+            status,
+            "the stopped node must stay Down across the hand-over"
+        );
+
+        match tokio::time::timeout_at(watch_until, registry.changed()).await {
+            Ok(Ok(())) => continue,
+            Ok(Err(_)) => panic!("the registry watch closed while its node is still running"),
+            Err(_) => break,
+        }
+    }
+
+    Ok(())
+}
+
 /// A healthy, unchanged cluster produces no further registry writes at all: the liveness task
 /// only ever writes on an actual status change.
 #[tokio::test(flavor = "multi_thread")]
@@ -236,18 +307,14 @@ const SCAN_ATTEMPT_BUDGET: Duration = Duration::from_secs(5);
 /// own steps normally, so there is nothing stale to reconcile) - the caller retries with a
 /// different offset on a fresh cluster, never reusing this one.
 async fn try_reconcile_stale_entry_at_offset(offset: usize) -> io::Result<bool> {
-    // Threshold, grace and the check interval are all set far longer than one scan attempt runs.
-    // Threshold and grace: a brand new peer's own heartbeat entry starts `None` until its very
-    // first acknowledgement lands (this leadership's own age, not "since it joined", is what a
-    // never-acknowledged peer's silence is measured against - see `crate::liveness`'s own docs),
-    // which would otherwise briefly - and correctly, by that same rule - flip the learner `Down`
-    // then back `Up` right after it joins a leadership that has already run long enough to clear
-    // both, consuming extra log entries this scan does not account for. Check interval:
-    // `tokio::time::interval`'s own first tick fires immediately, not after a full interval, so
-    // the built-in task's *first* check (finding nothing stale yet) is harmless - but its
-    // *second* check, one interval later, could land on exactly the persist this scan means to
-    // crash. A long interval makes that second check impossible within one attempt, while the
-    // *restarted* node's own fresh task still reconciles promptly: its first tick fires
+    // Threshold, grace and the check interval are all set far longer than one scan attempt runs,
+    // so that the built-in task writes nothing this scan does not account for. Threshold and
+    // grace: no status can change during an attempt, however slow a heartbeat is under load.
+    // Check interval: `tokio::time::interval`'s own first tick fires immediately, not after a
+    // full interval, so the built-in task's *first* check (finding nothing stale yet) is harmless
+    // - but its *second* check, one interval later, could land on exactly the persist this scan
+    // means to crash. A long interval makes that second check impossible within one attempt,
+    // while the *restarted* node's own fresh task still reconciles promptly: its first tick fires
     // immediately too.
     let cfg = EzConfig {
         liveness_threshold: Duration::from_secs(60),
