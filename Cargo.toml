@@ -99,6 +99,18 @@ path = "examples/kvstore.rs"
 name = "kvstore_example"
 path = "examples/kvstore_test.rs"
 
+[[test]]
+name = "kvstore_kill_leader"
+path = "examples/kvstore_kill_leader_test.rs"
+
+[[test]]
+name = "kvstore_kill_follower"
+path = "examples/kvstore_kill_follower_test.rs"
+
+[[test]]
+name = "kvstore_cleanup"
+path = "examples/kvstore_cleanup_test.rs"
+
 [profile.release]
 debug = 2
 split-debuginfo = "packed"

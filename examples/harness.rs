@@ -26,11 +26,53 @@ pub struct Node {
     child: Child,
 }
 
+impl Node {
+    /// This node's OS process id, for logging or for [`pid_is_alive`] to check on later.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// SIGKILL this node right now (`Child::kill`, which sends `SIGKILL` on Unix), without
+    /// waiting for the test to end.
+    ///
+    /// Distinct from [`Drop`]: a SIGKILL test kills one node mid-test and keeps driving the rest
+    /// of the cluster, so the kill has to happen on the test's own schedule. Reaps the process
+    /// (`wait`, not `try_wait`) so a killed node never lingers as a zombie - a just-killed child
+    /// exits immediately, so this does not block.
+    pub fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()?;
+        self.child.wait()?;
+        Ok(())
+    }
+}
+
 impl Drop for Node {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Whether the OS still has a process at `pid`
+///
+/// Unix only, like [`Node::kill`]'s own `SIGKILL` (`Child::kill`) - used to prove a killed or
+/// dropped node actually left no process behind, not merely that this handle stopped tracking it.
+/// Sends signal `0` (`kill -0`), which delivers no signal and only checks the pid exists; a zero
+/// exit status means it still does. A pid the OS has already recycled for an unrelated process
+/// would be a false positive, but the window for that on a test machine, checked immediately
+/// after a `kill`+`wait`, is not one these tests hit in practice.
+#[cfg(unix)]
+pub fn pid_is_alive(pid: u32) -> bool {
+    // A dead pid is the expected, common case here (this is mostly called to confirm a kill
+    // worked), and `kill -0` on one prints "No such process" to stderr on top of the exit status
+    // this only cares about - discarded so a passing test's output stays quiet.
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// A built example binary and the scratch directory its nodes run in.
@@ -83,16 +125,20 @@ impl Example {
         self
     }
 
-    /// Spawn one node; its `./data/<addr>` dir and log land in the work directory.
+    /// Spawn one node: `addr` is its internal port (Raft + RPC), `api_addr` the separate external
+    /// port this example's own client API listens on. Its `./data/<addr>` dir and log land in the
+    /// work directory.
     ///
-    /// `seed` is the address of a node already in the cluster, or `None` to found
-    /// a new one.
-    pub fn spawn(&self, addr: &str, seed: Option<&str>) -> io::Result<Node> {
+    /// `seed` is another node's internal-port address to join through, or `None` to found a new
+    /// cluster. Restarting a node that already has an id (same `addr`, same work directory, so the
+    /// same data directory) ignores `seed` on its own - pass `None` for a restart, since the
+    /// example itself already does the same (see `examples/kvstore.rs`).
+    pub fn spawn(&self, addr: &str, api_addr: &str, seed: Option<&str>) -> io::Result<Node> {
         let log_name = format!("node-{}.log", addr.replace(':', "-"));
         let log = File::create(self.work_dir.join(log_name))?;
         let mut cmd = Command::new(&self.bin);
         cmd.current_dir(&self.work_dir)
-            .args(["--addr", addr])
+            .args(["--addr", addr, "--api-addr", api_addr])
             .args(&self.node_args)
             .stdout(log.try_clone()?)
             .stderr(log)
@@ -114,4 +160,9 @@ impl Example {
 pub fn free_addr() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().to_string()
+}
+
+/// A fresh `(internal, external)` address pair - every node this example spawns needs both.
+pub fn free_addr_pair() -> (String, String) {
+    (free_addr(), free_addr())
 }

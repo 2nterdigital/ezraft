@@ -1,139 +1,94 @@
 //! End-to-end test of the kvstore example: spawn real `kvstore` processes,
-//! form a three-node cluster, and drive it purely over HTTP - the same
-//! commands the example's doc header shows, minus the terminals.
+//! form a three-node cluster, and drive it purely over its external API - the
+//! same commands the example's doc header shows, minus the terminals.
 
+mod api_client;
 mod harness;
 
 use std::io;
 use std::time::Instant;
 
+use api_client::*;
 use harness::*;
-use serde_json::Value;
-use serde_json::json;
-
-/// The cluster token every spawned `kvstore` node authenticates with - `kvstore.rs`'s own
-/// `--token` default, unchanged here since this test never passes `--token` itself.
-const TOKEN: &str = "dev-cluster-token";
-
-/// POST `req` to `/api/write` on whichever of `addrs` currently accepts it.
-///
-/// Only the leader does - `EzKv::write` has no forwarding (ech0-media#30) - so this tries every
-/// address in turn and retries the whole round while the cluster is still forming or between an
-/// election and the next write.
-async fn write(addrs: &[&str], req: Value) -> io::Result<Value> {
-    let client = reqwest::Client::new();
-    let deadline = Instant::now() + WAIT;
-    loop {
-        for addr in addrs {
-            if let Ok(resp) =
-                client.post(format!("http://{}/api/write", addr)).bearer_auth(TOKEN).json(&req).send().await
-                && resp.status().is_success()
-            {
-                return resp.json().await.map_err(io::Error::other);
-            }
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::other(format!(
-                "no node in {:?} accepted {:?} within {:?}",
-                addrs, req, WAIT
-            )));
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
-}
-
-/// Poll a node's `/api/read` endpoint until `key` serves exactly `expected`,
-/// where `None` is a key the node does not hold - the app answers that with no
-/// entry. Getting there proves the state reached that node's own state machine.
-async fn wait_for_key(addr: &str, key: &str, expected: Option<&str>) -> io::Result<()> {
-    let client = reqwest::Client::new();
-    let want = expected.map_or_else(|| json!({}), |value| json!({ key: value }));
-    let deadline = Instant::now() + WAIT;
-    let mut last = None;
-    loop {
-        // An error is the node's HTTP server still binding; retry until the deadline.
-        let get = json!({"op": "Get", "key": key});
-        if let Ok(resp) = client.post(format!("http://{}/api/read", addr)).bearer_auth(TOKEN).json(&get).send().await {
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(io::Error::other(format!(
-                    "read {} from {} failed: {}",
-                    key, addr, status
-                )));
-            }
-
-            let entries: Value = resp.json().await.map_err(io::Error::other)?;
-            if entries == want {
-                return Ok(());
-            }
-            last = Some(entries);
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::other(format!(
-                "{} never served {:?} for {}, last seen: {:?}",
-                addr, expected, key, last
-            )));
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn three_node_kvstore_cluster_writes_and_reads() -> io::Result<()> {
     let example = Example::build("kvstore")?;
 
-    let addr_a = free_addr();
-    let a = example.spawn(&addr_a, None)?;
+    let (addr_a, api_a) = free_addr_pair();
+    let a = example.spawn(&addr_a, &api_a, None)?;
 
     // The first write doubles as the readiness wait: it only succeeds once the
     // founding node serves HTTP and leads. A brand-new cluster's first
     // transaction always lands at revision 1.
-    assert_eq!(
-        json!({"revision": 1}),
-        write(&[&addr_a], json!({"op": "Set", "key": "k1", "value": "v1"})).await?
-    );
+    let deadline = Instant::now() + WAIT;
+    match write(&[&api_a], put("k1", "v1"), deadline).await? {
+        TxOutcome::Success { revision, .. } => assert_eq!(1, revision),
+        other => panic!("expected the first write to succeed, got {other:?}"),
+    }
 
-    let addr_b = free_addr();
-    let addr_c = free_addr();
-    let b = example.spawn(&addr_b, Some(&addr_a))?;
-    let c = example.spawn(&addr_c, Some(&addr_a))?;
+    let (addr_b, api_b) = free_addr_pair();
+    let (addr_c, api_c) = free_addr_pair();
+    let b = example.spawn(&addr_b, &api_b, Some(&addr_a))?;
+    let c = example.spawn(&addr_c, &api_c, Some(&addr_a))?;
 
     // Replication must deliver the pre-join write to both joiners.
-    wait_for_key(&addr_b, "k1", Some("v1")).await?;
-    wait_for_key(&addr_c, "k1", Some("v1")).await?;
+    wait_for_value(&api_b, "k1", Some("v1"), Instant::now() + WAIT).await?;
+    wait_for_value(&api_c, "k1", Some("v1"), Instant::now() + WAIT).await?;
 
-    // Only the leader accepts a write, and which node that is may have changed
-    // since the first write (joining two more voters can trigger an election),
-    // so every write below is tried against all three addresses.
-    let addrs = [addr_a.as_str(), addr_b.as_str(), addr_c.as_str()];
-    write(&addrs, json!({"op": "Set", "key": "k2", "value": "v2"})).await?;
-    write(&addrs, json!({"op": "Delete", "key": "k1"})).await?;
-    write(&addrs, json!({"op": "Set", "key": "k2", "value": "v2b"})).await?;
+    // Any node accepts a write (forwarding to the leader is the foundation's own job), so every
+    // write below is tried against all three addresses.
+    let apis = [api_a.as_str(), api_b.as_str(), api_c.as_str()];
+    write(&apis, put("k2", "v2"), Instant::now() + WAIT).await?;
+    write(&apis, delete("k1"), Instant::now() + WAIT).await?;
+    write(&apis, put("k2", "v2b"), Instant::now() + WAIT).await?;
 
     // Every node converges on the exact final state: the overwritten key reads
     // back everywhere, and the deleted key answers with no entry at all.
-    for addr in &addrs {
-        wait_for_key(addr, "k2", Some("v2b")).await?;
-        wait_for_key(addr, "k1", None).await?;
+    for api in &apis {
+        wait_for_value(api, "k2", Some("v2b"), Instant::now() + WAIT).await?;
+        wait_for_value(api, "k1", None, Instant::now() + WAIT).await?;
     }
 
-    // One read answering with every match, which is the shape a key-at-a-time
-    // request cannot express.
-    let prefixed: Value = reqwest::Client::new()
-        .post(format!("http://{}/api/read", addr_a))
-        .bearer_auth(TOKEN)
-        .json(&json!({"op": "Prefix", "prefix": "k"}))
+    // A conflicting condition is reported as a conflict, not silently ignored or applied.
+    let conflicting = serde_json::json!({
+        "conditions": [{"ModRevEq": {"key": "k2", "mod_rev": 999}}],
+        "ops": [{"Put": {"key": "k2", "value": b64("nope")}}],
+    });
+    match write(&apis, conflicting, Instant::now() + WAIT).await? {
+        TxOutcome::Conflict(body) => {
+            assert_eq!(
+                Some("conflict"),
+                body["error"].as_str(),
+                "unexpected conflict body: {body}"
+            );
+        }
+        other => panic!("expected the mismatched condition to conflict, got {other:?}"),
+    }
+    // The conflict changed nothing.
+    wait_for_value(&api_a, "k2", Some("v2b"), Instant::now() + WAIT).await?;
+
+    // One read answering with every match, which is the shape a point lookup cannot express.
+    let prefixed: Vec<ezraft::KeyValue> = reqwest::Client::new()
+        .get(format!("http://{api_a}/view"))
+        .query(&[("prefix", "k")])
         .send()
         .await
         .map_err(io::Error::other)?
         .json()
         .await
         .map_err(io::Error::other)?;
-    assert_eq!(json!({"k2": "v2b"}), prefixed);
+    assert_eq!(1, prefixed.len(), "unexpected /view?prefix= body: {prefixed:?}");
+    assert_eq!("k2", prefixed[0].key);
+    assert_eq!("v2b", text(&prefixed[0].value));
 
+    let pids = [a.pid(), b.pid(), c.pid()];
     drop(a);
     drop(b);
     drop(c);
+    for pid in pids {
+        assert!(!pid_is_alive(pid), "process {pid} outlived the test");
+    }
     example.cleanup()?;
     Ok(())
 }
