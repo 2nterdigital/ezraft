@@ -130,6 +130,7 @@ pub mod admin;
 pub mod app;
 pub mod config;
 pub mod entry;
+pub mod kv;
 pub mod meta;
 mod network;
 pub mod node_role;
