@@ -41,8 +41,9 @@
   "不可达/超时"与其他错误），`src/network.rs` 改为在它之上实现 openraft 网络 trait，错误映射不变。新增仅在
   cargo feature `fault-injection` 下存在的 `ezraft::fault::{Faults, Fault}`：按有向节点对 `Drop`、
   `Delay`、`DropResponse`，以及 `partition`/`isolate`/`heal`；句柄按测试集群独立、经 `EzConfig::faults`
-  传入，非进程全局。feature 默认关闭，普通构建不含任何钩子代码；自身 dev-dependency 让 `cargo test` 无需
-  额外参数即可启用。新增 `tests/common/faults.rs` 与验收测试 `tests/partition.rs`。
+  传入，非进程全局。feature 默认关闭，作为依赖被构建时不含任何钩子代码；自身 dev-dependency 让 `cargo test` 无需
+  额外参数即可启用——代价是同一仓库里的示例目标（含 #35 的 kvstore 与 #36 基准所测的二进制）也带着这个
+  feature 构建：钩子在场但无规则时只是每次出站请求多一次 `Option` 判断。新增 `tests/common/faults.rs` 与验收测试 `tests/partition.rs`。
 - [#24 RedbStorage：生产存储替换样例文件存储](https://github.com/2nterdigital/ech0-media/issues/24)：
   新增生产存储 `RedbStorage`（redb 4.3.0）：每节点一个 redb 文件、三张表（log / meta / snapshot），每次
   `persist` 是一个 `Durability::Immediate` 写事务，契约不变（一批 N 条同步 N+1 次、append 同步通知完成）；
