@@ -95,6 +95,12 @@ tracing-subscriber = { version = "0.3.3", features = ["env-filter"] }
 name = "kvstore"
 path = "examples/kvstore.rs"
 
+# The ech0-media#36 benchmark driver: not a test (never run by `cargo test`), a real-process
+# benchmark instead. `make bench` runs it; see its own module doc comment.
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
+
 [[test]]
 name = "kvstore_example"
 path = "examples/kvstore_test.rs"

@@ -92,8 +92,12 @@ pub struct EzConfig {
     /// the retained window's group count and byte size, each subscriber's queue length, and the
     /// `Progress` rate limit.
     ///
-    /// Defaults (10,000 groups, 64 MiB, a queue of 1024, a 1-second `Progress` interval) are
-    /// provisional until benchmarked (ech0-media#36).
+    /// Defaults (10,000 groups, 64 MiB, a queue of 1024, a 1-second `Progress` interval) kept as
+    /// measured (`FORK.md`'s "参数定值" § watch 环形缓冲与订阅队列): for typical small KV
+    /// changes the group-count cap binds well before the byte cap, and fan-out delivery latency
+    /// showed no rising cost per subscriber. `WatchLimits::default()` itself lives in
+    /// `src/watch.rs`, outside this measurement's own file - see that type's own doc comment for
+    /// its definitive default values.
     pub watch_limits: WatchLimits,
 
     /// Maximum size of a JSON request body for the Raft and admin/RPC routes
@@ -111,8 +115,20 @@ pub struct EzConfig {
     /// transactions the leader batches per replication round trip; it never changes the
     /// oversized-request failure mode itself. actix's own default is 2 MiB.
     ///
-    /// Default: provisional until benchmarked (ech0-media#36); 8 MiB - several times a single
-    /// maximally-sized transaction, with headroom to batch a handful more per request.
+    /// Default: 8 MiB - several times a single maximally-sized transaction, with headroom to
+    /// batch a handful more per request. Measured (`FORK.md`'s "参数定值" § 请求体上限):
+    /// against the derived `max_payload_entries` of 4 (openraft's own default is 300), a
+    /// benchmark of small entries under concurrency and of a follower a few hundred entries
+    /// behind found no meaningful difference in write throughput or catch-up time on the
+    /// measured machine - both were dominated by this crate's per-entry fsync cost (see
+    /// [`Self::ledger_capacity`]'s own doc comment), not by how many entries one append batches.
+    /// That measurement does not generalize to a deployment where round trips are expensive
+    /// (real network RTT) or storage is fast enough for batch size to matter; if the derived cap
+    /// of 4 turns out to cost throughput in such a deployment, splitting an oversized append by
+    /// *bytes* inside `Network::append_entries` (crate-internal) and answering openraft's
+    /// `AppendEntriesResponse::PartialSuccess` would let small entries batch by the hundreds
+    /// while this limit continues to bound the worst case - a proposal recorded in `FORK.md`,
+    /// not implemented.
     pub json_body_limit: usize,
 
     /// Maximum size of the raw snapshot body `/raft/snapshot` accepts, and the largest snapshot
@@ -127,11 +143,15 @@ pub struct EzConfig {
     /// whose snapshots are too small to trip its own check but too large for a stricter follower's
     /// - configure it the same on every node.
     ///
-    /// Default: provisional until benchmarked (ech0-media#36); 64 MiB. The snapshot design
-    /// (ech0-media#14) accepts that both ends hold a whole snapshot in memory at once, so this is
-    /// sized as a generous ceiling on that memory cost - many times larger than anything this
-    /// milestone's own acceptance tests exercise (a few MiB) - rather than as a realistic
-    /// expectation of actual snapshot size. actix's own `PayloadConfig` default is 256 KiB.
+    /// Default: 64 MiB. The snapshot design (ech0-media#14) accepts that both ends hold a whole
+    /// snapshot in memory at once, so this is sized as a generous ceiling on that memory cost -
+    /// many times larger than anything this milestone's own acceptance tests exercise (a few
+    /// MiB) - rather than as a realistic expectation of actual snapshot size. actix's own
+    /// `PayloadConfig` default is 256 KiB. Measured (`FORK.md`'s "参数定值" §
+    /// 快照超时与体积上限): a real-process build/transfer/install benchmark up to ~51 MiB (a
+    /// three-voter cluster, one shared disk) stayed well inside this ceiling with margin to
+    /// spare; kept at 64 MiB rather than lowered, since a localhost benchmark cannot speak to how
+    /// large a legitimate production snapshot gets.
     pub snapshot_max_bytes: usize,
 
     /// Budget for one whole `/raft/snapshot` POST, mapped to openraft's
@@ -146,8 +166,13 @@ pub struct EzConfig {
     /// finish inside a 150ms soft budget (ech0-media#6): enough for a trivial demo state,
     /// nowhere near enough for the >2 MiB states this ticket's acceptance tests exercise.
     ///
-    /// Default: provisional until benchmarked (ech0-media#36); 30 seconds - a round, generous
-    /// number chosen ahead of real measurements.
+    /// Default: 30 seconds. Measured (`FORK.md`'s "参数定值" § 快照超时与体积上限): on a
+    /// real three-voter process cluster (one shared disk), build+transfer+install for a ~51 MiB
+    /// snapshot - sent to a brand-new joiner, which always needs the full snapshot - completed
+    /// within roughly 100 ms, comfortably inside this budget. Kept generous rather than tightened
+    /// to the measured figure: localhost has no real network latency and shares one physical disk
+    /// across all three voters, so a real deployment's transfer time (and thus the safe timeout)
+    /// could be substantially higher; see the same section for the full caveat.
     pub snapshot_timeout: Duration,
 
     /// How many entries the idempotency ledger (ech0-media#30) keeps before evicting the oldest,
@@ -158,8 +183,13 @@ pub struct EzConfig {
     /// of the log, or two differently-configured replicas would diverge the moment one
     /// deduplicated a retry the other re-executed (see `crate::kv::ledger`'s module docs).
     ///
-    /// Default: provisional until benchmarked (ech0-media#36); 100,000, matching ech0-media#12's
-    /// spec.
+    /// Default: 100,000, matching ech0-media#12's spec. Measured (`FORK.md`'s "参数定值" §
+    /// 幂等账本容量): this crate's own writes serialize regardless of client concurrency (one
+    /// `Durability::Immediate` persist per log entry, no group commit, ech0-media#11's
+    /// resolution) - on the measured machine, roughly 55-75 writes/second sustained. Covering
+    /// [`Self::write_deadline`]'s default (10s) with a 3x margin at that rate needs on the order
+    /// of 2,000 entries, comfortably under the default; kept at 100,000 rather than lowered,
+    /// since a production write rate this benchmark cannot reproduce could be far higher.
     pub ledger_capacity: usize,
 
     /// The total time budget [`crate::EzKv::write`] and [`crate::EzKv::write_with_id`] retry a
@@ -205,7 +235,15 @@ pub struct EzConfig {
     /// heard from counts as silent since the leadership began, not since some earlier leadership
     /// this one has no visibility into - see [`Self::liveness_grace`] for why that matters.
     ///
-    /// Default: provisional until benchmarked (ech0-media#36); 5 seconds.
+    /// Default: 5 seconds. Measured (`FORK.md`'s "参数定值" § 存活判定阈值与宽限期): a
+    /// `SIGKILL`ed follower's registry entry read "Down" on a surviving node within threshold
+    /// plus one check tick on the measured machine, and no healthy node was ever falsely marked
+    /// "Down" under write load or during a leader change - including a tighter 1.5-second
+    /// candidate tried side by side. Kept at the generous default rather than tightened to that
+    /// candidate: a real deployment's slower elections (real network round trips, more voters,
+    /// real per-node disk contention) are exactly the case a shorter threshold could
+    /// false-positive on, and a localhost benchmark with no real network latency cannot
+    /// reproduce that slowness to rule it out.
     pub liveness_threshold: Duration,
 
     /// How long a freshly won leadership must have lasted before the built-in liveness task marks
@@ -220,15 +258,25 @@ pub struct EzConfig {
     /// node configured with a shorter one, since that could still mark a peer `Down` before this
     /// leadership could possibly have heard from it.
     ///
-    /// Default: provisional until benchmarked (ech0-media#36); equal to
-    /// [`Self::liveness_threshold`]'s own default (5 seconds).
+    /// Default: equal to [`Self::liveness_threshold`]'s own default (5 seconds). Measured
+    /// (`FORK.md`'s "参数定值" § 存活判定阈值与宽限期): a fresh election took roughly
+    /// 5.3-6 seconds end to end on the measured machine - a small multiple of
+    /// `election_timeout_max` (`6 × heartbeat_interval` at this crate's own defaults), which is
+    /// the scale a leader change should take - and no surviving healthy follower was ever falsely
+    /// marked "Down" during one, even with a tighter 1.5-second grace tried side by side. Kept at
+    /// the generous default for the same reason as [`Self::liveness_threshold`]'s own doc
+    /// comment: a real deployment's elections can run slower than this benchmark's idle localhost
+    /// cluster can reproduce.
     pub liveness_grace: Duration,
 
     /// How often the built-in liveness task re-evaluates every peer's heartbeat, and the registry
     /// against the committed membership
     ///
-    /// Default: provisional until benchmarked (ech0-media#36); 1 second - comfortably below the
-    /// default threshold, so a peer going down is detected promptly once past it.
+    /// Default: 1 second - comfortably below the default threshold, so a peer going down is
+    /// detected promptly once past it. Measured (`FORK.md`'s "参数定值" § 存活判定阈值与宽限期):
+    /// this is the dominant source of slack in observed detection time (threshold plus up to one
+    /// tick, matching this value); no evidence favored a different value over the round number
+    /// already this small relative to the default threshold.
     pub liveness_check_interval: Duration,
 
     /// The test cluster's shared network fault-injection handle, if any

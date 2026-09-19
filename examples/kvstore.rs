@@ -44,6 +44,7 @@ mod api;
 
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use ezraft::EzConfig;
@@ -93,21 +94,65 @@ struct Args {
     /// behind.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+
+    /// Override `EzConfig::snapshot_interval` (log entries between automatic snapshots)
+    ///
+    /// Exists so ech0-media#36's benchmark driver can force a snapshot at a chosen cadence
+    /// instead of waiting out the default 500-entry interval; ordinary runs of this example never
+    /// need it.
+    #[arg(long, default_value_t = EzConfig::default().snapshot_interval)]
+    snapshot_interval: u64,
+
+    /// Override `EzConfig::json_body_limit`, in bytes
+    ///
+    /// `EzConfig::to_raft_config` derives openraft's `max_payload_entries` from this value and
+    /// `kv_limits.max_txn_bytes`; ech0-media#36's benchmark driver raises it to reproduce
+    /// openraft's own 300-entry default for comparison against the derived default of 4.
+    /// Ordinary runs of this example never need to change it.
+    #[arg(long, default_value_t = EzConfig::default().json_body_limit)]
+    json_body_limit: usize,
+
+    /// Override `EzConfig::liveness_threshold`, in milliseconds
+    ///
+    /// Exists so ech0-media#36's benchmark driver can compare candidate thresholds for false
+    /// `Down` marks under load and during leader changes; ordinary runs of this example never
+    /// need it.
+    #[arg(long, default_value_t = EzConfig::default().liveness_threshold.as_millis() as u64)]
+    liveness_threshold_ms: u64,
+
+    /// Override `EzConfig::liveness_grace`, in milliseconds - see `--liveness-threshold-ms`
+    #[arg(long, default_value_t = EzConfig::default().liveness_grace.as_millis() as u64)]
+    liveness_grace_ms: u64,
+
+    /// Override `EzConfig::liveness_check_interval`, in milliseconds - see
+    /// `--liveness-threshold-ms`
+    #[arg(long, default_value_t = EzConfig::default().liveness_check_interval.as_millis() as u64)]
+    liveness_check_interval_ms: u64,
+
+    /// Trace filter for `tracing_subscriber`'s `EnvFilter` (e.g. "warn", "info",
+    /// "warn,ezraft::network=info")
+    ///
+    /// Settable through `RUST_LOG`, this crate's usual convention (see the module doc comment
+    /// above); ech0-media#36's benchmark driver passes `--log-filter` directly instead of
+    /// threading an environment variable through its child-process harness.
+    #[arg(long, env = "RUST_LOG", default_value = "warn")]
+    log_filter: String,
 }
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    let args = Args::parse();
+
     // Without this, everything Raft reports about a cluster that is not working goes nowhere.
-    // Warnings and errors by default; set RUST_LOG=info (or debug) to follow what Raft is doing.
+    // Warnings and errors by default; set RUST_LOG=info (or debug) to follow what Raft is doing,
+    // or pass --log-filter directly (see that flag's own doc comment).
     tracing_subscriber::fmt()
         .with_target(true)
         .with_thread_ids(true)
         .with_level(true)
         .with_ansi(false)
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
+        .with_env_filter(EnvFilter::try_new(&args.log_filter).unwrap_or_else(|_| EnvFilter::new("warn")))
         .init();
-
-    let args = Args::parse();
 
     // The founding node is the cluster's first voter and cannot be anything else: a cluster whose
     // only member does not vote can never commit, not even the change that would fix it.
@@ -131,6 +176,14 @@ async fn main() -> io::Result<()> {
         // answer to "where do clients reach me", so any node can hand a client the address of
         // any other (`GET /status` lists them).
         external_addr: args.api_addr.clone(),
+        // The five fields below default to `EzConfig::default()`'s own values (see each flag's
+        // own doc comment) and only move when ech0-media#36's benchmark driver passes them
+        // explicitly; every other run of this example gets the library's ordinary defaults.
+        snapshot_interval: args.snapshot_interval,
+        json_body_limit: args.json_body_limit,
+        liveness_threshold: Duration::from_millis(args.liveness_threshold_ms),
+        liveness_grace: Duration::from_millis(args.liveness_grace_ms),
+        liveness_check_interval: Duration::from_millis(args.liveness_check_interval_ms),
         ..EzConfig::default()
     };
 

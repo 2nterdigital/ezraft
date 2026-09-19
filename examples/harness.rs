@@ -76,6 +76,11 @@ pub fn pid_is_alive(pid: u32) -> bool {
 }
 
 /// A built example binary and the scratch directory its nodes run in.
+///
+/// `Clone` (ech0-media#36): a benchmark driver builds one binary once and then spawns several
+/// differently-configured clusters from it, each with its own `node_args` - cheap, since this is
+/// two paths and a small argument list, not the build itself.
+#[derive(Clone)]
 pub struct Example {
     bin: PathBuf,
     work_dir: PathBuf,
@@ -83,16 +88,29 @@ pub struct Example {
 }
 
 impl Example {
-    /// Build example `name` and create the work directory its nodes share.
+    /// Build example `name` (dev profile) and create the work directory its nodes share.
     ///
     /// The test cannot assume the example is already built: `cargo test --tests`,
     /// which `cargo llvm-cov` runs, builds test targets only. Nor can it derive the
     /// path from its own executable, because cargo has more than one target
     /// directory layout. Cargo offers no `CARGO_BIN_EXE_*` for examples, so ask it.
     pub fn build(name: &str) -> io::Result<Self> {
+        Self::build_with_args(name, &[])
+    }
+
+    /// Like [`Self::build`], but compiles the optimized `--release` profile.
+    ///
+    /// A benchmark (ech0-media#36) has to drive the same binary a real deployment would run;
+    /// the dev profile's numbers (no optimizations, overflow checks on) do not transfer.
+    pub fn build_release(name: &str) -> io::Result<Self> {
+        Self::build_with_args(name, &["--release"])
+    }
+
+    fn build_with_args(name: &str, profile_args: &[&str]) -> io::Result<Self> {
         let cargo = std::env::var_os("CARGO").expect("cargo sets CARGO for the tests it runs");
         let out = Command::new(cargo)
             .args(["build", "--package", "ezraft", "--example", name])
+            .args(profile_args)
             .arg("--message-format=json-render-diagnostics")
             .stderr(Stdio::inherit())
             .output()
@@ -125,6 +143,18 @@ impl Example {
         self
     }
 
+    /// Where [`Self::spawn`] puts `addr`'s node's log - `tracing`'s structured events included,
+    /// at whatever level `--log-filter`/`RUST_LOG` was given. A benchmark that needs a fact
+    /// `kvstore`'s own HTTP API does not expose (snapshot build/transfer/install timing,
+    /// ech0-media#36) reads it from here instead of adding a route for it.
+    pub fn log_path(&self, addr: &str) -> PathBuf {
+        self.work_dir.join(Self::log_name(addr))
+    }
+
+    fn log_name(addr: &str) -> String {
+        format!("node-{}.log", addr.replace(':', "-"))
+    }
+
     /// Spawn one node: `addr` is its internal port (Raft + RPC), `api_addr` the separate external
     /// port this example's own client API listens on. Its `./data/<addr>` dir and log land in the
     /// work directory.
@@ -134,8 +164,7 @@ impl Example {
     /// same data directory) ignores `seed` on its own - pass `None` for a restart, since the
     /// example itself already does the same (see `examples/kvstore.rs`).
     pub fn spawn(&self, addr: &str, api_addr: &str, seed: Option<&str>) -> io::Result<Node> {
-        let log_name = format!("node-{}.log", addr.replace(':', "-"));
-        let log = File::create(self.work_dir.join(log_name))?;
+        let log = File::create(self.log_path(addr))?;
         let mut cmd = Command::new(&self.bin);
         cmd.current_dir(&self.work_dir)
             .args(["--addr", addr, "--api-addr", api_addr])
