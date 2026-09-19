@@ -163,6 +163,34 @@
   `tracing` 日志。新增依赖 `ulid`，`imbl` 启用 `serde`。`/api/write`、`/api/read` 已于 #27 删除（确认）。
   `tests/crash_recovery.rs` 改为经从不崩溃的那个 voter 写入（依赖同请求 id 重试跨越 leader 崩溃）。新增
   `tests/write_forward.rs`、`tests/idempotency.rs`。
+- [#35 真实进程示例与 SIGKILL 测试](https://github.com/2nterdigital/ech0-media/issues/35)：
+  kvstore 示例完全改写到 `EzKv` 公开 API 上。底座跑在内部端口（`--addr`、`--token` 或环境变量
+  `EZRAFT_CLUSTER_TOKEN`、`--seed`、`--learner`、`--data-dir`）；示例在**独立的对外端口**（`--api-addr`）
+  提供自己的 HTTP API（`examples/kvstore/api.rs`），客户端只与它通信：`POST /tx`（事务，可带 `request_id`）、
+  `GET /view`、`GET /linearizable`、`GET /status`（读 `cluster()`、`last_leader_contact()` 与节点注册表，
+  列出每个节点的对外地址）、`GET /watch`（按前缀的换行分隔 JSON 流，可带续订 revision）。底座的带类型错误各自
+  映射为不同的状态码与响应体（`Conflict`→409、上限→422、`Indeterminate`→504、`LocalLag`→503、`NoLeader`→503、
+  `NotMember`→410、`NotCaughtUp`→504）。示例把 `--api-addr` 登记为 `EzConfig::external_addr`。扩展子进程测试
+  工具 `examples/harness.rs`，新增测试用客户端 `examples/api_client.rs`。真实进程测试只驱动对外 API：三节点
+  冒烟（含"每个节点都列出三个对外地址"）；**写入过程中 SIGKILL leader**——已确认写入在幸存节点上全部保留、选出
+  新 leader 后继续服务，被杀瞬间在途的写入用自己的请求 id 重试、恰好生效一次；**SIGKILL follower 并在同一数据
+  目录重启**——追上集群，watch 客户端带上次 revision 重连得到 Reset + 增量或无缺口增量，折叠结果等于最终状态；
+  测试无论通过、失败或 panic，子进程都被清理。该示例同时是 #36 基准测试的被测二进制。
+- [#33 集群观测与节点注册表](https://github.com/2nterdigital/ech0-media/issues/33)：
+  新增 `src/cluster.rs`：`EzKv::cluster()` 返回 `watch::Receiver<ClusterState>`（本节点 id、角色、term、当前
+  leader、voters、learners、是否仍是成员），由每节点一个任务从 openraft `server_metrics` 派生，**只在这些字段
+  变化时推送**；`EzKv::last_leader_contact() -> Option<Duration>`（leader 上为 0，从未收到为 `None`）——
+  alpha.33 没有 follower 侧的对应指标，由底座在 `/raft/append` 路由里、请求被承认来自合法 leader 时记录。新增
+  节点注册表：`src/kv/registry.rs`（复制部分：`NodeInfo { external_addr, meta, status }`、
+  `NodeStatus::{Up, Down}`，存于 `InternalState`，不占上游 key 空间，随 v1 快照布局原地扩展）与
+  `src/registry.rs`（句柄侧：`registry()` 本地读、`watch_registry()` 整表订阅、`update_node_meta()`）。
+  节点启动时后台任务用 `EzConfig::external_addr` / `node_meta` 登记自身条目，重试到成功为止；`remove_node`
+  在成员变更提交后于同一流程删除条目（leader 在两步之间崩溃会留下陈旧条目，由 #34 的内置任务回收）。
+  **注册表变更是 Raft 日志里的内部命令**：`CommandBody` 新增 `RegisterNode` / `RemoveNode`，`CommandOutcome`
+  改为枚举，同一幂等账本记录两类结果；#30 的任意节点写入路径（本地提议、`ez.write` 转发、同请求 id 重试）从
+  "事务"泛化为"命令体"并原样复用，没有长出第二条路径；内部命令不推进 revision、不产生变更组。`status` 本票只存储
+  与暴露。合并后将成员管理操作从 `src/raft.rs`（已达 811 行）拆到 `src/membership.rs`。新增
+  `tests/cluster_state.rs`、`tests/registry.rs`。
 
 ## 验证命令
 
