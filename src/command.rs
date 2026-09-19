@@ -147,9 +147,16 @@ impl Command {
                     registry: None,
                 }
             }
-            // A node registering or updating its own entry is, by definition, up right now.
+            // A node registering or updating its own entry is, by definition, up right now. Only a
+            // member has an entry: a node that was removed and is still running could otherwise put
+            // its own back, any time it restarts or updates its meta. A node joining cannot be
+            // caught by this - it learns who leads only by being replicated to, so whatever it
+            // proposes is already behind the membership entry that added it.
             CommandBody::RegisterNode(entry) => {
                 AppliedCommand::registry(kv.apply_registry_command(request_id, ledger_capacity, |registry| {
+                    if !is_member(entry.node_id) {
+                        return;
+                    }
                     registry.set(entry.node_id, NodeInfo {
                         external_addr: entry.external_addr,
                         meta: entry.meta,
@@ -322,6 +329,17 @@ mod tests {
             kv.view().revision(),
             "a registry command never advances the revision"
         );
+    }
+
+    #[test]
+    fn a_node_outside_the_applied_membership_cannot_register() {
+        let mut kv = KvState::new();
+
+        let applied = command(None, register(7)).apply(1, |id| id != 7, &mut kv);
+
+        assert_eq!(CommandOutcome::Registry, applied.outcome);
+        assert!(applied.registry.is_none());
+        assert!(kv.registry().is_empty());
     }
 
     #[test]

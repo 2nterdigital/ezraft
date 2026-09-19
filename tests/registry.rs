@@ -75,6 +75,40 @@ async fn an_entry_larger_than_a_single_value_is_refused() -> io::Result<()> {
     Ok(())
 }
 
+/// Only a member has an entry. A node that was removed but is still running must not be able to
+/// put its own entry back - not even until the leader's next reconciliation, which this test
+/// keeps from ever running.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_node_cannot_put_its_entry_back() -> io::Result<()> {
+    let never_reconciling = |external_addr: &str, meta: &str| EzConfig {
+        liveness_threshold: std::time::Duration::from_secs(3600),
+        liveness_grace: std::time::Duration::from_secs(3600),
+        liveness_check_interval: std::time::Duration::from_secs(3600),
+        ..config_for(external_addr, meta)
+    };
+    let (addr_a, a, _data_a) = founding_node_with(never_reconciling("a.example:1", "meta-a")).await?;
+    let (_, removed, _data_r) = joined_learner_with(&addr_a, never_reconciling("r.example:1", "meta-r")).await?;
+    let removed_id = removed.node_id();
+    wait_for_registry(&a, |r| r.get(removed_id).is_some(), "the learner registered itself").await?;
+
+    a.remove_node(removed_id).await.map_err(|e| io::Error::other(e.to_string()))?;
+    wait_for_registry(&a, |r| r.get(removed_id).is_none(), "its entry went with it").await?;
+
+    // Still running, and it still knows who leads: the update reaches the leader and is
+    // committed - as a command that changes nothing.
+    removed.update_node_meta("meta-r-again").await.map_err(|e| io::Error::other(e.to_string()))?;
+    let revision = a.write(set("after", "the-update")).await.map_err(|e| io::Error::other(e.to_string()))?;
+    wait_for_revision(&a, revision).await?;
+
+    assert_eq!(
+        None,
+        a.registry().get(removed_id),
+        "a removed node has no entry, whatever it proposes"
+    );
+
+    Ok(())
+}
+
 /// A new node's `external_addr` and `meta` appear in every node's registry once it has started -
 /// registered by the node itself, in the background, without the caller doing anything for it.
 #[tokio::test(flavor = "multi_thread")]
