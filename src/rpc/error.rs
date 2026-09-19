@@ -2,8 +2,8 @@
 
 /// Why [`crate::rpc::Rpc::call`] did not return the handler's typed result
 ///
-/// No automatic retry happens anywhere in this crate for any of these (DECISIONS.md
-/// ech0-media#15 item 3): a handler is not assumed idempotent, so retrying is the caller's
+/// No automatic retry happens anywhere in this crate for any of these
+/// (ech0-media#15): a handler is not assumed idempotent, so retrying is the caller's
 /// decision to make, informed by which of these it got.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {

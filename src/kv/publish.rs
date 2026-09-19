@@ -1,4 +1,4 @@
-//! The single publish source behind `EzKv::view` (DESIGN.md §5's "publish-before-reply")
+//! The single publish source behind `EzKv::view`: publish first, reply to the writer second
 //!
 //! The state-machine adapter (`crate::storage::adapter::state_machine`) owns exactly one
 //! [`Publisher`]: for every applied transaction it publishes the new view *before* answering the

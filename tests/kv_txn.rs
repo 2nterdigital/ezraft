@@ -17,7 +17,7 @@ use ezraft::Txn;
 use ezraft::WriteError;
 
 /// Writing on the leader, then calling `view()`, must show the write with no wait and no retry
-/// loop: the adapter publishes before answering the writer (DESIGN.md §5).
+/// loop: the adapter publishes before answering the writer.
 #[tokio::test(flavor = "multi_thread")]
 async fn write_on_the_leader_is_immediately_visible_in_its_own_view() -> io::Result<()> {
     let (_, a, _data_a) = founding_node().await?;

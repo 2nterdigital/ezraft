@@ -71,7 +71,7 @@ pub struct EzKv {
     /// promoted.
     promotion: Promotion,
 
-    /// A lock-free reader onto the KV's latest published view (DESIGN.md §5)
+    /// A lock-free reader onto the KV's latest published view
     view_rx: ViewReceiver,
 
     /// The limits [`crate::write`] checks a transaction against before proposing it
@@ -345,7 +345,7 @@ impl EzKv {
     /// a pointer swap: it is a plain read of the value `crate::kv::Publisher` (crate-internal)
     /// last published.
     /// May lag the leader; on the leader itself, a [`Self::write`] that just returned is always
-    /// already reflected here (DESIGN.md §5's publish-before-reply).
+    /// already reflected here: the state machine publishes before it answers the writer.
     pub fn view(&self) -> View {
         self.view_rx.current()
     }

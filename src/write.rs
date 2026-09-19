@@ -59,11 +59,11 @@ impl EzKv {
     /// A limit violation or a failed condition is reported without anything having been
     /// proposed. Success carries the transaction's new revision; by the time this returns,
     /// [`EzKv::view`] on this node already reflects it - the state-machine adapter publishes the
-    /// new view before answering the writer (DESIGN.md §5), and that publish runs inside the
+    /// new view before answering the writer, and that publish runs inside the
     /// same `apply` call that unblocks this future.
     ///
     /// alpha.33 requires the leader to hold a quorum-acknowledged lease before it accepts a
-    /// write (OPENRAFT-A33.md §3): right after an election or a membership change, this node may
+    /// write: right after an election or a membership change, this node may
     /// lead by its own metrics yet have openraft answer an empty `ForwardToLeader` for a moment.
     /// The write was not appended in that case, so retrying is safe; this method does so, within
     /// a budget on the order of the election timeout, before giving up with
@@ -88,7 +88,7 @@ impl EzKv {
                     return outcome.map_err(WriteError::from);
                 }
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(to_leader))) => {
-                    // The lease gap OPENRAFT-A33.md §3 describes: this node's own metrics say it
+                    // The lease gap: this node's own metrics say it
                     // leads, yet openraft names no leader at all because the lease is not valid
                     // yet. Retrying is safe (nothing was appended) and worthwhile (the gap is
                     // brief) only while both hold and the budget is not spent.

@@ -39,9 +39,9 @@
 //! # Publishing views
 //!
 //! `publish::Publisher` (crate-internal) is the one place a new [`view::View`] becomes visible
-//! to readers (DESIGN.md §5's "publish-before-reply"). The adapter owns the single instance;
-//! [`EzKv::view`](crate::EzKv::view) reads through a cloned `publish::ViewReceiver`, never
-//! touching the state machine's lock.
+//! to readers, and it publishes before the writer is answered. The adapter owns the single
+//! instance; [`EzKv::view`](crate::EzKv::view) reads through a cloned `publish::ViewReceiver`,
+//! never touching the state machine's lock.
 
 mod bytes_codec;
 mod change;

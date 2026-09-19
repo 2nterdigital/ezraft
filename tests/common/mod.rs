@@ -113,11 +113,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 ///
 /// `EzKv::write` only succeeds on the leader - forwarding is ech0-media#30 - and answers
 /// [`WriteError::NotLeader`] everywhere else, including briefly right after an election or a
-/// membership change while the new leader's lease is not yet valid (openraft alpha.33, see
-/// OPENRAFT-A33.md §3; `EzKv::write` itself already waits out that particular gap on the node
-/// that is about to lead). This is the harness's replacement for the old `/api/write`-based
-/// "write through whoever leads, whichever node that is": it retries every handle in turn until
-/// one accepts the write or the wait budget runs out.
+/// membership change while the new leader's lease is not yet valid (openraft alpha.33 accepts a
+/// write only under a quorum-acknowledged lease; `EzKv::write` itself already waits out that
+/// particular gap on the node that is about to lead). This is the harness's replacement for the old
+/// `/api/write`-based "write through whoever leads, whichever node that is": it retries every
+/// handle in turn until one accepts the write or the wait budget runs out.
 pub async fn write_through_leader(nodes: &[&EzKv], txn: Txn) -> io::Result<u64> {
     let deadline = tokio::time::Instant::now() + WAIT.expect("cluster waits are bounded");
 

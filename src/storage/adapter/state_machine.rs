@@ -1,8 +1,8 @@
 //! The state machine half of the storage adapter: the KV, and its snapshot
 //!
-//! Owns the single [`Publisher`] DESIGN.md §5 calls for: every applied transaction publishes its
-//! new view before answering the writer ([`RaftStateMachine::apply`]), and installing a snapshot
-//! or finishing startup recovery publishes again ([`Self::new`],
+//! Owns the single [`Publisher`] - views and watches must share one source: every applied
+//! transaction publishes its new view before answering the writer ([`RaftStateMachine::apply`]),
+//! and installing a snapshot or finishing startup recovery publishes again ([`Self::new`],
 //! [`RaftStateMachine::install_snapshot`]).
 
 use std::io::Cursor;
@@ -64,7 +64,7 @@ pub struct StateMachineStore {
     /// not re-run the startup-only [`EzStorage::load`](crate::storage::EzStorage::load).
     snapshot: Arc<Mutex<Option<EzSnapshot>>>,
 
-    /// The single publisher DESIGN.md §5 calls for: every applied transaction, and installing a
+    /// The single publisher: every applied transaction, and installing a
     /// snapshot, publish through this one instance.
     publisher: Arc<Publisher>,
 
@@ -72,8 +72,8 @@ pub struct StateMachineStore {
     /// never touches `sm_state`.
     view_rx: ViewReceiver,
 
-    /// This node's own id, attached to the snapshot build/install tracing events (DESIGN.md §8,
-    /// ech0-media#26) - `crate::raft::EzKv::new` sets it exactly once via [`Self::set_node_id`],
+    /// This node's own id, attached to the snapshot build/install tracing events
+    /// (ech0-media#26) - `crate::raft::EzKv::new` sets it exactly once via [`Self::set_node_id`],
     /// right after this store is constructed, because `crate::storage::adapter::open` (and so
     /// this constructor) runs *before* the node id is known: a restart reads it back from the
     /// very log store `open` returns, and a join asks a seed for one. A plain constructor
@@ -113,8 +113,8 @@ impl StateMachineStore {
     /// The snapshot data is restored here, not just its position: reporting `last_applied` at
     /// the snapshot makes openraft re-apply only the log tail after it, and skip installing this
     /// snapshot itself. The publisher this constructs already holds that restored view - the
-    /// "publish after startup recovery" DESIGN.md §5 asks for falls out of the log tail's own
-    /// applies, or, if there is no tail, out of this initial value.
+    /// "publish after startup recovery" the read path needs (ech0-media#16) falls out of the log
+    /// tail's own applies, or, if there is no tail, out of this initial value.
     pub(super) fn new(storage: SharedStorage, snapshot: Option<EzSnapshot>) -> Result<Self, std::io::Error> {
         let (last_applied, membership, kv) = match &snapshot {
             Some(snap) => {
@@ -196,7 +196,7 @@ impl RaftStateMachine<OpenRaftTypes> for StateMachineStore {
 
             let resp = match entry.payload {
                 EntryPayload::Normal(Command::Txn(txn)) => {
-                    // Publish before answering the writer (DESIGN.md §5): only a transaction
+                    // Publish before answering the writer (ech0-media#16): only a transaction
                     // that actually changed the view - i.e. did not conflict - has anything new
                     // to publish. The change group moves to the publisher; the writer hears only
                     // the revision it committed at.
@@ -270,7 +270,7 @@ impl RaftStateMachine<OpenRaftTypes> for StateMachineStore {
         // `last_log_id` through the invariant [`Self::save_meta`] keeps.
 
         // Update state machine state and restore the KV from the snapshot; then publish the
-        // restored view (DESIGN.md §5).
+        // restored view.
         {
             let mut sm = self.sm_state.lock().await;
             sm.last_applied = snapshot_meta.last_log_id;

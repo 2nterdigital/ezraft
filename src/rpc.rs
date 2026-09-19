@@ -2,7 +2,7 @@
 //!
 //! `kv.rpc()` hands out the facade this module defines, [`Rpc`]: JSON over one fixed path prefix
 //! on the internal port, addressed by node id through the current membership, with no actix type
-//! anywhere in its public surface (DECISIONS.md ech0-media#15 item 2). Traffic goes through the
+//! anywhere in its public surface (ech0-media#15). Traffic goes through the
 //! same `Transport` Raft traffic does, so it carries the same cluster token
 //! and, in test builds, sees the same fault-injection rules - on its own connection pool, so a
 //! burst of RPC calls can never make a heartbeat wait behind one.
@@ -61,8 +61,8 @@ impl Rpc {
     ///
     /// `raft` is read only for this node's own current membership, to resolve a target node id
     /// to its internal address and to answer [`RpcError::NotMember`]. `transport` is the same
-    /// choke point [`crate::network::EzNetworkFactory`] sends Raft traffic through (DESIGN.md
-    /// §4): sharing it is what gives RPC traffic the same cluster token and the same
+    /// choke point [`crate::network::EzNetworkFactory`] sends Raft traffic through:
+    /// sharing it is what gives RPC traffic the same cluster token and the same
     /// fault-injection rules Raft traffic gets.
     pub(crate) fn new(node_id: u64, raft: ORRaft, transport: Transport) -> Self {
         Self {

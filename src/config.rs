@@ -41,7 +41,7 @@ pub struct EzConfig {
     /// The shared secret every request on the internal port must present as
     /// `Authorization: Bearer <cluster_token>` - `/raft/*`, `/api/*`, the RPC prefix, and any
     /// route an embedder adds through [`crate::EzKv::serve_with`] alike - compared in constant
-    /// time (DECISIONS.md ech0-media#15 item 4). Exactly one token is supported at a time:
+    /// time (ech0-media#15). Exactly one token is supported at a time:
     /// rotating it means restarting the whole cluster with the new value.
     ///
     /// **Mandatory, with no sensible default**: [`EzKv::create`](crate::EzKv::create) and its
@@ -89,11 +89,11 @@ pub struct EzConfig {
     /// whose snapshots are too small to trip its own check but too large for a stricter follower's
     /// - configure it the same on every node.
     ///
-    /// Default: provisional until benchmarked (ech0-media#36); 64 MiB. DESIGN.md §6 already
-    /// accepts that both ends hold a whole snapshot in memory at once, so this is sized as a
-    /// generous ceiling on that memory cost - many times larger than anything this milestone's own
-    /// acceptance tests exercise (a few MiB) - rather than as a realistic expectation of actual
-    /// snapshot size. actix's own `PayloadConfig` default is 256 KiB.
+    /// Default: provisional until benchmarked (ech0-media#36); 64 MiB. The snapshot design
+    /// (ech0-media#14) accepts that both ends hold a whole snapshot in memory at once, so this is
+    /// sized as a generous ceiling on that memory cost - many times larger than anything this
+    /// milestone's own acceptance tests exercise (a few MiB) - rather than as a realistic
+    /// expectation of actual snapshot size. actix's own `PayloadConfig` default is 256 KiB.
     pub snapshot_max_bytes: usize,
 
     /// Budget for one whole `/raft/snapshot` POST, mapped to openraft's
@@ -105,7 +105,7 @@ pub struct EzConfig {
     /// the snapshot RPC's hard timeout from exactly this `Config` field. Before this field existed,
     /// ezraft left `install_snapshot_timeout` at openraft's own default (200ms), so the whole
     /// snapshot POST - including the receiving node's time to decode and install it - had to
-    /// finish inside a 150ms soft budget (OPENRAFT-A33.md §4): enough for a trivial demo state,
+    /// finish inside a 150ms soft budget (ech0-media#6): enough for a trivial demo state,
     /// nowhere near enough for the >2 MiB states this ticket's acceptance tests exercise.
     ///
     /// Default: provisional until benchmarked (ech0-media#36); 30 seconds - a round, generous

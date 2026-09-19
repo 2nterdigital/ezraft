@@ -50,7 +50,7 @@ pub type EzVote = Vote<EzLeaderId>;
 
 /// A cluster member, as membership carries it: its address on the internal port
 ///
-/// Replaces openraft's `BasicNode` (ech0-media#29, DECISIONS.md ech0-media#18 item 2). A node is
+/// Replaces openraft's `BasicNode` (ech0-media#29, decided in ech0-media#18). A node is
 /// addressed by id through the current membership - `Transport`, `Rpc::call`, and `EzKv`'s own
 /// membership-change handlers all look a target node's `Node` up there rather than being told an
 /// address directly - and this is the type that lookup returns. It carries no other metadata: a
