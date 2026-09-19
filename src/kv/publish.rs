@@ -35,6 +35,21 @@ impl ViewReceiver {
     pub(crate) fn current(&self) -> View {
         self.0.borrow().clone()
     }
+
+    /// Wait until the published view has reached `revision`, or `deadline` passes first
+    ///
+    /// Woken by the publish itself rather than polling for it: this is the wait behind a write's
+    /// read-your-writes guarantee, so every millisecond of polling interval would be added to the
+    /// latency of every write issued on a follower. `false` if the deadline passed first, or the
+    /// node shut down and nothing will ever be published again.
+    pub(crate) async fn wait_for_revision(&self, revision: u64, deadline: tokio::time::Instant) -> bool {
+        // A clone, because waiting needs `&mut`: the receiver this node reads `view()` through is
+        // shared by every handle and must never be left marked as having seen a value.
+        let mut rx = self.0.clone();
+        tokio::time::timeout_at(deadline, rx.wait_for(|view| view.revision() >= revision))
+            .await
+            .is_ok_and(|reached| reached.is_ok())
+    }
 }
 
 /// The one place a new [`View`] becomes visible to every [`ViewReceiver`], and the watch side

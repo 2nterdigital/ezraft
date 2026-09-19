@@ -44,13 +44,6 @@ use crate::raft::EzKv;
 use crate::raft::ORRaft;
 use crate::rpc::Rpc;
 
-/// How often [`EzKv::write`]'s local catch-up wait re-checks [`EzKv::view`]
-///
-/// Short enough that the common case - a follower whose forwarded write already committed and
-/// only needs an ordinary replication round trip to become locally visible - adds negligible
-/// latency; the wait itself is still bounded by the overall deadline regardless.
-const LOCAL_CATCH_UP_POLL_INTERVAL: Duration = Duration::from_millis(5);
-
 /// Why [`EzKv::write`] or [`EzKv::write_with_id`] did not produce a new revision
 ///
 /// [`Self::LimitExceeded`] and [`Self::Conflict`] mean nothing was proposed anywhere, or - if a
@@ -427,24 +420,10 @@ impl EzKv {
         let _ = self.await_local_revision(conflict.current_mod_rev, deadline).await;
     }
 
-    /// Poll this node's own [`Self::view`] until its revision reaches `revision`, or `deadline`
-    /// passes first
+    /// Wait until this node's own [`Self::view`] has reached `revision`, or `deadline` passes first
     ///
-    /// A short, bounded poll rather than an event-driven wait: the publisher `view()` reads
-    /// through exposes only the latest value, not a wait-for-predicate primitive, and this avoids
-    /// changing that shared type while it is also being extended for `watch` (ech0-media#32).
-    /// [`LOCAL_CATCH_UP_POLL_INTERVAL`] keeps the added latency negligible for the common case (a
-    /// follower waiting out one replication round trip).
+    /// Woken by the publish that makes it true, not by polling for it.
     async fn await_local_revision(&self, revision: u64, deadline: tokio::time::Instant) -> bool {
-        loop {
-            if self.view().revision() >= revision {
-                return true;
-            }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return false;
-            }
-            tokio::time::sleep(remaining.min(LOCAL_CATCH_UP_POLL_INTERVAL)).await;
-        }
+        self.view_receiver().wait_for_revision(revision, deadline).await
     }
 }

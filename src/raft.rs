@@ -409,6 +409,11 @@ impl EzKv {
         self.view_rx.current()
     }
 
+    /// The reader behind [`Self::view`], for the write path's wait on a revision
+    pub(crate) fn view_receiver(&self) -> &ViewReceiver {
+        &self.view_rx
+    }
+
     /// Add a learner node to the cluster
     ///
     /// A learner receives log replication but does not vote. Every node is admitted this way,
