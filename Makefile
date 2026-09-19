@@ -36,9 +36,14 @@ audit:
 	# cargo install cargo-audit
 	cargo audit
 
-# Verify the crate packages and publishes cleanly, without uploading.
+# Verify the fork cannot be published: `publish = false` must make cargo refuse, so this target
+# passes only when `cargo publish` fails. See FORK.md.
 publish_check:
-	cargo publish --dry-run
+	@if cargo publish --dry-run >/dev/null 2>&1; then \
+		echo "error: cargo publish --dry-run succeeded; the fork must stay unpublishable"; \
+		exit 1; \
+	fi
+	@echo "ok: cargo publish is refused"
 
 clean:
 	cargo clean

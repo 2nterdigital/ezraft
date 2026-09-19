@@ -1,5 +1,11 @@
 <img src="logo.png" alt="EzRaft" width="320">
 
+> **This is the 2nterdigital fork** of [drmingdrmer/ezraft](https://github.com/drmingdrmer/ezraft),
+> extended into the foundation of [ech0-media](https://github.com/2nterdigital/ech0-media). The
+> trunk is `dev`; `main` mirrors the original. See [FORK.md](FORK.md) for the baseline, the list of
+> changes, and how to depend on it. The text below is still the original's and is replaced as the
+> fork's own API lands.
+
 [![CI](https://github.com/drmingdrmer/ezraft/actions/workflows/ci.yaml/badge.svg)](https://github.com/drmingdrmer/ezraft/actions/workflows/ci.yaml)
 [![Crates.io](https://img.shields.io/crates/v/ezraft.svg)](https://crates.io/crates/ezraft)
 [![Docs](https://docs.rs/ezraft/badge.svg)](https://docs.rs/ezraft)
