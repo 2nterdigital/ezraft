@@ -43,6 +43,16 @@
   `Delay`、`DropResponse`，以及 `partition`/`isolate`/`heal`；句柄按测试集群独立、经 `EzConfig::faults`
   传入，非进程全局。feature 默认关闭，普通构建不含任何钩子代码；自身 dev-dependency 让 `cargo test` 无需
   额外参数即可启用。新增 `tests/common/faults.rs` 与验收测试 `tests/partition.rs`。
+- [#24 RedbStorage：生产存储替换样例文件存储](https://github.com/2nterdigital/ech0-media/issues/24)：
+  新增生产存储 `RedbStorage`（redb 4.3.0）：每节点一个 redb 文件、三张表（log / meta / snapshot），每次
+  `persist` 是一个 `Durability::Immediate` 写事务，契约不变（一批 N 条同步 N+1 次、append 同步通知完成）；
+  日志截断与压缩用范围删除，快照的 meta 与 data 在同一事务内替换，所有 redb 调用跑在 blocking 线程池。
+  `RedbStorage::open` 对"数据库已被占用"做 2 秒有界重试，覆盖同进程内重启时上一实例句柄异步释放的间隙。
+  新增 `src/storage/adapter/conformance.rs`：openraft alpha.33 自带的日志存储测试套件经适配层跑在
+  `RedbStorage` 上；它暴露并修复了适配层两处既有缺陷（未经 purge、起点高于 0 的日志读取失败；
+  `truncate_after` 在截断点超出日志末尾时把 `last_log_id` 推过了实际存储位置）。进程内集群测试与示例全部改用
+  `RedbStorage`（临时目录）。**删除**原版样例文件存储 `FileStorage`（`src/storage/file_storage.rs`）及其
+  专属测试，以及只有它用到的 tokio `fs`/`io-util` feature。
 
 ## 验证命令
 
