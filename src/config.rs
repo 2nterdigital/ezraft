@@ -168,7 +168,10 @@ pub struct EzConfig {
     /// Bounds the *whole* call: forwarding to the leader, retrying with the same request id
     /// through any number of leadership changes, and - once a success or conflict is definite -
     /// this node's own catch-up wait before returning it (or `LocalLag` if that wait itself runs
-    /// out the budget).
+    /// out the budget). Also bounds a single node's own leader-only retry of the alpha.33 no-lease
+    /// gap (ech0-media#34): `crate::leader_task::LeaderCtx::write` and the built-in liveness
+    /// task's internal commands never forward, so there is no second, longer budget to reuse for
+    /// them - this is the one configured value both share.
     ///
     /// Default: provisional until benchmarked (ech0-media#36); 10 seconds, matching ech0-media#15's
     /// spec.
@@ -191,6 +194,42 @@ pub struct EzConfig {
     ///
     /// Default: empty.
     pub node_meta: Bytes,
+
+    /// How long a peer's last-acknowledged heartbeat may go unrenewed before the built-in
+    /// liveness task (ech0-media#34) marks its registry entry `Down`
+    ///
+    /// Read only by the leader task that makes this judgment, from its own view of openraft's
+    /// per-peer heartbeat metrics - never by `apply`, which only ever assigns the status a
+    /// `SetStatus` command already names (the determinism rule: thresholds shape which command
+    /// the leader proposes, never how a replica applies one). A peer this leadership has never
+    /// heard from counts as silent since the leadership began, not since some earlier leadership
+    /// this one has no visibility into - see [`Self::liveness_grace`] for why that matters.
+    ///
+    /// Default: provisional until benchmarked (ech0-media#36); 5 seconds.
+    pub liveness_threshold: Duration,
+
+    /// How long a freshly won leadership must have lasted before the built-in liveness task marks
+    /// *any* peer `Down`
+    ///
+    /// openraft alpha.33's per-peer heartbeat metrics start every member other than the leader
+    /// itself at `None` on a brand new leadership (see `crate::liveness`'s own module docs), so
+    /// without a grace period every peer would briefly look silent right after an election, well
+    /// before the new leader could possibly have heard from any of them even once.
+    ///
+    /// Must be at least [`Self::liveness_threshold`] - `EzKv::create`/`join` refuse to start a
+    /// node configured with a shorter one, since that could still mark a peer `Down` before this
+    /// leadership could possibly have heard from it.
+    ///
+    /// Default: provisional until benchmarked (ech0-media#36); equal to
+    /// [`Self::liveness_threshold`]'s own default (5 seconds).
+    pub liveness_grace: Duration,
+
+    /// How often the built-in liveness task re-evaluates every peer's heartbeat, and the registry
+    /// against the committed membership
+    ///
+    /// Default: provisional until benchmarked (ech0-media#36); 1 second - comfortably below the
+    /// default threshold, so a peer going down is detected promptly once past it.
+    pub liveness_check_interval: Duration,
 
     /// The test cluster's shared network fault-injection handle, if any
     ///
@@ -221,6 +260,9 @@ impl Default for EzConfig {
             write_deadline: Duration::from_secs(10),
             external_addr: String::new(),
             node_meta: Bytes::new(),
+            liveness_threshold: Duration::from_secs(5),
+            liveness_grace: Duration::from_secs(5),
+            liveness_check_interval: Duration::from_secs(1),
             #[cfg(feature = "fault-injection")]
             faults: None,
         }
@@ -228,6 +270,27 @@ impl Default for EzConfig {
 }
 
 impl EzConfig {
+    /// Validate the liveness settings
+    ///
+    /// Called by `EzKv::new`, the same way the replication-lag/snapshot-interval pair validates
+    /// itself inside [`Self::to_raft_config`] - a check on nothing but this configuration's own
+    /// arguments, so it belongs alongside every other "fail before this node starts" check rather
+    /// than surfacing however the first liveness tick would discover it.
+    pub(crate) fn validate_liveness(&self) -> Result<(), io::Error> {
+        if self.liveness_grace < self.liveness_threshold {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "liveness_grace ({:?}) must be at least liveness_threshold ({:?}): a shorter grace period \
+                     could mark a peer Down before a freshly elected leader could possibly have heard from it \
+                     even once",
+                    self.liveness_grace, self.liveness_threshold
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Convert to openraft Config
     ///
     /// Validates and creates the internal Raft configuration.
@@ -403,5 +466,49 @@ mod tests {
         };
 
         assert!(config.to_raft_config().is_ok());
+    }
+
+    /// The defaults keep the grace period at least as long as the threshold, matching the
+    /// documented minimum.
+    #[test]
+    fn the_default_liveness_grace_is_at_least_the_default_threshold() {
+        assert!(EzConfig::default().validate_liveness().is_ok());
+        assert_eq!(
+            EzConfig::default().liveness_threshold,
+            EzConfig::default().liveness_grace
+        );
+    }
+
+    /// A grace period shorter than the threshold is refused with a message naming both configured
+    /// values - it could mark a peer `Down` before a freshly elected leader could possibly have
+    /// heard from it even once.
+    #[test]
+    fn a_liveness_grace_shorter_than_the_threshold_is_refused() {
+        let config = EzConfig {
+            liveness_threshold: Duration::from_secs(10),
+            liveness_grace: Duration::from_secs(5),
+            ..EzConfig::default()
+        };
+
+        let err = config.validate_liveness().unwrap_err();
+
+        assert_eq!(io::ErrorKind::InvalidInput, err.kind());
+        assert!(
+            err.to_string().contains("liveness_grace") && err.to_string().contains("liveness_threshold"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A grace period exactly equal to the threshold is the documented minimum, not an off-by-one
+    /// over it - it must be accepted.
+    #[test]
+    fn a_liveness_grace_equal_to_the_threshold_is_accepted() {
+        let config = EzConfig {
+            liveness_threshold: Duration::from_secs(10),
+            liveness_grace: Duration::from_secs(10),
+            ..EzConfig::default()
+        };
+
+        assert!(config.validate_liveness().is_ok());
     }
 }

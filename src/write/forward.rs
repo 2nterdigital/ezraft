@@ -84,7 +84,7 @@ pub(super) fn register(rpc: &Rpc, raft: ORRaft, kv_limits: KvLimits, ledger_capa
 /// The leader side of `ez.write`: propose `req.body` under `req.request_id`, answering with
 /// whatever [`propose`] produced
 async fn handle(raft: &ORRaft, kv_limits: KvLimits, ledger_capacity: usize, req: ForwardRequest) -> ForwardReply {
-    match propose(raft, kv_limits, ledger_capacity, req.request_id, req.body).await {
+    match propose(raft, kv_limits, ledger_capacity, req.request_id, None, req.body).await {
         Err(limit_err) => ForwardReply::LimitExceeded(limit_err),
         Ok(super::ProposeOutcome::Definite(outcome)) => ForwardReply::Outcome(outcome),
         Ok(super::ProposeOutcome::NotLeader { leader_id, leader_addr }) => {
