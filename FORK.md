@@ -191,6 +191,25 @@
   "事务"泛化为"命令体"并原样复用，没有长出第二条路径；内部命令不推进 revision、不产生变更组。`status` 本票只存储
   与暴露。合并后将成员管理操作从 `src/raft.rs`（已达 811 行）拆到 `src/membership.rs`。新增
   `tests/cluster_state.rs`、`tests/registry.rs`。
+- [#34 leader 专属任务与基于 Raft 心跳的存活判定](https://github.com/2nterdigital/ech0-media/issues/34)：
+  新增 `src/leader_task.rs`：`EzKv::spawn_leader_task(name, f)` 为节点生命周期注册任务；每节点一个监督者观察
+  `cluster()`，本节点在 term T 成为 leader 时为每个已注册任务运行 `f(LeaderCtx { term: T, .. })`，失去
+  leadership 或 term 变化时 abort 并**等它们全部结束后**才允许新一轮开始；已在 leading 时注册的任务立即启动；
+  任务返回或 panic 会被记录，同一 term 内不重启。**`ctx.write` 从不转发，且围栏是精确的**：提议前核对角色与
+  term（省去一条不可能生效的日志），但 leadership 可能在核对与追加之间变化——因此命令同时被盖上它所属的 term
+  （`Command::required_term`），`apply` 拒绝在任何其他 term 追加的条目（结果 `CommandOutcome::StaleTerm`）；
+  这只依据日志本身判定，故各副本结论一致。经由过期 context 发出的写入不可能生效，哪怕同一节点先重新赢得了
+  leadership。租约未生效时在同一 term 内等待重试。仍在 leading 却超时返回 `LeaderWriteError::Indeterminate`
+  而非 `NotLeader`：context 很可能仍然有效，而以此结束的任务要到下个 term 才会再运行。新增内置存活判定任务
+  `src/liveness.rs`（经同一机制运行）：leader 读取每个成员最近一次被确认的心跳，注册过的节点静默超过
+  `EzConfig::liveness_threshold` **且**本次 leadership 已超过 `liveness_grace`（校验 grace ≥ threshold；
+  新 leader 的心跳记录初始为空，从未确认过的节点视为自 leadership 开始起静默）时置 `Down`，恢复确认后置 `Up`，
+  leader 自身恒为 `Up`；**只在状态变化时写入**，经 leader 专属内部命令 `CommandBody::SetStatus`，每次变化有
+  结构化 `tracing` 日志。同一任务用 `CommandBody::ReconcileRegistry` 清理已不在成员配置中的注册表条目
+  （`remove_node` 两步之间 leader 崩溃留下的窗口），`apply` 依据状态机自己已应用的成员配置判定，与节点配置
+  无关。`EzConfig` 新增 `liveness_threshold` / `liveness_grace` / `liveness_check_interval`（5 s / 5 s /
+  1 s，待 #36 实测）。对转发命令收到形状不符的应答时记录错误并按"无应答"处理，不再 panic（该应答来自对端）。
+  原版 `timestamp_oracle` 示例已于 #27 删除（确认）。新增 `tests/leader_task.rs`、`tests/liveness.rs`。
 
 ## 验证命令
 

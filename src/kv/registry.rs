@@ -114,6 +114,21 @@ pub struct RemoveNode {
     pub(crate) node_id: u64,
 }
 
+/// Set one node's liveness status (ech0-media#34)
+///
+/// The command body the built-in liveness task proposes, through the leader-only propose path
+/// `crate::leader_task::LeaderCtx::write` shares (`crate::write::propose_leader_only`) - never
+/// forwarded, never proposed by anything else. The threshold/grace decision that produced this
+/// command already happened on the proposing leader, from its own configuration and its own view
+/// of openraft's per-peer heartbeat metrics; applying it is a pure assignment, with nothing left
+/// to decide (the determinism rule: thresholds are the leader task's concern, never `apply`'s).
+/// `pub` for the same reason [`RegisterNode`] is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetStatus {
+    pub(crate) node_id: u64,
+    pub(crate) status: NodeStatus,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -90,6 +90,49 @@ pub struct LocalLag {
     pub revision: u64,
 }
 
+/// Why [`crate::leader_task::LeaderCtx::write`] (or the built-in liveness task's own internal
+/// commands) did not produce a result (ech0-media#34)
+///
+/// No `Indeterminate` and nothing about forwarding: the leader-only propose path never sends
+/// `body` anywhere but to `node` itself, so the only way it can fail to produce a definite outcome
+/// is [`Self::NotLeader`].
+#[derive(Debug, thiserror::Error)]
+pub enum LeaderWriteError {
+    /// `txn` exceeded a configured limit (a transaction-only concern)
+    #[error(transparent)]
+    LimitExceeded(#[from] LimitError),
+
+    /// `txn`'s conditions were not all satisfied
+    #[error(transparent)]
+    Conflict(#[from] Conflict),
+
+    /// `node` no longer leads in `term` - it lost leadership, or won it again in a later term -
+    /// and the write did not and will not take effect. Never forwarded: whoever holds this context
+    /// must go through the ordinary [`EzKv::write`] path on the *current* leader instead, if
+    /// the write still needs to happen.
+    #[error("this node is not confirmed to be leading in term {term} anymore")]
+    NotLeader {
+        /// The term this write was scoped to - [`crate::leader_task::LeaderCtx::term`], or the
+        /// term the built-in liveness task's own command was proposed under
+        term: u64,
+    },
+
+    /// The bounded wait ran out while this node still appeared to lead in `term`, without a
+    /// definite answer: the write may have been appended and may yet commit, or may never have
+    /// been accepted at all (a leader cut off from its quorum gets neither a lease nor a commit)
+    ///
+    /// Deliberately not [`Self::NotLeader`]. That one says the context is dead; this one says
+    /// nothing about it - the node may go on leading in this very term once the trouble passes. A
+    /// task that ended on it would not run again until the next term, so the thing to do is to
+    /// read the state again and, if the write is still needed, issue it again under its CAS
+    /// conditions, which are what make a late commit of the first attempt harmless.
+    #[error("no definite outcome within the deadline while still leading in term {term}")]
+    Indeterminate {
+        /// The term this write was scoped to
+        term: u64,
+    },
+}
+
 /// One attempt's result: either a definite outcome to stop on, or a reason to retry
 ///
 /// Shared by every kind of command the any-node command path carries: [`EzKv::write_with_id`]'s
@@ -222,6 +265,7 @@ async fn propose(
     kv_limits: KvLimits,
     ledger_capacity: usize,
     request_id: RequestId,
+    required_term: Option<u64>,
     body: CommandBody,
 ) -> Result<ProposeOutcome, LimitError> {
     if let CommandBody::Txn(txn) = &body {
@@ -231,6 +275,7 @@ async fn propose(
     let command = Command {
         request_id,
         ledger_capacity: ledger_capacity as u64,
+        required_term,
         body,
     };
 
@@ -294,11 +339,114 @@ pub(crate) async fn attempt_command(
 /// The local-propose half of [`attempt_command`]: `node` believes it leads, so this proposes
 /// directly rather than forwarding
 async fn propose_command_locally(node: &EzKv, request_id: RequestId, body: CommandBody) -> Attempt {
-    match propose(node.inner(), node.kv_limits(), node.ledger_capacity(), request_id, body).await {
+    match propose(
+        node.inner(),
+        node.kv_limits(),
+        node.ledger_capacity(),
+        request_id,
+        None,
+        body,
+    )
+    .await
+    {
         Err(limit_err) => Attempt::Done(Err(limit_err)),
         Ok(ProposeOutcome::Definite(outcome)) => Attempt::Done(Ok(outcome)),
         Ok(ProposeOutcome::NotLeader { .. }) => Attempt::Retry(RetryReason::LeaseGap),
         Ok(ProposeOutcome::Unknown) => Attempt::Retry(RetryReason::LocalEngineUnavailable),
+    }
+}
+
+/// The leader-only propose path [`crate::leader_task::LeaderCtx::write`] and the built-in
+/// liveness task's own internal commands share (ech0-media#34): never forwards, and checks that
+/// `node` is leading *in `term`* immediately before every propose attempt, so a context captured
+/// from an earlier leadership can never quietly commit under a later one just because the same
+/// physical node happens to be re-elected.
+///
+/// # Fencing
+///
+/// Two checks, because neither is enough alone. Immediately before each attempt this reads
+/// `node`'s own current metrics (a plain, synchronous watch read - no round trip) and returns
+/// [`LeaderWriteError::NotLeader`] at once unless `node`'s role is
+/// [`openraft::ServerState::Leader`] and its current term equals `term`: cheap, and it spares the
+/// log an entry that could not take effect. But leadership can change between that read and the
+/// append, so the command is also fenced to `term` ([`Command::required_term`]), and `apply`
+/// refuses it unless the entry itself was appended in that term - which holds even if this same
+/// node lost leadership and won it back in between. Because this function never forwards, `body`
+/// can only ever be proposed on `node` itself: there is no path by which a write issued through a
+/// stale context takes effect, through this node or any other.
+///
+/// Running out of time while still leading is [`LeaderWriteError::Indeterminate`], not
+/// `NotLeader`: the entry may have been appended and may yet commit.
+///
+/// A [`ProposeOutcome::NotLeader`] from the propose attempt itself is retried, waiting a short
+/// backoff, up to [`crate::EzConfig::write_deadline`] (the same bound [`EzKv::write`] retries a
+/// whole forwarded write across, reused here for one node's own bounded local wait instead of a
+/// second configured value): openraft's writable-leader check reports the alpha.33 no-lease gap
+/// the exact same way it reports a genuine loss of leadership, and the fencing check at the top of
+/// the next loop iteration is what actually tells the two apart, since a genuine loss of
+/// leadership fails that check and returns immediately rather than retrying to no purpose.
+pub(crate) async fn propose_leader_only(
+    node: &EzKv,
+    term: u64,
+    body: CommandBody,
+) -> Result<CommandOutcome, LeaderWriteError> {
+    let deadline = tokio::time::Instant::now() + node.write_deadline();
+    let backoff = Duration::from_millis(node.inner().config().heartbeat_interval);
+
+    loop {
+        let metrics = node.inner().metrics().borrow_watched().clone();
+        if metrics.state != openraft::ServerState::Leader || metrics.current_term != term {
+            return Err(LeaderWriteError::NotLeader { term });
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(LeaderWriteError::Indeterminate { term });
+        }
+
+        // Bounded by `remaining`, the same way `attempt_command`'s own local-propose path is:
+        // openraft's `client_write` never times out on its own, and a leader that has lost its
+        // quorum (isolated, say) but still holds a valid lease would otherwise hang this call past
+        // `term`'s own bounded wait. A fresh `RequestId` every attempt is safe here - unlike
+        // `EzKv::write_with_id`'s ledger-backed exactly-once retry, nothing this function proposes
+        // is guaranteed to have never reached the log on a timeout, and this crate never claims
+        // otherwise: duplicate actions across attempts are the task author's to fence with CAS
+        // conditions, exactly as `LeaderCtx::write`'s own docs say.
+        let attempt = tokio::time::timeout(
+            remaining,
+            propose(
+                node.inner(),
+                node.kv_limits(),
+                node.ledger_capacity(),
+                RequestId::new(),
+                // The check above cannot by itself rule out that leadership changes before the
+                // append: the entry is fenced to `term`, and `apply` refuses it unless the entry
+                // itself was appended in that term.
+                Some(term),
+                body.clone(),
+            ),
+        )
+        .await;
+
+        match attempt {
+            // Appended, perhaps, but not known to be committed: not a refusal.
+            Err(_elapsed) => return Err(LeaderWriteError::Indeterminate { term }),
+            Ok(Err(limit_err)) => return Err(LeaderWriteError::LimitExceeded(limit_err)),
+            // The entry was appended under another leadership - even one this same node won
+            // later - and changed nothing, on any replica.
+            Ok(Ok(ProposeOutcome::Definite(CommandOutcome::StaleTerm))) => {
+                return Err(LeaderWriteError::NotLeader { term });
+            }
+            Ok(Ok(ProposeOutcome::Definite(outcome))) => return Ok(outcome),
+            Ok(Ok(ProposeOutcome::NotLeader { .. } | ProposeOutcome::Unknown)) => {
+                tracing::debug!(
+                    term,
+                    "leader-only propose found no definite outcome yet (lease gap or transient \
+                     engine state); retrying within the same term",
+                );
+                tokio::time::sleep(backoff.min(remaining)).await;
+            }
+        }
     }
 }
 
@@ -374,9 +522,17 @@ impl EzKv {
                     self.wait_for_conflict_visibility(&conflict, deadline).await;
                     return Err(WriteError::Conflict(conflict));
                 }
-                Attempt::Done(Ok(CommandOutcome::Registry)) => unreachable!(
-                    "write_with_id only ever proposes CommandBody::Txn, whose outcome is always CommandOutcome::Txn"
-                ),
+                // A transaction is answered as a transaction. Anything else came from a node that
+                // does not speak this one's protocol - the answer to a forwarded write is a peer's
+                // to give - so it is no outcome to vouch for, and certainly no reason to panic.
+                Attempt::Done(Ok(unexpected @ (CommandOutcome::Registry | CommandOutcome::StaleTerm))) => {
+                    tracing::error!(
+                        request_id = %request_id,
+                        outcome = ?unexpected,
+                        "a transaction was answered with another kind of command's outcome",
+                    );
+                    self.wait_before_next_attempt(believed_leader, backoff, remaining).await;
+                }
                 Attempt::Done(Err(err)) => return Err(WriteError::LimitExceeded(err)),
                 Attempt::Retry(reason) => {
                     tracing::debug!(

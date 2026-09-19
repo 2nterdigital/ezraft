@@ -23,6 +23,7 @@ use crate::kv::Conflict;
 use crate::kv::RegisterNode;
 use crate::kv::RemoveNode;
 use crate::kv::RequestId;
+use crate::kv::SetStatus;
 use crate::kv::Txn;
 
 /// The Raft log's request type: an idempotency-tracked command
@@ -40,6 +41,17 @@ pub struct Command {
     /// `crate::kv::ledger`'s module docs for why that is what keeps eviction a pure function of
     /// the log.
     pub ledger_capacity: u64,
+    /// The term this command is fenced to, if any: it takes effect only if the log entry that
+    /// carries it was itself appended in this term
+    ///
+    /// `None` for every ordinary command. `Some(term)` for a command proposed from a leader-only
+    /// context (ech0-media#34): a leader stamps the entries it appends with its own term, so an
+    /// entry whose term differs was appended under some other leadership - even one the same node
+    /// won later - and `apply` refuses it. Checking the node's role and term before proposing
+    /// cannot rule that out by itself, because leadership can change between the check and the
+    /// append; comparing against the entry's own term can, and does so identically on every
+    /// replica, since it reads nothing but the log.
+    pub required_term: Option<u64>,
     /// What this command actually does
     pub body: CommandBody,
 }
@@ -55,6 +67,15 @@ pub enum CommandBody {
     /// Remove a node's registry entry (ech0-media#33) - proposed by the leader, once the matching
     /// membership change has committed
     RemoveNode(RemoveNode),
+    /// Set one node's liveness status (ech0-media#34) - proposed only by the built-in liveness
+    /// leader task, through the leader-only propose path that never forwards
+    /// (`crate::write::propose_leader_only`)
+    SetStatus(SetStatus),
+    /// Remove every registry entry whose node is no longer in the committed membership
+    /// (ech0-media#34) - the crash window `EzKv::remove_node` can leave between its own two
+    /// steps. Carries no data: `apply` computes which entries are stale from the state machine's
+    /// own already-applied membership, identical on every replica by construction.
+    ReconcileRegistry,
 }
 
 impl fmt::Display for Command {
@@ -73,6 +94,20 @@ impl fmt::Display for Command {
                     f,
                     "remove node {} from the registry (request {})",
                     cmd.node_id, self.request_id
+                )
+            }
+            CommandBody::SetStatus(cmd) => {
+                write!(
+                    f,
+                    "set node {} status to {:?} (request {})",
+                    cmd.node_id, cmd.status, self.request_id
+                )
+            }
+            CommandBody::ReconcileRegistry => {
+                write!(
+                    f,
+                    "reconcile the node registry against the committed membership (request {})",
+                    self.request_id
                 )
             }
         }
@@ -94,4 +129,7 @@ pub enum CommandOutcome {
     /// A registry command's outcome - registering, updating, or removing an entry cannot itself
     /// fail once accepted, so there is nothing to carry beyond "this ran"
     Registry,
+    /// The command was fenced to a term ([`Command::required_term`]) other than the one its log
+    /// entry was appended in, and changed nothing
+    StaleTerm,
 }

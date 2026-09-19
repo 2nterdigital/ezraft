@@ -77,6 +77,7 @@ pub use registry::NodeStatus;
 pub(crate) use registry::RegisterNode;
 pub use registry::Registry;
 pub(crate) use registry::RemoveNode;
+pub(crate) use registry::SetStatus;
 pub(crate) use snapshot_codec::decode_snapshot;
 pub(crate) use snapshot_codec::encode_snapshot;
 pub(crate) use state::KvState;

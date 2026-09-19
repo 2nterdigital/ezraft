@@ -5,6 +5,7 @@
 //! and installing a snapshot or finishing startup recovery publishes again ([`Self::new`],
 //! [`RaftStateMachine::install_snapshot`]).
 
+use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Seek;
@@ -220,10 +221,20 @@ impl RaftStateMachine<OpenRaftTypes> for StateMachineStore {
             sm.last_applied = Some(log_id);
 
             let resp = match entry.payload {
+                // A command fenced to a term takes effect only if this very entry was appended in
+                // that term (ech0-media#34). Decided from the entry alone - its own log term
+                // against the term it carries - so every replica refuses it identically, and
+                // before anything else looks at it: a refused command touches neither the state
+                // nor the ledger.
+                EntryPayload::Normal(Command {
+                    required_term: Some(required),
+                    ..
+                }) if required != term => Some(CommandOutcome::StaleTerm),
                 EntryPayload::Normal(Command {
                     request_id,
                     ledger_capacity,
                     body: CommandBody::Txn(txn),
+                    ..
                 }) => {
                     // The idempotency ledger (ech0-media#30) is consulted *inside*
                     // `apply_idempotent`, before `txn` ever runs: a retried request id comes back
@@ -241,6 +252,7 @@ impl RaftStateMachine<OpenRaftTypes> for StateMachineStore {
                     request_id,
                     ledger_capacity,
                     body: CommandBody::RegisterNode(cmd),
+                    ..
                 }) => {
                     // Same idempotency discipline as a transaction, consulting the same ledger
                     // (ech0-media#33): a retried registration is a no-op here, not a second
@@ -262,9 +274,59 @@ impl RaftStateMachine<OpenRaftTypes> for StateMachineStore {
                     request_id,
                     ledger_capacity,
                     body: CommandBody::RemoveNode(cmd),
+                    ..
                 }) => {
                     let applied = sm.kv.apply_registry_command(request_id, ledger_capacity as usize, |registry| {
                         registry.remove(cmd.node_id);
+                    });
+                    if let Some(registry) = applied.registry {
+                        self.publisher.publish_registry(registry);
+                    }
+                    Some(CommandOutcome::Registry)
+                }
+                EntryPayload::Normal(Command {
+                    request_id,
+                    ledger_capacity,
+                    body: CommandBody::SetStatus(cmd),
+                    ..
+                }) => {
+                    // Ledger-guarded the same way every other registry command is (ech0-media#34):
+                    // a retried request id changes nothing and publishes nothing. An entry that no
+                    // longer exists (concurrently reconciled away) is a silent no-op, not an
+                    // error - the leader's own decision to set this status can be stale by the
+                    // time it is applied, and there is nothing left to correct.
+                    let applied = sm.kv.apply_registry_command(request_id, ledger_capacity as usize, |registry| {
+                        if let Some(mut info) = registry.get(cmd.node_id) {
+                            info.status = cmd.status;
+                            registry.set(cmd.node_id, info);
+                        }
+                    });
+                    if let Some(registry) = applied.registry {
+                        self.publisher.publish_registry(registry);
+                    }
+                    Some(CommandOutcome::Registry)
+                }
+                EntryPayload::Normal(Command {
+                    request_id,
+                    ledger_capacity,
+                    body: CommandBody::ReconcileRegistry,
+                    ..
+                }) => {
+                    // Deterministic by construction (ech0-media#34's determinism rule): every
+                    // replica applies the very same `EntryPayload::Membership` entries in the same
+                    // order before reaching this one, so `sm.membership` here is identical on
+                    // every replica - no value from this node's own configuration enters the
+                    // decision of which entries are stale.
+                    let member_ids: BTreeSet<u64> = {
+                        let membership = sm.membership.membership();
+                        membership.voter_ids().chain(membership.learner_ids()).collect()
+                    };
+                    let applied = sm.kv.apply_registry_command(request_id, ledger_capacity as usize, |registry| {
+                        let stale: Vec<u64> =
+                            registry.iter().map(|(id, _)| id).filter(|id| !member_ids.contains(id)).collect();
+                        for node_id in stale {
+                            registry.remove(node_id);
+                        }
                     });
                     if let Some(registry) = applied.registry {
                         self.publisher.publish_registry(registry);
@@ -598,6 +660,46 @@ mod tests {
 
     /// A snapshot round-trips the KV's revision and per-key revisions, not just its values -
     /// exactly what ech0-media#27b's restart and lagging-joiner paths depend on.
+    /// A command fenced to a term takes effect only in an entry appended in that same term. The
+    /// second entry below is what a leader-only write looks like when its node lost leadership
+    /// and won it back before the append: proposed for term 3, appended in term 4. Every replica
+    /// must refuse it, from the entry alone, and leave no trace of it.
+    #[tokio::test]
+    async fn a_command_fenced_to_another_term_changes_nothing() {
+        let store = SnapshotStore::default();
+        let (_log, mut sm) = open(store).await.unwrap();
+
+        let fenced = |entry_term: u64, index: u64, required_term: u64, key: &str| crate::entry::EzEntry {
+            log_id: (entry_term, index),
+            payload: EntryPayload::Normal(Command {
+                request_id: crate::kv::RequestId::new(),
+                ledger_capacity: 100,
+                required_term: Some(required_term),
+                body: CommandBody::Txn(Txn::new().put(key, Bytes::from_static(b"v"))),
+            }),
+        };
+
+        let entries: Vec<Result<EntryResponder<OpenRaftTypes>, std::io::Error>> = vec![
+            Ok((fenced(3, 1, 3, "kept"), None)),
+            Ok((fenced(4, 2, 3, "refused"), None)),
+        ];
+        sm.apply(futures::stream::iter(entries)).await.unwrap();
+
+        let view = sm.subscribe_view().current();
+        assert_eq!(
+            1,
+            view.revision(),
+            "only the entry appended in its own term advances the revision"
+        );
+        assert!(view.get("kept").is_some());
+        assert_eq!(None, view.get("refused"));
+
+        // Both entries were applied as far as Raft is concerned: refusing a command is an outcome,
+        // not a failure to apply the entry.
+        let (last_applied, _) = sm.applied_state().await.unwrap();
+        assert_eq!(Some(LogId::new_term_index(4, 2)), last_applied);
+    }
+
     #[tokio::test]
     async fn build_snapshot_then_install_it_reproduces_the_same_view() {
         let store = SnapshotStore::default();
