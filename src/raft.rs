@@ -2,8 +2,13 @@
 //!
 //! This module provides the primary [`EzKv`] struct users interact with: cluster lifecycle
 //! (`create`/`join`/`join_as_learner`/`serve`/`shutdown`), membership, metrics and the local
-//! view. The write path lives in `crate::write` (a second `impl EzKv` block), kept separate so
-//! this file stays about lifecycle and membership as it grows.
+//! view. The write path lives in `crate::write`, cluster observation in `crate::cluster`, and the
+//! node registry's handle-level half in `crate::registry` - each its own `impl EzKv` block, kept
+//! separate so this file stays about lifecycle and membership as it grows. This module still owns
+//! starting each of those (cluster observation's background task, the registry's self-registration
+//! task) from the node's own constructor, and the two membership operations that also touch the
+//! registry ([`EzKv::remove_node`]) or must stop a still-retrying registration
+//! ([`EzKv::shutdown`]).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -19,13 +24,17 @@ use openraft::RaftMetrics;
 use openraft::async_runtime::WatchReceiver;
 use openraft::errors::InitializeError;
 use openraft::errors::RaftError;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::admin::AdminClient;
 use crate::admin::MembershipChange;
+use crate::cluster::ClusterState;
+use crate::cluster::LeaderContact;
 use crate::config::EzConfig;
 use crate::kv::KvLimits;
 use crate::kv::Publisher;
+use crate::kv::Registry;
 use crate::kv::View;
 use crate::kv::ViewReceiver;
 use crate::network::EzNetworkFactory;
@@ -112,6 +121,29 @@ pub struct EzKv {
     /// (ech0-media#32) to register subscriptions through - the very instance [`Self::view`] reads
     /// from, so a subscription and the view it starts at are always consistent.
     watch: Arc<Publisher>,
+
+    /// A lock-free reader onto the registry's latest published value (ech0-media#33), the
+    /// registry's counterpart to `view_rx`
+    registry_rx: watch::Receiver<Registry>,
+
+    /// This node's own view of the cluster, kept current by one background task
+    /// (`crate::cluster::spawn`, ech0-media#33)
+    cluster_rx: watch::Receiver<ClusterState>,
+
+    /// When this node last accepted an append-entries request from a leader it recognized
+    /// (ech0-media#33) - written by `crate::server`'s append route, read by
+    /// [`Self::last_leader_contact`]
+    leader_contact: LeaderContact,
+
+    /// This node's own external-port address, as registered in the node registry
+    /// (`EzConfig::external_addr`, ech0-media#33) - remembered so
+    /// [`crate::registry::EzKv::update_node_meta`] can re-register with the same address
+    external_addr: Arc<str>,
+
+    /// The self-registration task [`crate::registry::spawn_self_registration`] started at
+    /// construction, if it has not finished yet - [`Self::shutdown`] aborts it, so "retries until
+    /// it succeeds" does not mean "forever, even after this node has stopped" (ech0-media#33)
+    self_registration: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl Clone for EzKv {
@@ -132,6 +164,11 @@ impl Clone for EzKv {
             rpc: self.rpc.clone(),
             read_index: self.read_index.clone(),
             watch: self.watch.clone(),
+            registry_rx: self.registry_rx.clone(),
+            cluster_rx: self.cluster_rx.clone(),
+            leader_contact: self.leader_contact.clone(),
+            external_addr: self.external_addr.clone(),
+            self_registration: self.self_registration.clone(),
         }
     }
 }
@@ -248,10 +285,15 @@ impl EzKv {
         let json_body_limit = config.json_body_limit;
         let snapshot_max_bytes = config.snapshot_max_bytes;
         let watch_limits = config.watch_limits;
+        // Remembered for `crate::registry::EzKv::update_node_meta` to re-register with the same
+        // address later; `node_meta` is only ever needed once, for the startup registration below.
+        let external_addr: Arc<str> = Arc::from(config.external_addr.as_str());
+        let node_meta = config.node_meta.clone();
 
         // Open user storage as the two stores openraft asks for
         let (log, sm) = open(storage).await?;
         let view_rx = sm.subscribe_view();
+        let registry_rx = sm.subscribe_registry();
         let watch = sm.publisher();
         // The watch hub is built with default limits (it exists before `EzConfig` reaches it -
         // see `crate::kv::publish::Publisher::new`'s own doc comment); this is the one place that
@@ -331,6 +373,10 @@ impl EzKv {
 
         let rpc = Rpc::new(node_id, raft.clone(), transport);
 
+        // One background task per node, fed from openraft's own `server_metrics` channel
+        // (ech0-media#33); it ends on its own once that channel closes, at shutdown.
+        let cluster_rx = crate::cluster::spawn(raft.clone());
+
         // The `ez.read_index` handler (ech0-media#31) is registered proactively, for every node,
         // rather than lazily the first time this node itself calls `linearizable_view`: a leader
         // that never calls its own read path must still be able to answer a follower's request.
@@ -353,7 +399,7 @@ impl EzKv {
             tokio::spawn(async move { admin.membership(promote).await })
         });
 
-        Ok(Self {
+        let ez = Self {
             node_id,
             addr: http_addr,
             raft,
@@ -369,7 +415,20 @@ impl EzKv {
             rpc,
             read_index,
             watch,
-        })
+            registry_rx,
+            cluster_rx,
+            leader_contact: LeaderContact::default(),
+            external_addr,
+            self_registration: Arc::new(Mutex::new(None)),
+        };
+
+        // Started last, once `ez` itself exists to hand the task a working handle: this node
+        // registers or updates its own entry, retrying under one request id until it succeeds
+        // (ech0-media#33). `Self::shutdown` aborts it if it is still retrying.
+        let handle = crate::registry::spawn_self_registration(ez.clone(), ez.external_addr.to_string(), node_meta);
+        *ez.self_registration.lock().unwrap() = Some(handle);
+
+        Ok(ez)
     }
 
     /// The limits `crate::write` checks a transaction against before proposing it
@@ -412,6 +471,33 @@ impl EzKv {
     /// The reader behind [`Self::view`], for the write path's wait on a revision
     pub(crate) fn view_receiver(&self) -> &ViewReceiver {
         &self.view_rx
+    }
+
+    /// The reader behind `crate::registry::EzKv::registry`/`watch_registry` (ech0-media#33)
+    pub(crate) fn registry_receiver(&self) -> &watch::Receiver<Registry> {
+        &self.registry_rx
+    }
+
+    /// The reader behind [`crate::cluster::EzKv::cluster`] (ech0-media#33)
+    pub(crate) fn cluster_receiver(&self) -> &watch::Receiver<ClusterState> {
+        &self.cluster_rx
+    }
+
+    /// The tracker behind [`crate::cluster::EzKv::last_leader_contact`] (ech0-media#33)
+    pub(crate) fn leader_contact(&self) -> &LeaderContact {
+        &self.leader_contact
+    }
+
+    /// Record "now" as the last time this node accepted an append-entries request from a leader
+    /// it recognized - called by `crate::server`'s append route (ech0-media#33)
+    pub(crate) fn record_leader_contact(&self) {
+        self.leader_contact.record_now();
+    }
+
+    /// This node's own external-port address, as registered in the node registry
+    /// (`EzConfig::external_addr`, ech0-media#33)
+    pub(crate) fn external_addr(&self) -> &str {
+        &self.external_addr
     }
 
     /// Add a learner node to the cluster
@@ -489,6 +575,12 @@ impl EzKv {
     /// serving stale reads to anyone who asks it.
     ///
     /// Leader only: on a follower this fails rather than looking for one.
+    ///
+    /// Once the membership change itself commits, this also removes `node_id`'s node-registry
+    /// entry (ech0-media#33), best-effort within one `EzConfig::write_deadline` -
+    /// `crate::registry::remove_entry`'s own docs cover why that is never reported back as this
+    /// call's own error, and the window a leader crash between the two steps leaves (reconciled by
+    /// a future leader-only task, ech0-media#34).
     pub async fn remove_node(&self, node_id: u64) -> Result<(), io::Error> {
         let metrics = self.metrics().await;
         let node = BTreeSet::from([node_id]);
@@ -509,7 +601,9 @@ impl EzKv {
             ChangeMembers::RemoveNodes(node)
         };
 
-        self.change_members(change, false).await
+        self.change_members(change, false).await?;
+        crate::registry::remove_entry(self, node_id).await;
+        Ok(())
     }
 
     /// Apply a membership change on this node
@@ -597,6 +691,12 @@ impl EzKv {
         // Nothing will be applied again, so nothing will be published again: end every watch
         // stream rather than leave its consumer waiting on a node that is gone.
         self.watch.close_watch();
+
+        // "Retries until it succeeds" (ech0-media#33) must not mean "forever, even after this
+        // node has stopped" - a no-op if it already finished on its own.
+        if let Some(handle) = self.self_registration.lock().unwrap().take() {
+            handle.abort();
+        }
 
         let handle = self.serve_handle.lock().unwrap().take();
         if let Some(handle) = handle {

@@ -91,23 +91,27 @@ pub struct LocalLag {
 }
 
 /// One attempt's result: either a definite outcome to stop on, or a reason to retry
-enum Attempt {
-    /// Stop retrying: `Ok` is the new revision, `Err` a [`Definite`] failure
-    Done(Result<u64, Definite>),
+///
+/// Shared by every kind of command the any-node command path carries: [`EzKv::write_with_id`]'s
+/// own loop proposes [`CommandBody::Txn`] and unwraps [`CommandOutcome::Txn`] out of `Done`;
+/// `crate::registry` proposes [`CommandBody::RegisterNode`]/`RemoveNode` and expects
+/// [`CommandOutcome::Registry`] instead. Neither caller can ever see the other's outcome variant
+/// in practice - each proposes only its own kind of body, and [`crate::storage::adapter`]'s apply
+/// loop answers a command with the outcome shape that matches its own `CommandBody` variant - so
+/// unwrapping the wrong one is an invariant violation, not a state either caller has to handle.
+pub(crate) enum Attempt {
+    /// Stop retrying: `Ok` is whatever the command produced, `Err` is a limit rejection that
+    /// never reached the log (a [`CommandBody::Txn`] only concern - `propose` never validates any
+    /// other body, so this is never produced for one)
+    Done(Result<CommandOutcome, LimitError>),
     /// Not definite: worth retrying, after the loop's usual wait
     Retry(RetryReason),
 }
 
-/// A definite, non-retryable outcome one attempt produced
-enum Definite {
-    Conflict(Conflict),
-    LimitExceeded(LimitError),
-}
-
 /// Why one attempt did not produce a definite outcome - purely for the structured tracing event
-/// [`EzKv::write_with_id`]'s retry loop emits; never itself part of [`WriteError`]
+/// every any-node command's retry loop emits; never itself part of [`WriteError`]
 #[derive(Debug)]
-enum RetryReason {
+pub(crate) enum RetryReason {
     /// This node knows of no leader right now
     NoKnownLeader,
     /// This node believes it leads, but openraft's writable-leader check says its lease is not
@@ -204,34 +208,39 @@ enum ProposeOutcome {
     Unknown,
 }
 
-/// Validate `txn`, then propose it on `raft` as a fresh idempotency-tracked [`Command`]
+/// Validate `body` (a [`CommandBody::Txn`] only concern), then propose it on `raft` as a fresh
+/// idempotency-tracked [`Command`]
 ///
 /// Free function, not a method: called both from the local-propose path (`raft` is this node's
 /// own) and from the `ez.write` RPC handler (`raft` is whichever node the caller forwarded to) -
-/// the exact same "validate, stamp this node's own ledger capacity, propose" logic either way.
-/// `ledger_capacity` is *this* call's own configured value: whichever node ends up calling this is
-/// "the proposing leader" `crate::kv::ledger`'s module docs describe.
+/// the exact same "validate, stamp this node's own ledger capacity, propose" logic either way,
+/// whatever kind of command `body` is. `ledger_capacity` is *this* call's own configured value:
+/// whichever node ends up calling this is "the proposing leader" `crate::kv::ledger`'s module
+/// docs describe.
 async fn propose(
     raft: &ORRaft,
     kv_limits: KvLimits,
     ledger_capacity: usize,
     request_id: RequestId,
-    txn: &Txn,
+    body: CommandBody,
 ) -> Result<ProposeOutcome, LimitError> {
-    txn.validate(&kv_limits)?;
+    if let CommandBody::Txn(txn) = &body {
+        txn.validate(&kv_limits)?;
+    }
 
     let command = Command {
         request_id,
         ledger_capacity: ledger_capacity as u64,
-        body: CommandBody::Txn(txn.clone()),
+        body,
     };
 
     match raft.client_write(command).await {
         Ok(resp) => Ok(match resp.data {
             Some(outcome) => ProposeOutcome::Definite(outcome),
-            // Never actually produced for `CommandBody::Txn` (the adapter always answers `Some`)
-            // - kept as `Unknown` rather than a panic, since a writer's future must never treat
-            // an unexpected shape as a success it cannot vouch for.
+            // Never actually produced by `crate::storage::adapter::state_machine` (the adapter
+            // always answers `Some` for a `Normal` entry) - kept as `Unknown` rather than a panic,
+            // since a writer's future must never treat an unexpected shape as a success it cannot
+            // vouch for.
             None => ProposeOutcome::Unknown,
         }),
         Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd))) => Ok(ProposeOutcome::NotLeader {
@@ -245,9 +254,52 @@ async fn propose(
 /// Register this node's `ez.write` handler - see `write::forward`
 ///
 /// Called once, from [`EzKv::new`](crate::raft::EzKv::new), for every node: a node that never
-/// calls its own `write` must still answer another node's forwarded one.
+/// calls its own `write` must still answer another node's forwarded one - and, since this same
+/// RPC now carries every kind of internal command (ech0-media#33), a node that never proposes a
+/// registry command of its own must still answer one forwarded to it.
 pub(crate) fn register_forward_handler(rpc: &Rpc, raft: ORRaft, kv_limits: KvLimits, ledger_capacity: usize) {
     forward::register(rpc, raft, kv_limits, ledger_capacity);
+}
+
+/// One attempt at committing `body` as a fresh idempotency-tracked command: locally if `node`
+/// currently leads, forwarded to whoever it believes does otherwise
+///
+/// The any-node command path in full, minus the retry loop around it: [`EzKv::write_with_id`]'s
+/// own loop is one caller, and `crate::registry`'s startup registration and
+/// [`EzKv::update_node_meta`](crate::EzKv::update_node_meta) are others - reusing this rather than
+/// growing a second forwarding path per kind of command (ech0-media#33).
+///
+/// `remaining` bounds this one attempt: a local propose is wrapped in a timeout of exactly
+/// `remaining` (openraft's `client_write` never times out on its own, and a leader cut off from
+/// its quorum mid-write would otherwise hang this call past the caller's own deadline); a forward
+/// bounds the actual RPC round to `remaining` capped at one election timeout, so one unresponsive
+/// peer cannot itself consume a caller's whole budget before it gets to try elsewhere - see
+/// `forward::attempt`.
+pub(crate) async fn attempt_command(
+    node: &EzKv,
+    request_id: RequestId,
+    body: CommandBody,
+    remaining: Duration,
+) -> Attempt {
+    if node.is_leader() {
+        match tokio::time::timeout(remaining, propose_command_locally(node, request_id, body)).await {
+            Ok(attempt) => attempt,
+            Err(_elapsed) => Attempt::Retry(RetryReason::LocalCommitTimeout),
+        }
+    } else {
+        forward::attempt(node, request_id, body, remaining).await
+    }
+}
+
+/// The local-propose half of [`attempt_command`]: `node` believes it leads, so this proposes
+/// directly rather than forwarding
+async fn propose_command_locally(node: &EzKv, request_id: RequestId, body: CommandBody) -> Attempt {
+    match propose(node.inner(), node.kv_limits(), node.ledger_capacity(), request_id, body).await {
+        Err(limit_err) => Attempt::Done(Err(limit_err)),
+        Ok(ProposeOutcome::Definite(outcome)) => Attempt::Done(Ok(outcome)),
+        Ok(ProposeOutcome::NotLeader { .. }) => Attempt::Retry(RetryReason::LeaseGap),
+        Ok(ProposeOutcome::Unknown) => Attempt::Retry(RetryReason::LocalEngineUnavailable),
+    }
 }
 
 impl EzKv {
@@ -312,27 +364,20 @@ impl EzKv {
 
             let believed_leader = self.inner().metrics().borrow_watched().current_leader;
 
-            let attempt = if self.is_leader() {
-                // openraft's `client_write` has no timeout of its own: a leader cut off from its
-                // quorum while its lease still holds appends the entry and then waits for a commit
-                // that cannot come. Without this bound the call would outlive the deadline it
-                // promises. The entry may still commit later, so the outcome is unknown, not a
-                // failure - exactly what retrying under the same request id is for.
-                match tokio::time::timeout(remaining, self.attempt_locally(request_id, &txn)).await {
-                    Ok(attempt) => attempt,
-                    Err(_elapsed) => Attempt::Retry(RetryReason::LocalCommitTimeout),
-                }
-            } else {
-                forward::attempt(self, request_id, &txn, remaining).await
-            };
+            let attempt = attempt_command(self, request_id, CommandBody::Txn(txn.clone()), remaining).await;
 
             match attempt {
-                Attempt::Done(Ok(revision)) => return self.after_success(request_id, revision, deadline).await,
-                Attempt::Done(Err(Definite::Conflict(conflict))) => {
+                Attempt::Done(Ok(CommandOutcome::Txn(Ok(revision)))) => {
+                    return self.after_success(request_id, revision, deadline).await;
+                }
+                Attempt::Done(Ok(CommandOutcome::Txn(Err(conflict)))) => {
                     self.wait_for_conflict_visibility(&conflict, deadline).await;
                     return Err(WriteError::Conflict(conflict));
                 }
-                Attempt::Done(Err(Definite::LimitExceeded(err))) => return Err(WriteError::LimitExceeded(err)),
+                Attempt::Done(Ok(CommandOutcome::Registry)) => unreachable!(
+                    "write_with_id only ever proposes CommandBody::Txn, whose outcome is always CommandOutcome::Txn"
+                ),
+                Attempt::Done(Err(err)) => return Err(WriteError::LimitExceeded(err)),
                 Attempt::Retry(reason) => {
                     tracing::debug!(
                         request_id = %request_id,
@@ -366,21 +411,17 @@ impl EzKv {
         }
     }
 
-    /// One local-propose attempt: this node believes it leads, so it proposes directly rather
-    /// than forwarding
-    async fn attempt_locally(&self, request_id: RequestId, txn: &Txn) -> Attempt {
-        match propose(self.inner(), self.kv_limits(), self.ledger_capacity(), request_id, txn).await {
-            Err(limit_err) => Attempt::Done(Err(Definite::LimitExceeded(limit_err))),
-            Ok(ProposeOutcome::Definite(Ok(revision))) => Attempt::Done(Ok(revision)),
-            Ok(ProposeOutcome::Definite(Err(conflict))) => Attempt::Done(Err(Definite::Conflict(conflict))),
-            Ok(ProposeOutcome::NotLeader { .. }) => Attempt::Retry(RetryReason::LeaseGap),
-            Ok(ProposeOutcome::Unknown) => Attempt::Retry(RetryReason::LocalEngineUnavailable),
-        }
-    }
-
     /// Wait for a leadership change away from `believed_leader`, or `backoff`, whichever comes
     /// first - never longer than `remaining`, and never a busy loop either way
-    async fn wait_before_next_attempt(&self, believed_leader: Option<u64>, backoff: Duration, remaining: Duration) {
+    ///
+    /// `pub(crate)`, not private: every any-node command's retry loop waits the same way between
+    /// attempts, `crate::registry`'s included (ech0-media#33).
+    pub(crate) async fn wait_before_next_attempt(
+        &self,
+        believed_leader: Option<u64>,
+        backoff: Duration,
+        remaining: Duration,
+    ) {
         let budget = backoff.min(remaining);
         let _ = self
             .wait_metrics(

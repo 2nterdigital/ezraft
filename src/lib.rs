@@ -82,6 +82,7 @@
 
 pub mod admin;
 mod auth;
+mod cluster;
 mod command;
 pub mod config;
 pub mod entry;
@@ -91,6 +92,7 @@ mod network;
 pub mod node_role;
 pub mod raft;
 mod read;
+mod registry;
 mod rpc;
 pub mod server;
 pub mod snapshot;
@@ -101,6 +103,7 @@ pub mod watch;
 mod write;
 
 // Re-export public API
+pub use cluster::ClusterState;
 pub use config::EzConfig;
 pub use entry::EzEntry;
 pub use entry::EzLogId;
@@ -111,8 +114,11 @@ pub use kv::Conflict;
 pub use kv::KeyValue;
 pub use kv::KvLimits;
 pub use kv::LimitError;
+pub use kv::NodeInfo;
+pub use kv::NodeStatus;
 pub use kv::Op;
 pub use kv::Page;
+pub use kv::Registry;
 pub use kv::RequestId;
 pub use kv::Txn;
 pub use kv::View;
@@ -123,6 +129,7 @@ pub use openraft::RaftTypeConfig;
 pub use openraft::ServerState;
 pub use raft::EzKv;
 pub use read::ReadError;
+pub use registry::RegistryIndeterminate;
 pub use rpc::Rpc;
 pub use rpc::RpcError;
 pub use rpc::RpcRegisterError;

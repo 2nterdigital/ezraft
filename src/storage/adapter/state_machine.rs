@@ -30,8 +30,10 @@ use tokio::sync::Mutex;
 
 use crate::command::Command;
 use crate::command::CommandBody;
+use crate::command::CommandOutcome;
 use crate::kv::KvState;
 use crate::kv::Publisher;
+use crate::kv::Registry;
 use crate::kv::ViewReceiver;
 use crate::kv::decode_snapshot;
 use crate::kv::encode_snapshot;
@@ -72,6 +74,10 @@ pub struct StateMachineStore {
     /// never touches `sm_state`.
     view_rx: ViewReceiver,
 
+    /// A registry watch receiver clone, handed out again by [`Self::subscribe_registry`]
+    /// (ech0-media#33); lock-free and never touches `sm_state`.
+    registry_rx: tokio::sync::watch::Receiver<Registry>,
+
     /// This node's own id, attached to the snapshot build/install tracing events
     /// (ech0-media#26) - `crate::raft::EzKv::new` sets it exactly once via [`Self::set_node_id`],
     /// right after this store is constructed, because `crate::storage::adapter::open` (and so
@@ -90,6 +96,7 @@ impl Clone for StateMachineStore {
             snapshot: self.snapshot.clone(),
             publisher: self.publisher.clone(),
             view_rx: self.view_rx.clone(),
+            registry_rx: self.registry_rx.clone(),
             node_id: self.node_id.clone(),
         }
     }
@@ -131,7 +138,7 @@ impl StateMachineStore {
             None => (None, StoredMembership::new(None, Membership::default()), KvState::new()),
         };
 
-        let (publisher, view_rx) = Publisher::new(kv.view());
+        let (publisher, view_rx, registry_rx) = Publisher::new(kv.view(), kv.registry());
 
         let sm_state = StateMachineState {
             kv,
@@ -145,6 +152,7 @@ impl StateMachineStore {
             snapshot: Arc::new(Mutex::new(snapshot)),
             publisher: Arc::new(publisher),
             view_rx,
+            registry_rx,
             node_id: Arc::new(OnceLock::new()),
         })
     }
@@ -153,6 +161,12 @@ impl StateMachineStore {
     /// `apply` by more than a pointer swap.
     pub(crate) fn subscribe_view(&self) -> ViewReceiver {
         self.view_rx.clone()
+    }
+
+    /// A clone of the watch receiver every `EzKv::watch_registry()` call reads from
+    /// (ech0-media#33): lock-free, and never delayed by `apply` by more than a pointer swap.
+    pub(crate) fn subscribe_registry(&self) -> tokio::sync::watch::Receiver<Registry> {
+        self.registry_rx.clone()
     }
 
     /// A clone of the single publisher, for `crate::watch::EzKv::watch`/`view_and_watch`
@@ -221,7 +235,41 @@ impl RaftStateMachine<OpenRaftTypes> for StateMachineStore {
                     if let Some(changes) = applied.changes {
                         self.publisher.publish(sm.kv.view(), changes);
                     }
-                    Some(applied.outcome)
+                    Some(CommandOutcome::Txn(applied.outcome))
+                }
+                EntryPayload::Normal(Command {
+                    request_id,
+                    ledger_capacity,
+                    body: CommandBody::RegisterNode(cmd),
+                }) => {
+                    // Same idempotency discipline as a transaction, consulting the same ledger
+                    // (ech0-media#33): a retried registration is a no-op here, not a second
+                    // publish. Never touches `kv`/`revision`/`Changes` - the registry is
+                    // foundation-internal state, not the user's key space.
+                    let applied = sm.kv.apply_registry_command(request_id, ledger_capacity as usize, |registry| {
+                        registry.set(cmd.node_id, crate::kv::NodeInfo {
+                            external_addr: cmd.external_addr,
+                            meta: cmd.meta,
+                            status: crate::kv::NodeStatus::Up,
+                        });
+                    });
+                    if let Some(registry) = applied.registry {
+                        self.publisher.publish_registry(registry);
+                    }
+                    Some(CommandOutcome::Registry)
+                }
+                EntryPayload::Normal(Command {
+                    request_id,
+                    ledger_capacity,
+                    body: CommandBody::RemoveNode(cmd),
+                }) => {
+                    let applied = sm.kv.apply_registry_command(request_id, ledger_capacity as usize, |registry| {
+                        registry.remove(cmd.node_id);
+                    });
+                    if let Some(registry) = applied.registry {
+                        self.publisher.publish_registry(registry);
+                    }
+                    Some(CommandOutcome::Registry)
                 }
                 EntryPayload::Membership(membership) => {
                     sm.membership = StoredMembership::new(Some(log_id), membership);
@@ -292,14 +340,17 @@ impl RaftStateMachine<OpenRaftTypes> for StateMachineStore {
         // `last_log_id` through the invariant [`Self::save_meta`] keeps.
 
         // Update state machine state and restore the KV from the snapshot; then publish the
-        // restored view.
+        // restored view and registry alike (ech0-media#33): an installed snapshot can change
+        // either wholesale, just as it can the user's KV.
         {
             let mut sm = self.sm_state.lock().await;
             sm.last_applied = snapshot_meta.last_log_id;
             sm.membership = snapshot_meta.last_membership.clone();
             let view = kv.view();
+            let registry = kv.registry();
             sm.kv = kv;
             self.publisher.reset(view);
+            self.publisher.publish_registry(registry);
         }
 
         tracing::info!(

@@ -15,8 +15,10 @@ use serde::Serialize;
 use crate::kv::change::Change;
 use crate::kv::change::Changes;
 use crate::kv::ledger::Ledger;
+use crate::kv::ledger::LedgerOutcome;
 use crate::kv::ledger::RequestId;
 use crate::kv::ledger::TxnOutcome;
+use crate::kv::registry::Registry;
 use crate::kv::txn::Condition;
 use crate::kv::txn::Conflict;
 use crate::kv::txn::Op;
@@ -28,15 +30,16 @@ use crate::kv::view::to_key_value;
 
 /// The foundation-internal replicated state block, next to the user's KV
 ///
-/// Holds the idempotency ledger (ech0-media#30) today; the node registry (ech0-media#33) adds a
-/// sibling field the same way. Applied by the same [`KvState::apply_idempotent`] call as the
-/// user's KV, and folded into the same snapshot right next to it (`crate::kv::snapshot_codec`),
-/// without ever bumping the snapshot's format version. Plain serde derives only (no
-/// `tag`/`untagged`/`flatten`/`skip_serializing_if`/`default`): this type is embedded directly in
-/// the postcard snapshot body.
+/// Holds the idempotency ledger (ech0-media#30) and the node registry (ech0-media#33). Applied by
+/// the same command-apply path as the user's KV ([`KvState::apply_idempotent`] for a transaction,
+/// [`KvState::apply_registry_command`] for a registry command), and folded into the same snapshot
+/// right next to it (`crate::kv::snapshot_codec`), without ever bumping the snapshot's format
+/// version. Plain serde derives only (no `tag`/`untagged`/`flatten`/`skip_serializing_if`/
+/// `default`): this type is embedded directly in the postcard snapshot body.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InternalState {
     ledger: Ledger,
+    registry: Registry,
 }
 
 /// What [`KvState::apply_idempotent`] produced
@@ -50,17 +53,23 @@ pub(crate) struct Applied {
     pub(crate) changes: Option<Changes>,
 }
 
+/// What [`KvState::apply_registry_command`] produced
+pub(crate) struct RegistryApplied {
+    /// The registry, as it stands after this call, if the command actually ran. `None` when the
+    /// request id was already recorded: nothing changed, so there is nothing new to publish.
+    pub(crate) registry: Option<Registry>,
+}
+
 /// The KV state machine: the user's key space, the revision counter, and the foundation-internal
 /// state block
 ///
 /// # Where foundation-internal state goes
 ///
 /// `internal` is the foundation-internal replicated state block: never part of the user key
-/// space in `kv` above, applied by this same [`apply_idempotent`](Self::apply_idempotent) call,
-/// and folded into the same snapshot next to `kv` (ech0-media#28). It holds the idempotency
-/// ledger (ech0-media#30) today; the node registry (ech0-media#33) adds a field to
-/// [`InternalState`] itself, not to `KvState`, so the snapshot's v1 layout never needs a version
-/// bump for it either.
+/// space in `kv` above, applied by the same command-apply path, and folded into the same snapshot
+/// next to `kv` (ech0-media#28). It holds the idempotency ledger (ech0-media#30) and the node
+/// registry (ech0-media#33) as fields of [`InternalState`] itself, not of `KvState`, so the
+/// snapshot's v1 layout never needs a version bump for either.
 pub(crate) struct KvState {
     /// The user's key space: `Arc<str>` keys so revisions that touch only a few keys share the
     /// rest of their key strings by pointer instead of cloning them.
@@ -95,12 +104,18 @@ impl KvState {
 
     /// A cheap clone of the foundation-internal state block, for building a snapshot
     ///
-    /// O(1): the ledger's maps are `imbl::OrdMap`s (an `Arc`-backed persistent structure, the same
-    /// discipline `kv` itself follows) - ledger/registry tickets that add further fields to
+    /// O(1): the ledger's and the registry's maps are `imbl::OrdMap`s (an `Arc`-backed persistent
+    /// structure, the same discipline `kv` itself follows) - any future field added to
     /// [`InternalState`] must keep that discipline too, so building a snapshot never has to block
     /// `apply` to read this either.
     pub(crate) fn internal_state(&self) -> InternalState {
         self.internal.clone()
+    }
+
+    /// A cheap clone of the current node registry - what [`crate::EzKv::registry`] and the
+    /// registry watch channel (`crate::kv::publish::Publisher`) both read
+    pub(crate) fn registry(&self) -> Registry {
+        self.internal.registry.clone()
     }
 
     /// Apply one command's transaction, consulting the idempotency ledger first
@@ -116,14 +131,19 @@ impl KvState {
     /// [`crate::command::Command`] being applied - see [`crate::kv::ledger`]'s module docs for why
     /// that is the determinism this method depends on.
     pub(crate) fn apply_idempotent(&mut self, request_id: RequestId, ledger_capacity: usize, txn: &Txn) -> Applied {
-        if let Some(outcome) = self.internal.ledger.get(request_id) {
+        // A `LedgerOutcome::Registry` entry recorded under this id is a request-id collision
+        // between a transaction and a registry command - both mint a fresh, effectively-unique
+        // `RequestId` (a random ULID) independently, so this cannot legitimately happen. Falling
+        // through to a fresh `apply` rather than trusting a value of the wrong shape keeps this
+        // method total without ever unwrapping or panicking on untrusted log content.
+        if let Some(LedgerOutcome::Txn(outcome)) = self.internal.ledger.get(request_id) {
             return Applied { outcome, changes: None };
         }
 
         match self.apply(txn) {
             Ok(changes) => {
                 let outcome: TxnOutcome = Ok(changes.revision);
-                self.internal.ledger.record(request_id, outcome.clone(), ledger_capacity);
+                self.internal.ledger.record(request_id, LedgerOutcome::Txn(outcome.clone()), ledger_capacity);
                 Applied {
                     outcome,
                     changes: Some(changes),
@@ -131,9 +151,37 @@ impl KvState {
             }
             Err(conflict) => {
                 let outcome: TxnOutcome = Err(conflict);
-                self.internal.ledger.record(request_id, outcome.clone(), ledger_capacity);
+                self.internal.ledger.record(request_id, LedgerOutcome::Txn(outcome.clone()), ledger_capacity);
                 Applied { outcome, changes: None }
             }
+        }
+    }
+
+    /// Apply one registry command, consulting the same idempotency ledger first
+    ///
+    /// `mutate` is handed the current registry to change in place - `crate::registry` (the
+    /// register-or-update and remove command handlers) is the only caller, and it is the one that
+    /// knows which mutation a given command means. Registry commands never fail once accepted
+    /// (there is no condition to fail), so - unlike [`Self::apply_idempotent`] - there is no
+    /// `Result` here: consulting the ledger only decides whether to run `mutate` again, never
+    /// whether it succeeds.
+    ///
+    /// Never advances `self.revision` and never produces a [`Changes`] group (ech0-media#33): the
+    /// registry is foundation-internal state, not part of the user's key space.
+    pub(crate) fn apply_registry_command(
+        &mut self,
+        request_id: RequestId,
+        ledger_capacity: usize,
+        mutate: impl FnOnce(&mut Registry),
+    ) -> RegistryApplied {
+        if self.internal.ledger.get(request_id).is_some() {
+            return RegistryApplied { registry: None };
+        }
+
+        mutate(&mut self.internal.registry);
+        self.internal.ledger.record(request_id, LedgerOutcome::Registry, ledger_capacity);
+        RegistryApplied {
+            registry: Some(self.internal.registry.clone()),
         }
     }
 
@@ -768,9 +816,90 @@ mod tests {
 
         let retried = restored.internal.ledger.get(id);
         assert_eq!(
-            Some(Ok(1)),
+            Some(LedgerOutcome::Txn(Ok(1))),
             retried,
             "the ledger entry recorded before the snapshot is still there"
         );
+    }
+
+    fn node_info(addr: &str) -> crate::kv::registry::NodeInfo {
+        crate::kv::registry::NodeInfo {
+            external_addr: addr.to_string(),
+            meta: Bytes::from_static(b"meta"),
+            status: crate::kv::registry::NodeStatus::Up,
+        }
+    }
+
+    #[test]
+    fn apply_registry_command_registers_a_new_node_and_reports_the_registry_to_publish() {
+        let mut state = KvState::new();
+        let applied = state.apply_registry_command(RequestId::new(), 100, |registry| {
+            registry.set(1, node_info("127.0.0.1:9001"));
+        });
+
+        let registry = applied.registry.expect("a first registration must be published");
+        assert_eq!(Some(node_info("127.0.0.1:9001")), registry.get(1));
+        assert_eq!(
+            0,
+            state.view().revision(),
+            "a registry command never advances the KV revision"
+        );
+    }
+
+    #[test]
+    fn apply_registry_command_deduplicates_a_repeated_request_id() {
+        let mut state = KvState::new();
+        let id = RequestId::new();
+
+        state.apply_registry_command(id, 100, |registry| {
+            registry.set(1, node_info("127.0.0.1:9001"));
+        });
+
+        // A retry with the same id must not run `mutate` again: a different address here would
+        // prove it, if it took effect.
+        let retried = state.apply_registry_command(id, 100, |registry| {
+            registry.set(1, node_info("127.0.0.1:9999"));
+        });
+
+        assert!(
+            retried.registry.is_none(),
+            "a deduplicated command has nothing new to publish"
+        );
+        assert_eq!(
+            Some(node_info("127.0.0.1:9001")),
+            state.registry().get(1),
+            "the duplicate's mutation never ran"
+        );
+    }
+
+    #[test]
+    fn apply_registry_command_can_remove_an_entry() {
+        let mut state = KvState::new();
+        state.apply_registry_command(RequestId::new(), 100, |registry| {
+            registry.set(1, node_info("127.0.0.1:9001"));
+        });
+
+        let applied = state.apply_registry_command(RequestId::new(), 100, |registry| {
+            registry.remove(1);
+        });
+
+        let registry = applied.registry.expect("a removal must be published");
+        assert_eq!(None, registry.get(1));
+    }
+
+    #[test]
+    fn the_registry_survives_a_restore_from_a_snapshot() {
+        let mut state = KvState::new();
+        state.apply_registry_command(RequestId::new(), 100, |registry| {
+            registry.set(1, node_info("127.0.0.1:9001"));
+        });
+
+        let restored = KvState::restore(
+            state.view().revision(),
+            state.view().prefix("").collect(),
+            state.internal_state(),
+        );
+
+        assert_eq!(Some(node_info("127.0.0.1:9001")), restored.registry().get(1));
     }
 }

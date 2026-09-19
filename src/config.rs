@@ -6,6 +6,7 @@
 use std::io;
 use std::time::Duration;
 
+use bytes::Bytes;
 use openraft::Config;
 use openraft::SnapshotPolicy;
 
@@ -173,6 +174,24 @@ pub struct EzConfig {
     /// spec.
     pub write_deadline: Duration,
 
+    /// This node's client-facing signaling address, registered in the node registry
+    /// (ech0-media#33) at startup and readable by every node through
+    /// [`crate::EzKv::registry`]/[`crate::EzKv::watch_registry`] - distinct from `http_addr`
+    /// (`EzKv::create`/`join`'s argument), which is the *internal* port Raft traffic and inter-node
+    /// RPC use and is never meant for a client.
+    ///
+    /// Opaque to the foundation: never parsed, never dialed. Default: an empty string - a node
+    /// with nothing configured here still registers, with an empty `external_addr`, rather than
+    /// skipping registration.
+    pub external_addr: String,
+
+    /// This node's initial application-defined registry metadata (ech0-media#33): opaque bytes,
+    /// stored and handed back verbatim, never interpreted by the foundation. Registered alongside
+    /// [`Self::external_addr`] at startup; [`crate::EzKv::update_node_meta`] changes it later.
+    ///
+    /// Default: empty.
+    pub node_meta: Bytes,
+
     /// The test cluster's shared network fault-injection handle, if any
     ///
     /// Only present in builds compiled with the `fault-injection` cargo feature (off by
@@ -200,6 +219,8 @@ impl Default for EzConfig {
             snapshot_timeout: Duration::from_secs(30),
             ledger_capacity: 100_000,
             write_deadline: Duration::from_secs(10),
+            external_addr: String::new(),
+            node_meta: Bytes::new(),
             #[cfg(feature = "fault-injection")]
             faults: None,
         }
