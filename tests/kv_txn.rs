@@ -1,7 +1,10 @@
 //! `EzKv::write` acceptance tests (ech0-media#27): publish-before-reply, conflicts, limits,
-//! `DeletePrefix` atomicity, cross-replica revision agreement, and the not-leader error.
+//! `DeletePrefix` atomicity, and cross-replica revision agreement.
 //!
-//! Every test drives `EzKv` through its public API and real HTTP between nodes.
+//! Every test drives `EzKv` through its public API and real HTTP between nodes. Any-node
+//! forwarding, same-request-id retry and the idempotency ledger (ech0-media#30 - what replaced
+//! this file's old "a follower's write returns `NotLeader`" case) live in `tests/write_forward.rs`
+//! and `tests/idempotency.rs` instead.
 
 mod common;
 
@@ -294,24 +297,6 @@ async fn the_total_transaction_size_limit_is_enforced_before_anything_is_propose
     );
     assert_eq!(1, a.view().revision());
     assert_eq!(None, a.view().get("d"));
-
-    Ok(())
-}
-
-/// A follower's `write` must return the typed not-leader error and change nothing, on the
-/// follower or on the leader.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_followers_write_returns_not_leader_and_changes_nothing() -> io::Result<()> {
-    let (addr_a, a, _data_a) = founding_node().await?;
-    let (_, b, _data_b) = joined_voter(&addr_a).await?;
-    wait_for_voters(&a, BTreeSet::from([0, b.node_id()]), "the joining voter is promoted").await?;
-    assert!(!b.is_leader());
-
-    let err = b.write(set("k1", "v1")).await.expect_err("a follower must not accept a write");
-    assert!(matches!(err, WriteError::NotLeader(_)), "{err}");
-
-    assert_eq!(0, b.view().revision(), "nothing was proposed on the follower");
-    assert_eq!(0, a.view().revision(), "nothing reached the leader either");
 
     Ok(())
 }

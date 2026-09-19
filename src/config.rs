@@ -140,6 +140,30 @@ pub struct EzConfig {
     /// number chosen ahead of real measurements.
     pub snapshot_timeout: Duration,
 
+    /// How many entries the idempotency ledger (ech0-media#30) keeps before evicting the oldest,
+    /// first-in-first-out.
+    ///
+    /// Read only when a write is *proposed* - the proposing node stamps its own configured value
+    /// into the Raft log command - never inside `apply` itself: eviction must be a pure function
+    /// of the log, or two differently-configured replicas would diverge the moment one
+    /// deduplicated a retry the other re-executed (see `crate::kv::ledger`'s module docs).
+    ///
+    /// Default: provisional until benchmarked (ech0-media#36); 100,000, matching ech0-media#12's
+    /// spec.
+    pub ledger_capacity: usize,
+
+    /// The total time budget [`crate::EzKv::write`] and [`crate::EzKv::write_with_id`] retry a
+    /// write across leadership changes before giving up with `Indeterminate`.
+    ///
+    /// Bounds the *whole* call: forwarding to the leader, retrying with the same request id
+    /// through any number of leadership changes, and - once a success or conflict is definite -
+    /// this node's own catch-up wait before returning it (or `LocalLag` if that wait itself runs
+    /// out the budget).
+    ///
+    /// Default: provisional until benchmarked (ech0-media#36); 10 seconds, matching ech0-media#15's
+    /// spec.
+    pub write_deadline: Duration,
+
     /// The test cluster's shared network fault-injection handle, if any
     ///
     /// Only present in builds compiled with the `fault-injection` cargo feature (off by
@@ -164,6 +188,8 @@ impl Default for EzConfig {
             json_body_limit: 8 * 1024 * 1024,
             snapshot_max_bytes: 64 * 1024 * 1024,
             snapshot_timeout: Duration::from_secs(30),
+            ledger_capacity: 100_000,
+            write_deadline: Duration::from_secs(10),
             #[cfg(feature = "fault-injection")]
             faults: None,
         }

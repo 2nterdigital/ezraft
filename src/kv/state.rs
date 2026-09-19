@@ -14,6 +14,9 @@ use serde::Serialize;
 
 use crate::kv::change::Change;
 use crate::kv::change::Changes;
+use crate::kv::ledger::Ledger;
+use crate::kv::ledger::RequestId;
+use crate::kv::ledger::TxnOutcome;
 use crate::kv::txn::Condition;
 use crate::kv::txn::Conflict;
 use crate::kv::txn::Op;
@@ -25,15 +28,27 @@ use crate::kv::view::to_key_value;
 
 /// The foundation-internal replicated state block, next to the user's KV
 ///
-/// Empty today - nothing populates or reads it yet. It exists so the idempotency ledger
-/// (ech0-media#30) and the node registry (ech0-media#33) have a fixed place to add fields to:
-/// applied by the same [`KvState::apply`] call as the user's KV, and folded into the same
-/// snapshot right next to it (`crate::kv::snapshot_codec`), without ever bumping the snapshot's
-/// format version. Plain serde derives only (no `tag`/`untagged`/`flatten`/
-/// `skip_serializing_if`/`default`): this type is embedded directly in the postcard snapshot
-/// body.
+/// Holds the idempotency ledger (ech0-media#30) today; the node registry (ech0-media#33) adds a
+/// sibling field the same way. Applied by the same [`KvState::apply_idempotent`] call as the
+/// user's KV, and folded into the same snapshot right next to it (`crate::kv::snapshot_codec`),
+/// without ever bumping the snapshot's format version. Plain serde derives only (no
+/// `tag`/`untagged`/`flatten`/`skip_serializing_if`/`default`): this type is embedded directly in
+/// the postcard snapshot body.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct InternalState {}
+pub(crate) struct InternalState {
+    ledger: Ledger,
+}
+
+/// What [`KvState::apply_idempotent`] produced
+pub(crate) struct Applied {
+    /// The command's outcome - freshly computed, or the ledger's already-recorded one for a
+    /// retried request id.
+    pub(crate) outcome: TxnOutcome,
+    /// The change group to publish, if `apply_idempotent` actually executed `txn` this call.
+    /// `None` when the request id was already recorded: nothing changed, so there is nothing new
+    /// for `crate::storage::adapter::state_machine` to publish.
+    pub(crate) changes: Option<Changes>,
+}
 
 /// The KV state machine: the user's key space, the revision counter, and the foundation-internal
 /// state block
@@ -41,10 +56,11 @@ pub(crate) struct InternalState {}
 /// # Where foundation-internal state goes
 ///
 /// `internal` is the foundation-internal replicated state block: never part of the user key
-/// space in `kv` above, applied by this same [`apply`](Self::apply) call, and folded into the
-/// same snapshot next to `kv` (ech0-media#28). It is empty today - the idempotency ledger
-/// (ech0-media#30) and the node registry (ech0-media#33) add fields to [`InternalState`] itself,
-/// not to `KvState`, so the snapshot's v1 layout never needs a version bump for them.
+/// space in `kv` above, applied by this same [`apply_idempotent`](Self::apply_idempotent) call,
+/// and folded into the same snapshot next to `kv` (ech0-media#28). It holds the idempotency
+/// ledger (ech0-media#30) today; the node registry (ech0-media#33) adds a field to
+/// [`InternalState`] itself, not to `KvState`, so the snapshot's v1 layout never needs a version
+/// bump for it either.
 pub(crate) struct KvState {
     /// The user's key space: `Arc<str>` keys so revisions that touch only a few keys share the
     /// rest of their key strings by pointer instead of cloning them.
@@ -79,12 +95,46 @@ impl KvState {
 
     /// A cheap clone of the foundation-internal state block, for building a snapshot
     ///
-    /// O(1) today, the same bound [`Self::view`] gives the user's KV: the block is empty, and
-    /// ledger/registry tickets that add fields to [`InternalState`] must keep it that way (an
-    /// `Arc`-backed persistent structure, the same discipline `kv` itself follows), so building a
-    /// snapshot never has to block `apply` to read this either.
+    /// O(1): the ledger's maps are `imbl::OrdMap`s (an `Arc`-backed persistent structure, the same
+    /// discipline `kv` itself follows) - ledger/registry tickets that add further fields to
+    /// [`InternalState`] must keep that discipline too, so building a snapshot never has to block
+    /// `apply` to read this either.
     pub(crate) fn internal_state(&self) -> InternalState {
         self.internal.clone()
+    }
+
+    /// Apply one command's transaction, consulting the idempotency ledger first
+    ///
+    /// If `request_id` is already recorded, `txn` never runs again: this returns the recorded
+    /// outcome unchanged and [`Applied::changes`] is `None` - nothing for the caller to publish,
+    /// because nothing changed. Otherwise this calls [`Self::apply`], records the resulting
+    /// outcome (success or conflict alike - see [`crate::kv::ledger`]'s own docs for why both are
+    /// recorded), and evicts down to `ledger_capacity`.
+    ///
+    /// `ledger_capacity` is never this node's own configured value read here: it is handed in by
+    /// the caller (`crate::storage::adapter::state_machine`), which reads it from the very
+    /// [`crate::command::Command`] being applied - see [`crate::kv::ledger`]'s module docs for why
+    /// that is the determinism this method depends on.
+    pub(crate) fn apply_idempotent(&mut self, request_id: RequestId, ledger_capacity: usize, txn: &Txn) -> Applied {
+        if let Some(outcome) = self.internal.ledger.get(request_id) {
+            return Applied { outcome, changes: None };
+        }
+
+        match self.apply(txn) {
+            Ok(changes) => {
+                let outcome: TxnOutcome = Ok(changes.revision);
+                self.internal.ledger.record(request_id, outcome.clone(), ledger_capacity);
+                Applied {
+                    outcome,
+                    changes: Some(changes),
+                }
+            }
+            Err(conflict) => {
+                let outcome: TxnOutcome = Err(conflict);
+                self.internal.ledger.record(request_id, outcome.clone(), ledger_capacity);
+                Applied { outcome, changes: None }
+            }
+        }
     }
 
     /// Evaluate `txn`'s conditions and, if they all hold, apply its ops
@@ -616,5 +666,111 @@ mod tests {
         let restored = KvState::restore(0, Vec::new(), InternalState::default());
         assert_eq!(0, restored.view().revision());
         assert_eq!(0, restored.view().prefix("").count());
+    }
+
+    #[test]
+    fn apply_idempotent_executes_an_unseen_request_id_and_reports_changes_to_publish() {
+        let mut state = KvState::new();
+        let applied = state.apply_idempotent(RequestId::new(), 100, &txn().put("a", Bytes::from_static(b"1")));
+
+        assert_eq!(Ok(1), applied.outcome);
+        assert!(applied.changes.is_some(), "a first execution must be published");
+        assert_eq!(1, state.view().revision());
+    }
+
+    #[test]
+    fn apply_idempotent_deduplicates_a_repeated_request_id_without_executing_again() {
+        let mut state = KvState::new();
+        let id = RequestId::new();
+
+        let first = state.apply_idempotent(id, 100, &txn().put("a", Bytes::from_static(b"1")));
+        assert_eq!(Ok(1), first.outcome);
+
+        // A second command with the same request id, even one that would itself succeed and
+        // change more state, must not run: the ledger's recorded outcome comes back unchanged,
+        // and nothing new is published.
+        let second = state.apply_idempotent(
+            id,
+            100,
+            &txn().put("a", Bytes::from_static(b"2")).put("b", Bytes::from_static(b"3")),
+        );
+
+        assert_eq!(Ok(1), second.outcome, "the first outcome is returned, not a fresh one");
+        assert!(
+            second.changes.is_none(),
+            "a deduplicated command has nothing new to publish"
+        );
+        assert_eq!(1, state.view().revision(), "revision does not advance for a duplicate");
+        assert_eq!(
+            Bytes::from_static(b"1"),
+            state.view().get("a").unwrap().value,
+            "the duplicate's ops never ran"
+        );
+        assert_eq!(None, state.view().get("b"));
+    }
+
+    #[test]
+    fn apply_idempotent_records_a_conflict_and_a_retry_gets_the_same_conflict_even_after_state_changes() {
+        let mut state = KvState::new();
+        let id = RequestId::new();
+
+        let condition = Condition::NotExists { key: "a".to_string() };
+        state.apply(&txn().put("a", Bytes::from_static(b"1"))).unwrap(); // revision 1: "a" now exists
+
+        let first = state.apply_idempotent(
+            id,
+            100,
+            &txn().when(condition.clone()).put("a", Bytes::from_static(b"2")),
+        );
+        assert!(first.outcome.is_err(), "the condition fails: \"a\" already exists");
+        assert!(first.changes.is_none(), "a conflict never has anything to publish");
+
+        // Deleting "a" would make the very same condition hold now - but the retry must still see
+        // the *recorded* conflict, not re-evaluate it.
+        state.apply(&txn().delete("a")).unwrap(); // revision 2
+
+        let retry = state.apply_idempotent(id, 100, &txn().when(condition).put("a", Bytes::from_static(b"2")));
+        assert_eq!(
+            first.outcome, retry.outcome,
+            "a retry gets the recorded conflict, not a fresh evaluation"
+        );
+        assert!(retry.changes.is_none());
+        assert_eq!(None, state.view().get("a"), "the retry's op never ran either");
+    }
+
+    #[test]
+    fn apply_idempotent_evicts_by_the_capacity_the_command_carries_not_a_fixed_value() {
+        let mut state = KvState::new();
+        let first_id = RequestId::new();
+        state.apply_idempotent(first_id, 1, &txn().put("a", Bytes::from_static(b"1")));
+
+        // A capacity of 1, carried by *this* command, evicts the previous entry even though a
+        // later command could carry a different capacity - eviction follows whatever the command
+        // being applied says, never a value read from this replica's own configuration.
+        state.apply_idempotent(RequestId::new(), 1, &txn().put("b", Bytes::from_static(b"2")));
+
+        let retried = state.apply_idempotent(first_id, 1, &txn().put("a", Bytes::from_static(b"3")));
+        assert_eq!(Ok(3), retried.outcome, "outside the window, the same id executes again");
+        assert!(retried.changes.is_some());
+    }
+
+    #[test]
+    fn the_ledger_survives_a_restore_from_a_snapshot() {
+        let mut state = KvState::new();
+        let id = RequestId::new();
+        state.apply_idempotent(id, 100, &txn().put("a", Bytes::from_static(b"1")));
+
+        let restored = KvState::restore(
+            state.view().revision(),
+            state.view().prefix("").collect(),
+            state.internal_state(),
+        );
+
+        let retried = restored.internal.ledger.get(id);
+        assert_eq!(
+            Some(Ok(1)),
+            retried,
+            "the ledger entry recorded before the snapshot is still there"
+        );
     }
 }
