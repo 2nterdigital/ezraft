@@ -38,14 +38,21 @@ actix-web   = { version = "4.0", default-features = false }
 async-trait = { version = "0.1" }
 derive_more = { version = "2.1.1", features = ["display"] }
 futures     = { version = "0.3" }
+# The production `EzStorage`: one database, three tables (log, meta, snapshot), one
+# `Durability::Immediate` write transaction per `persist`. Locked to `4.3.0` or newer, per
+# FORK.md's storage decision; only the default `std` feature is needed.
+redb        = { version = "4.3.0" }
 reqwest     = { version = "0.12", features = ["json"] }
 serde       = { version = "1.0.114", features = ["derive"] }
 serde_json  = { version = "1.0.57" }
-tokio       = { version = "1.39", default-features = false, features = ["fs", "io-util", "macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio       = { version = "1.39", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 chrono             = { version = "0.4" }
 clap               = { version = "4.1.11", features = ["derive", "env"] }
+# One redb file per node under its own temp directory, for the in-process cluster tests
+# (`tests/common/`) and `RedbStorage`'s own unit tests.
+tempfile           = { version = "3" }
 tracing            = { version = "0.1" }
 tracing-subscriber = { version = "0.3.3", features = ["env-filter"] }
 

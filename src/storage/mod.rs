@@ -1,20 +1,20 @@
-//! Persistence: the [`EzStorage`] contract, the values it exchanges, and one implementation
+//! Persistence: the [`EzStorage`] contract, the values it exchanges, and the production
+//! implementation
 //!
-//! [`FileStorage`] is here to get a first cluster running, not to be the storage a deployment
-//! keeps. Read its caveats before reaching for it, and implement [`EzStorage`] yourself once
-//! they matter.
+//! [`RedbStorage`] is the storage this crate ships for production use. `EzStorage` stays the
+//! extension point: implement it yourself for anything [`RedbStorage`] does not fit.
 
 pub(crate) mod adapter;
-mod file_storage;
 mod loaded;
 mod persist;
+mod redb_storage;
 
 use std::io;
 
 use async_trait::async_trait;
-pub use file_storage::FileStorage;
 pub use loaded::Loaded;
 pub use persist::Persist;
+pub use redb_storage::RedbStorage;
 
 use crate::app::EzApp;
 use crate::entry::EzEntry;
@@ -31,8 +31,8 @@ use crate::entry::EzEntry;
 ///
 /// - **Durability.** [`persist`] must return only once the data would survive a crash of the
 ///   machine, not just of the process. Anything weaker means a node can forget a vote it cast or a
-///   log entry it acknowledged. Reaching that takes an `fsync` of the file and another of the
-///   directory naming it, which is what the bundled [`FileStorage`] does.
+///   log entry it acknowledged. Reaching that takes an `fsync`, which is what [`RedbStorage`]'s
+///   `Durability::Immediate` write transactions do.
 /// - **Ordering.** Operations are applied in the order [`persist`] receives them. A later one must
 ///   not become durable before an earlier one.
 /// - **Read-your-writes.** [`read_logs`] returns what [`persist`] last wrote, including the
@@ -41,9 +41,10 @@ use crate::entry::EzEntry;
 /// [`persist`]: Self::persist
 /// [`read_logs`]: Self::read_logs
 ///
-/// # Example (file-based storage)
+/// # Example (a sketch)
 ///
-/// [`FileStorage`] is this sketch filled in, and is worth reading before writing your own.
+/// [`RedbStorage`] is this sketch filled in for production use, and is worth reading before
+/// writing your own.
 ///
 /// ```ignore
 /// struct MyStorage { base_dir: PathBuf }

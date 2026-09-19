@@ -56,7 +56,9 @@ async fn demoted_leader_keeps_leading_outside_the_quorum() -> io::Result<()> {
 /// the transfer RPC reports "not implemented", so without ezraft implementing
 /// it the transfer is dropped and the leader simply keeps leading - which is
 /// what makes the assertion here specific: leadership moves, and to the node
-/// that was asked for.
+/// that was asked for. The target must have replicated up to the leader's log
+/// before the transfer, or its own election - triggered once its log catches
+/// up - can lose the race to a plain election timeout on another voter.
 #[tokio::test(flavor = "multi_thread")]
 async fn leadership_transfers_to_the_named_node() -> io::Result<()> {
     let (addr_a, a) = founding_node().await?;
@@ -65,6 +67,7 @@ async fn leadership_transfers_to_the_named_node() -> io::Result<()> {
 
     let all = BTreeSet::from([0, b.node_id(), c.node_id()]);
     wait_for_voters(&a, all, "every joined node is a voter").await?;
+    wait_for_applied(&c, &a).await?;
     assert!(a.is_leader());
 
     let target = c.node_id();

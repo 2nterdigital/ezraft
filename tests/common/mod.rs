@@ -9,22 +9,15 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io;
-use std::io::Cursor;
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use ezraft::EzApp;
 use ezraft::EzConfig;
-use ezraft::EzEntry;
-use ezraft::EzMeta;
 use ezraft::EzRaft;
-use ezraft::EzSnapshot;
-use ezraft::EzSnapshotMeta;
-use ezraft::EzStorage;
-use ezraft::Loaded;
-use ezraft::Persist;
+use ezraft::RedbStorage;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -109,60 +102,22 @@ impl EzApp for KvSm {
     }
 }
 
-/// What one node has "written to disk"; kept outside the storage instance so a
-/// restarted node starts from it, exactly like a process reading real files.
-#[derive(Default)]
-pub struct Disk {
-    pub meta: EzMeta,
-    /// Log entries as serialized bytes, the same shape a real disk would hold.
-    pub logs: BTreeMap<u64, Vec<u8>>,
-    pub snapshot: Option<(EzSnapshotMeta, Vec<u8>)>,
+/// A fresh temp directory for one node's redb file, kept on disk rather than deleted on drop:
+/// a restart test shuts a node down, drops it, and opens [`RedbStorage`] again on this same
+/// path, which redb allows only once the previous `Database` is fully closed. `TempDir::keep`
+/// hands back the bare path so callers that never restart do not have to carry a guard around;
+/// leftover directories are cleaned up the same way `examples/harness.rs` leaves failed runs
+/// behind, by the OS's own temp directory housekeeping.
+pub fn node_data_path() -> PathBuf {
+    tempfile::tempdir().expect("temp dir for a node's redb file").keep().join("node.redb")
 }
 
-#[derive(Clone, Default)]
-pub struct MemStorage {
-    pub disk: Arc<Mutex<Disk>>,
-}
-
-#[async_trait]
-impl EzStorage<KvSm> for MemStorage {
-    async fn load(&mut self) -> io::Result<Loaded> {
-        let disk = self.disk.lock().unwrap();
-        let snapshot = disk.snapshot.as_ref().map(|(meta, data)| EzSnapshot {
-            meta: meta.clone(),
-            snapshot: Cursor::new(data.clone()),
-        });
-        Ok(Loaded {
-            meta: disk.meta.clone(),
-            snapshot,
-        })
-    }
-
-    async fn persist(&mut self, op: Persist<KvSm>) -> io::Result<()> {
-        let mut disk = self.disk.lock().unwrap();
-        match op {
-            Persist::Meta(meta) => disk.meta = meta,
-            Persist::LogEntry(entry) => {
-                disk.logs.insert(entry.log_id.1, serde_json::to_vec(&entry)?);
-            }
-            Persist::Snapshot(snapshot) => {
-                disk.snapshot = Some((snapshot.meta, snapshot.snapshot.into_inner()));
-            }
-            Persist::DeleteLogs { from, to } => disk.logs.retain(|&index, _| !(from..to).contains(&index)),
-        }
-        Ok(())
-    }
-
-    async fn read_logs(&mut self, start: u64, end: u64) -> io::Result<Vec<EzEntry<KvSm>>> {
-        let disk = self.disk.lock().unwrap();
-        (start..end)
-            .map(|index| {
-                let data =
-                    disk.logs.get(&index).ok_or_else(|| io::Error::other(format!("missing log entry {}", index)))?;
-                Ok(serde_json::from_slice(data)?)
-            })
-            .collect()
-    }
+/// Storage for a fresh node: a redb file under its own temp directory.
+///
+/// Restart tests that need to reopen the same file after shutdown call
+/// `RedbStorage::open(&path)` directly with a path from [`node_data_path`] they kept.
+pub async fn node_storage() -> io::Result<RedbStorage> {
+    RedbStorage::open(node_data_path()).await
 }
 
 /// Grab a free port; the listener is dropped so EzRaft can bind it.
@@ -237,7 +192,7 @@ pub fn spawn_serve(node: &EzRaft<KvSm>) {
 /// A founding node, serving and leading.
 pub async fn founding_node() -> io::Result<(String, EzRaft<KvSm>)> {
     let addr = free_addr();
-    let node = EzRaft::create(&addr, KvSm::default(), MemStorage::default(), config()).await?;
+    let node = EzRaft::create(&addr, KvSm::default(), node_storage().await?, config()).await?;
     spawn_serve(&node);
 
     // Leading is not enough. `create` writes the founding membership and winning the election
@@ -256,7 +211,7 @@ pub async fn founding_node() -> io::Result<(String, EzRaft<KvSm>)> {
 /// promotion lands, so callers wait on the voter set.
 pub async fn joined_voter(seed: &str) -> io::Result<(String, EzRaft<KvSm>)> {
     let addr = free_addr();
-    let node = EzRaft::join(&addr, seed, KvSm::default(), MemStorage::default(), config()).await?;
+    let node = EzRaft::join(&addr, seed, KvSm::default(), node_storage().await?, config()).await?;
     spawn_serve(&node);
     Ok((addr, node))
 }
@@ -264,7 +219,7 @@ pub async fn joined_voter(seed: &str) -> io::Result<(String, EzRaft<KvSm>)> {
 /// A node that joined as a learner, serving.
 pub async fn joined_learner(seed: &str) -> io::Result<(String, EzRaft<KvSm>)> {
     let addr = free_addr();
-    let node = EzRaft::join_as_learner(&addr, seed, KvSm::default(), MemStorage::default(), config()).await?;
+    let node = EzRaft::join_as_learner(&addr, seed, KvSm::default(), node_storage().await?, config()).await?;
     spawn_serve(&node);
     Ok((addr, node))
 }
