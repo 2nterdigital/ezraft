@@ -157,10 +157,15 @@ async fn a_request_arriving_during_a_delayed_round_is_served_by_a_later_round() 
         tokio::spawn(async move { node.linearizable_view(READ_TIMEOUT).await })
     };
 
-    // Long enough that the first call's round has certainly already sent its RPC (and is now
-    // sitting inside the injected delay - everything before that point is synchronous, in-
-    // process work with no real wait), short enough to stay well inside the 300ms delay itself.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait until the first call's round has actually sent its RPC - the fault hook counts a
+    // request as it enters the injected delay - rather than guessing how long that takes.
+    tokio::time::timeout(READ_TIMEOUT, async {
+        while faults.request_count(follower_id, leader_id, READ_INDEX_PATH) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| io::Error::other("the first round never sent its RPC"))?;
 
     let second = {
         let node = b.clone();

@@ -96,8 +96,14 @@ async fn a_write_commits_exactly_once_across_a_leader_kill() -> io::Result<()> {
         })
     };
 
-    // Give the run a moment to start, then kill the leader mid-run.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Kill the leader mid-run: once some iterations have committed, and well before all have -
+    // checked, not assumed, so a fast machine cannot finish the run first and leave the kill
+    // (the whole point of this test) unexercised.
+    let mid_run = wait_for_revision(&b, ITERATIONS / 4).await?.revision();
+    assert!(
+        mid_run < ITERATIONS,
+        "the run finished before the leader could be killed mid-run"
+    );
     a.shutdown().await?;
 
     writer.await.expect("writer task panicked");
