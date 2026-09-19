@@ -28,9 +28,7 @@
 
 use std::fmt::Display;
 use std::future::Future;
-use std::io;
 
-use openraft::BasicNode;
 use openraft::OptionalSend;
 use openraft::error::Infallible;
 use openraft::error::NetworkError;
@@ -59,6 +57,7 @@ use crate::transport::TrafficClass;
 use crate::transport::Transport;
 use crate::transport::TransportError;
 use crate::type_config::EzVote;
+use crate::type_config::Node;
 use crate::type_config::OpenRaftTypes;
 
 /// Type alias for OpenRaft types
@@ -66,9 +65,10 @@ type C = OpenRaftTypes;
 
 /// HTTP network factory
 ///
-/// Creates the per-peer [`Network`] openraft asks for, one per [`TrafficClass`] (ech0-media#26).
-/// Every one of them shares one [`Transport`], and so its per-class connection pools - and, in
-/// test builds, one fault-injection handle. Implements OpenRaft's `RaftNetworkFactory` trait.
+/// Creates the per-peer [`Network`] openraft asks for, one per Raft [`TrafficClass`]
+/// (ech0-media#26). Every one of them shares one [`Transport`] - and so its per-class connection
+/// pools, the cluster token, and, in test builds, one fault-injection handle. Implements
+/// OpenRaft's `RaftNetworkFactory` trait.
 pub struct EzNetworkFactory {
     transport: Transport,
     /// The largest snapshot this node will ever attempt to send - see
@@ -77,25 +77,22 @@ pub struct EzNetworkFactory {
 }
 
 impl EzNetworkFactory {
-    /// Create a new network factory for the node whose id is `from`
-    pub fn new(from: u64, snapshot_max_bytes: usize) -> Result<Self, io::Error> {
-        Ok(Self {
-            transport: Transport::new(from)?,
+    /// Build the network factory around an already-configured [`Transport`]
+    ///
+    /// The caller ([`crate::raft::EzKv::new`]) builds one `Transport` per node and shares it with
+    /// this factory and with [`crate::rpc::Rpc`] alike: both send through the same choke point, so
+    /// both carry the same cluster token and see the same fault-injection rules.
+    pub(crate) fn new(transport: Transport, snapshot_max_bytes: usize) -> Self {
+        Self {
+            transport,
             snapshot_max_bytes,
-        })
-    }
-
-    /// Attach the test cluster's shared fault-injection handle
-    #[cfg(feature = "fault-injection")]
-    pub(crate) fn with_faults(mut self, faults: Option<crate::transport::fault::Faults>) -> Self {
-        self.transport = self.transport.with_faults(faults);
-        self
+        }
     }
 
     /// Build the [`Network`] client for `target`, tagged with `class`
-    fn build(&self, target: u64, node: &BasicNode, class: TrafficClass) -> Network {
+    fn build(&self, target: u64, node: &Node, class: TrafficClass) -> Network {
         Network {
-            addr: node.addr.clone(),
+            addr: node.internal_addr.clone(),
             target,
             transport: self.transport.clone(),
             class,
@@ -107,20 +104,20 @@ impl EzNetworkFactory {
 impl RaftNetworkFactory<C> for EzNetworkFactory {
     type Network = Network;
 
-    async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, target: u64, node: &Node) -> Self::Network {
         self.build(target, node, TrafficClass::Replication)
     }
 
-    /// A client dedicated to leader heartbeats and the ReadIndex leadership probes that reuse it
-    /// (OPENRAFT-A33.md §5): its own connection pool, so replication or a snapshot transfer to
-    /// the same peer can never delay one.
-    async fn new_heartbeat_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
+    /// A client dedicated to leader heartbeats and the ReadIndex leadership probes that reuse it:
+    /// its own connection pool, so replication or a snapshot transfer to the same peer can never
+    /// delay one.
+    async fn new_heartbeat_client(&mut self, target: u64, node: &Node) -> Self::Network {
         self.build(target, node, TrafficClass::Heartbeat)
     }
 
     /// A client dedicated to whole-snapshot transfer: its own connection pool, so a large
     /// transfer can never delay a heartbeat or ordinary replication to the same peer.
-    async fn new_snapshot_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
+    async fn new_snapshot_client(&mut self, target: u64, node: &Node) -> Self::Network {
         self.build(target, node, TrafficClass::Snapshot)
     }
 }
@@ -153,15 +150,10 @@ impl Network {
         Resp: Serialize + DeserializeOwned,
         Err: std::error::Error + Serialize + DeserializeOwned,
     {
-        self.transport.send(self.class, self.target, &self.addr, uri, option.soft_ttl(), req).await.map_err(
-            |e| match &e {
-                // A peer that does not answer in time - or, in test builds, one a fault dropped the
-                // request to - is treated like one that cannot be reached, so replication backs off
-                // instead of hammering it.
-                TransportError::Unreachable(_) => RPCError::Unreachable(Unreachable::new(&e)),
-                TransportError::Other(_) => RPCError::Network(NetworkError::new(&e)),
-            },
-        )
+        self.transport
+            .send(self.class, self.target, &self.addr, uri, option.soft_ttl(), req)
+            .await
+            .map_err(|e| to_rpc_error(&e))
     }
 
     /// [`Self::request`]'s counterpart for the raw-binary snapshot body: `body` is already framed
@@ -180,10 +172,22 @@ impl Network {
         self.transport
             .send_raw(self.class, self.target, &self.addr, uri, option.soft_ttl(), body)
             .await
-            .map_err(|e| match &e {
-                TransportError::Unreachable(_) => RPCError::Unreachable(Unreachable::new(&e)),
-                TransportError::Other(_) => RPCError::Network(NetworkError::new(&e)),
-            })
+            .map_err(|e| to_rpc_error(&e))
+    }
+}
+
+/// What openraft hears when a request could not be delivered
+///
+/// A peer that cannot be reached at all, one that does not answer in time, or - in test builds -
+/// one a fault dropped the request to, are all the same to openraft: "the peer could not be
+/// reached, or did not answer in time", so replication backs off instead of hammering it.
+/// `crate::rpc` keeps those two apart; the Raft path does not need to. A rejected cluster token
+/// and everything else are plain network errors.
+fn to_rpc_error<Cfg>(e: &TransportError) -> RPCError<Cfg>
+where Cfg: openraft::RaftTypeConfig {
+    match e {
+        TransportError::Unreachable(_) | TransportError::Timeout(_) => RPCError::Unreachable(Unreachable::new(e)),
+        TransportError::Unauthorized(_) | TransportError::Other(_) => RPCError::Network(NetworkError::new(e)),
     }
 }
 

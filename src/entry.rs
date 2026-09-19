@@ -1,6 +1,5 @@
 //! The Raft log entry
 
-use openraft::BasicNode;
 use openraft::EntryPayload;
 use openraft::LogId;
 use openraft::Membership;
@@ -10,6 +9,7 @@ use openraft::log_id::RaftLogId;
 use openraft::vote::leader_id_std::CommittedLeaderId;
 
 use crate::command::Command;
+use crate::type_config::Node;
 
 /// Log ID type (term, index)
 ///
@@ -20,7 +20,7 @@ pub type EzLogId = (u64, u64);
 pub type EzCommittedLeaderId = CommittedLeaderId<u64>;
 
 /// Entry payload with the foundation's node id and node types
-type EzEntryPayload = EntryPayload<Command, u64, BasicNode>;
+type EzEntryPayload = EntryPayload<Command, u64, Node>;
 
 /// A Raft log entry with the foundation's simplified log ID type
 ///
@@ -47,8 +47,8 @@ impl std::fmt::Display for EzEntry {
 }
 
 // Implement RaftPayload trait
-impl RaftPayload<u64, BasicNode> for EzEntry {
-    fn get_membership(&self) -> Option<Membership<u64, BasicNode>> {
+impl RaftPayload<u64, Node> for EzEntry {
+    fn get_membership(&self) -> Option<Membership<u64, Node>> {
         self.payload.get_membership()
     }
 }
@@ -58,7 +58,7 @@ impl RaftEntry for EzEntry {
     type CommittedLeaderId = EzCommittedLeaderId;
     type D = Command;
     type NodeId = u64;
-    type Node = BasicNode;
+    type Node = Node;
 
     fn new(log_id: LogId<EzCommittedLeaderId>, payload: EzEntryPayload) -> Self {
         Self {

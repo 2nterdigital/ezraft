@@ -139,7 +139,7 @@ impl Transport {
     /// Generic over the real send itself (`send_now`, a closure taking the - possibly
     /// delay-reduced - remaining timeout) rather than over the request/response types directly,
     /// so this one function serves both `Transport::send`'s JSON path and
-    /// `Transport::send_raw`'s raw-body path.
+    /// `Transport::send_raw`'s raw-body path, on whichever traffic class's pool the caller chose.
     pub(super) async fn send_faulty<F, Fut, Resp, Err>(
         &self,
         fault: Fault,
@@ -159,9 +159,12 @@ impl Transport {
 
             Fault::Delay(delay) if delay >= timeout => {
                 // The delay alone exhausts the caller's budget, so the peer never sees the
-                // request: report it exactly like a send that timed out.
+                // request: reported as `Timeout`, not `Unreachable` - the peer is not the
+                // problem here, the caller's own budget ran out. openraft does not need the
+                // difference (`crate::network` maps both to one `RPCError::Unreachable`), but
+                // `crate::rpc::RpcError` does.
                 tokio::time::sleep(timeout).await;
-                Err(TransportError::Unreachable(format!(
+                Err(TransportError::Timeout(format!(
                     "fault-injection: delay {delay:?} at or past the {timeout:?} timeout {} -> {target}",
                     self.from()
                 )))
@@ -337,7 +340,7 @@ mod tests {
     async fn a_dropped_request_is_unreachable_without_being_sent() {
         let faults = Faults::new();
         faults.set(1, 2, Fault::Drop);
-        let transport = Transport::new(1).unwrap().with_faults(Some(faults));
+        let transport = Transport::new(1, "test-token").unwrap().with_faults(Some(faults));
 
         // Nothing is listening at this address: a real send would itself fail, but a dropped
         // request must fail before it ever gets that far.
@@ -356,18 +359,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_delay_at_or_past_the_timeout_is_reported_as_unreachable() {
+    async fn a_delay_at_or_past_the_timeout_is_reported_as_a_timeout() {
         let faults = Faults::new();
         let delay = Duration::from_millis(50);
         faults.set(1, 2, Fault::Delay(delay));
-        let transport = Transport::new(1).unwrap().with_faults(Some(faults));
+        let transport = Transport::new(1, "test-token").unwrap().with_faults(Some(faults));
 
         let start = std::time::Instant::now();
         let err = transport
             .send::<_, (), Infallible>(TrafficClass::Replication, 2, "127.0.0.1:1", "x", delay, ())
             .await
             .expect_err("a delay at least as long as the timeout is a timeout");
-        assert!(matches!(err, TransportError::Unreachable(_)), "{err}");
+        assert!(matches!(err, TransportError::Timeout(_)), "{err}");
         assert!(start.elapsed() >= delay);
     }
 
@@ -375,7 +378,7 @@ mod tests {
     async fn a_dropped_response_is_reported_as_a_failure() {
         let faults = Faults::new();
         faults.set(1, 2, Fault::DropResponse);
-        let transport = Transport::new(1).unwrap().with_faults(Some(faults));
+        let transport = Transport::new(1, "test-token").unwrap().with_faults(Some(faults));
 
         let err = transport
             .send::<_, (), Infallible>(
@@ -395,7 +398,7 @@ mod tests {
     async fn a_class_specific_delay_leaves_other_classes_unaffected() {
         let faults = Faults::new();
         faults.set_class(1, 2, TrafficClass::Snapshot, Fault::Drop);
-        let transport = Transport::new(1).unwrap().with_faults(Some(faults));
+        let transport = Transport::new(1, "test-token").unwrap().with_faults(Some(faults));
 
         let snapshot_err = transport
             .send::<_, (), Infallible>(

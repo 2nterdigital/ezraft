@@ -55,11 +55,15 @@ redb        = { version = "4.3.0" }
 reqwest     = { version = "0.12", features = ["json"] }
 serde       = { version = "1.0.114", features = ["derive"] }
 serde_json  = { version = "1.0.57" }
+# Constant-time comparison of the presented `Authorization: Bearer` credential against the
+# cluster token (ech0-media#29): an audited primitive instead of `==`, so a byte-by-byte timing
+# difference can never leak how much of the token an attacker already guessed.
+subtle      = { version = "2.6" }
 thiserror   = { version = "2.0.20" }
 tokio       = { version = "1.39", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
-# Structured logging for key paths (elections, write forwarding, watch Reset, snapshot
-# build/send/install, ech0-media#26): a normal dependency now that the first package needing it
-# lands. Libraries never install a subscriber (see `src/lib.rs`).
+# Structured logging on key paths (snapshot build/send/install, rejected cluster tokens, and
+# the elections, write forwarding and watch resets still to come). Libraries never install a
+# subscriber.
 tracing     = { version = "0.1" }
 
 [features]

@@ -20,13 +20,17 @@
 //! Then drive it through the write API (`/api/write`, `/api/read`) below. These are this
 //! example's own routes, added on top of `EzKv::serve_with` - `EzKv::write` only ever succeeds
 //! on the current leader (any-node forwarding is ech0-media#30), so a write to a follower fails
-//! and has to be retried against another node:
+//! and has to be retried against another node. Every route on the internal port, this example's
+//! own included, requires the cluster token as `Authorization: Bearer <token>` - the default
+//! below matches `--token`'s own default, so it needs no flag for a single-command demo:
 //!
 //! ```bash
 //! curl -X POST 127.0.0.1:8080/api/write -H 'Content-Type: application/json' \
+//!     -H 'Authorization: Bearer dev-cluster-token' \
 //!     -d '{"op": "Set", "key": "hello", "value": "world"}'
 //!
 //! curl -X POST 127.0.0.1:8080/api/read -H 'Content-Type: application/json' \
+//!     -H 'Authorization: Bearer dev-cluster-token' \
 //!     -d '{"op": "Get", "key": "hello"}'
 //! ```
 
@@ -121,6 +125,14 @@ struct Args {
     /// `POST /api/membership` whenever you decide to.
     #[arg(long)]
     learner: bool,
+
+    /// The cluster token every node on this internal port must share
+    ///
+    /// A node refuses to start without one; every request to `/raft/*`, `/api/*`, `/rpc/*` -
+    /// including this example's own `/api/write`/`/api/read` - must present it as
+    /// `Authorization: Bearer <token>`.
+    #[arg(long, default_value = "dev-cluster-token")]
+    token: String,
 }
 
 #[tokio::main]
@@ -154,7 +166,11 @@ async fn main() -> io::Result<()> {
     let storage = RedbStorage::open(base_dir.join("node.redb")).await?;
 
     // Create the node handle: the first node starts the cluster, the rest join it
-    let config = EzConfig::default();
+    let token = args.token;
+    let config = EzConfig {
+        cluster_token: token.clone(),
+        ..EzConfig::default()
+    };
     let node = match &seed {
         Some(seed) if args.learner => EzKv::join_as_learner(&addr, seed, storage, config).await?,
         Some(seed) => EzKv::join(&addr, seed, storage, config).await?,
@@ -162,7 +178,7 @@ async fn main() -> io::Result<()> {
     };
 
     println!("Node {} listening on {}", node.node_id(), addr);
-    print_next_steps(&addr, seed.is_some());
+    print_next_steps(&addr, seed.is_some(), &token);
 
     // Start the HTTP server: the crate's `/raft/*` and admin routes, plus this example's own
     // `/api/write` and `/api/read`.
@@ -180,7 +196,7 @@ async fn main() -> io::Result<()> {
 /// A node that announces only that it is listening leaves the reader with nothing to type: the
 /// body `/api/write` takes is this file's `WriteRequest` enum as JSON, which cannot be guessed
 /// from outside the source.
-fn print_next_steps(addr: &str, seed_given: bool) {
+fn print_next_steps(addr: &str, seed_given: bool, token: &str) {
     // Without a seed this node forms a cluster of its own, and every other node must be pointed
     // at it. A reader who starts a second node without `--seed` gets two separate clusters that
     // never merge, so the invitation to join is printed with the address already filled in.
@@ -188,29 +204,35 @@ fn print_next_steps(addr: &str, seed_given: bool) {
         println!(
             "\nNo --seed given, so this node is the cluster's founding member. \
              Every other node joins through it - from another terminal:\n    \
-             cargo run --example kvstore -- --addr {next} --seed {addr}"
+             cargo run --example kvstore -- --addr {next} --seed {addr} --token {token}"
         );
     }
 
     println!(
         r#"
+Every request below needs the cluster token this node was started with ({token}).
+
 Write a key - only the leader accepts it (any-node forwarding is ech0-media#30):
     curl -X POST {addr}/api/write -H 'Content-Type: application/json' \
+        -H 'Authorization: Bearer {token}' \
         -d '{{"op": "Set", "key": "hello", "value": "world"}}'
 
 Read it back - answered from this node's local view, no consensus round:
     curl -X POST {addr}/api/read -H 'Content-Type: application/json' \
+        -H 'Authorization: Bearer {token}' \
         -d '{{"op": "Get", "key": "hello"}}'
 
 Read every key sharing a prefix - a read the write API cannot phrase:
     curl -X POST {addr}/api/read -H 'Content-Type: application/json' \
+        -H 'Authorization: Bearer {token}' \
         -d '{{"op": "Prefix", "prefix": "he"}}'
 
 Cluster state - leader, term, log index, membership:
-    curl {addr}/api/metrics
+    curl {addr}/api/metrics -H 'Authorization: Bearer {token}'
 
 Change a node's role - a voter counts towards a quorum, a learner does not:
     curl -X POST {addr}/api/membership -H 'Content-Type: application/json' \
+        -H 'Authorization: Bearer {token}' \
         -d '{{"op": "SetRole", "node_id": 1, "role": "Voter"}}'
 "#
     );
