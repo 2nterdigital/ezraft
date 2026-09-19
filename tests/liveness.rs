@@ -254,7 +254,15 @@ async fn a_down_node_stays_down_across_a_change_of_leader() -> io::Result<()> {
 /// only ever writes on an actual status change.
 #[tokio::test(flavor = "multi_thread")]
 async fn status_is_written_only_on_change() -> io::Result<()> {
-    let cfg = liveness_config();
+    // Checked every 30 ms like everywhere else here, but against a threshold no healthy node can
+    // plausibly miss: this proves that nothing is written without a change, and a heartbeat that
+    // a loaded test machine delays past a 200 ms threshold *is* a change - a real `Down`, and a
+    // real `Up` after it.
+    let cfg = EzConfig {
+        liveness_threshold: Duration::from_secs(5),
+        liveness_grace: Duration::from_secs(5),
+        ..liveness_config()
+    };
     let (addr_a, a, _data_a) = founding_node_with(cfg.clone()).await?;
     let (_, b, _data_b) = joined_voter_with(&addr_a, cfg.clone()).await?;
     let (_, c, _data_c) = joined_voter_with(&addr_a, cfg.clone()).await?;
