@@ -41,6 +41,12 @@ pub enum Fault {
 /// means "every traffic class" (see [`Faults::rules`]'s own doc comment)
 type RuleKey = (u64, u64, Option<TrafficClass>);
 
+/// A request counter's key: a directed node-id pair and the exact request path
+type PathCountKey = (u64, u64, String);
+
+/// A request counter's key: a directed node-id pair and the traffic class
+type ClassCountKey = (u64, u64, TrafficClass);
+
 /// A cheap, `Clone`-able handle onto one test cluster's fault rules
 ///
 /// Every node of one in-process test cluster shares one `Faults`. It is never process-global:
@@ -54,6 +60,19 @@ pub struct Faults {
     /// test written before traffic classes existed keeps working unchanged. `Some(class)` entries
     /// (`Self::set_class`) are additive and are checked first.
     rules: Arc<Mutex<HashMap<RuleKey, Fault>>>,
+
+    /// Additive (ech0-media#31): every request [`Transport::send`] is asked to make, counted by
+    /// directed node pair and its exact request path - what lets a test count RPC rounds (for
+    /// example `"rpc/ez.read_index"`) without a production metric. A request is counted here
+    /// whatever a fault rule (if any) then does with it: a round that ends up dropped or delayed
+    /// was still asked for, which is what a coalescing guarantee like "at most N rounds" is
+    /// actually about.
+    request_counts_by_path: Arc<Mutex<HashMap<PathCountKey, u64>>>,
+
+    /// The same counting, keyed by traffic class instead of exact path, for a test that only
+    /// cares which pool traffic went through (for example "did anything but heartbeats cross
+    /// this pair").
+    request_counts_by_class: Arc<Mutex<HashMap<ClassCountKey, u64>>>,
 }
 
 impl Faults {
@@ -124,6 +143,29 @@ impl Faults {
     fn get(&self, from: u64, to: u64, class: TrafficClass) -> Option<Fault> {
         let rules = self.rules.lock().unwrap();
         rules.get(&(from, to, Some(class))).or_else(|| rules.get(&(from, to, None))).copied()
+    }
+
+    /// How many requests `from` has sent `to` at exactly this path (for example
+    /// `"rpc/ez.read_index"`), since this handle was created
+    ///
+    /// Counts an attempt whatever happened to it next - dropped, delayed, or delivered - see
+    /// [`Self::record_request`].
+    pub fn request_count(&self, from: u64, to: u64, path: &str) -> u64 {
+        self.request_counts_by_path.lock().unwrap().get(&(from, to, path.to_string())).copied().unwrap_or(0)
+    }
+
+    /// How many requests `from` has sent `to` of this traffic class, since this handle was
+    /// created
+    pub fn request_count_by_class(&self, from: u64, to: u64, class: TrafficClass) -> u64 {
+        self.request_counts_by_class.lock().unwrap().get(&(from, to, class)).copied().unwrap_or(0)
+    }
+
+    /// [`Transport::send`]'s hook: record one attempted request, whatever a fault rule (if any)
+    /// goes on to do with it - test-only introspection (ech0-media#31), never a production
+    /// metric.
+    pub(super) fn record_request(&self, from: u64, to: u64, class: TrafficClass, path: &str) {
+        *self.request_counts_by_path.lock().unwrap().entry((from, to, path.to_string())).or_insert(0) += 1;
+        *self.request_counts_by_class.lock().unwrap().entry((from, to, class)).or_insert(0) += 1;
     }
 }
 

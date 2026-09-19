@@ -16,7 +16,6 @@ use actix_web::dev::ServerHandle;
 use openraft::ChangeMembers;
 use openraft::Raft;
 use openraft::RaftMetrics;
-use openraft::ReadPolicy;
 use openraft::async_runtime::WatchReceiver;
 use openraft::errors::InitializeError;
 use openraft::errors::RaftError;
@@ -25,12 +24,12 @@ use tokio::task::JoinHandle;
 use crate::admin::AdminClient;
 use crate::admin::MembershipChange;
 use crate::config::EzConfig;
-use crate::entry::EzLogId;
 use crate::kv::KvLimits;
 use crate::kv::View;
 use crate::kv::ViewReceiver;
 use crate::network::EzNetworkFactory;
 use crate::node_role::NodeRole;
+use crate::read::ReadIndexCoalescer;
 use crate::rpc::Rpc;
 use crate::storage::EzStorage;
 use crate::storage::adapter::StateMachineStore;
@@ -93,6 +92,10 @@ pub struct EzKv {
 
     /// The typed inter-node RPC facade this node hands out through [`Self::rpc`]
     rpc: Rpc,
+
+    /// The follower-side ReadIndex coalescer behind [`crate::read`]'s
+    /// `EzKv::linearizable_view` (ech0-media#31)
+    read_index: ReadIndexCoalescer,
 }
 
 impl Clone for EzKv {
@@ -109,6 +112,7 @@ impl Clone for EzKv {
             serve_handle: self.serve_handle.clone(),
             cluster_token: self.cluster_token.clone(),
             rpc: self.rpc.clone(),
+            read_index: self.read_index.clone(),
         }
     }
 }
@@ -298,6 +302,12 @@ impl EzKv {
 
         let rpc = Rpc::new(node_id, raft.clone(), transport);
 
+        // The `ez.read_index` handler (ech0-media#31) is registered proactively, for every node,
+        // rather than lazily the first time this node itself calls `linearizable_view`: a leader
+        // that never calls its own read path must still be able to answer a follower's request.
+        crate::read::register_read_index_handler(&rpc, raft.clone());
+        let read_index = ReadIndexCoalescer::spawn(node_id, raft.clone(), rpc.clone());
+
         // Asking now, answered later. The leader holds the request until this node has caught up,
         // which cannot happen until `serve` is running, so the wait belongs there and not here.
         let promotion = promote_via.map(|admin| {
@@ -321,6 +331,7 @@ impl EzKv {
             serve_handle: Arc::new(Mutex::new(None)),
             cluster_token,
             rpc,
+            read_index,
         })
     }
 
@@ -348,29 +359,6 @@ impl EzKv {
     /// already reflected here: the state machine publishes before it answers the writer.
     pub fn view(&self) -> View {
         self.view_rx.current()
-    }
-
-    /// Wait until this node's metrics satisfy a linearizable-read barrier, returning the log id
-    /// it is anchored to
-    ///
-    /// Confirms this node still leads, then waits until the local state machine has applied
-    /// everything committed up to that point. Only the leader can serve this: on a follower it
-    /// returns an error instead of forwarding, since forwarding cannot make this node's local
-    /// state current.
-    ///
-    /// `policy` chooses how leadership is confirmed. [`ReadPolicy::ReadIndex`] asks a quorum and
-    /// is correct whatever the clocks do; [`ReadPolicy::LeaseRead`] answers from the leader lease
-    /// with no round trip, and trades that cost for the assumption that clock drift between nodes
-    /// stays inside the lease.
-    ///
-    /// The returned log id's term identifies the leadership that granted the read, which is what
-    /// a caller comparing two reads across a leader change needs.
-    pub async fn linearizable(&self, policy: ReadPolicy) -> Result<EzLogId, io::Error> {
-        let read_log_id = self.raft.ensure_linearizable(policy).await.map_err(|e| io::Error::other(e.to_string()))?;
-
-        let term = read_log_id.committed_leader_id().term;
-        let index = read_log_id.index();
-        Ok((term, index))
     }
 
     /// Add a learner node to the cluster
@@ -487,8 +475,8 @@ impl EzKv {
     /// Reports this node's own state, which is what a caller asking "am I the leader" wants. It
     /// is not a guarantee that the answer is still true elsewhere: a deposed leader does not
     /// find out until it hears from the new one. Nothing here needs that guarantee -- writing
-    /// reports its own `NotLeader` when it matters, and code that does want a linearizable read
-    /// calls [`Self::linearizable`] first.
+    /// reports its own `NotLeader` when it matters, and a linearizable read
+    /// ([`crate::EzKv::linearizable_view`]) confirms leadership itself, on every call.
     pub fn is_leader(&self) -> bool {
         self.raft.is_leader()
     }
@@ -652,5 +640,10 @@ impl EzKv {
     /// This node's cluster token, for [`crate::server::bind`]'s auth middleware
     pub(crate) fn cluster_token(&self) -> &str {
         &self.cluster_token
+    }
+
+    /// The follower-side ReadIndex coalescer, for `crate::read::EzKv::linearizable_view`
+    pub(crate) fn read_index(&self) -> &ReadIndexCoalescer {
+        &self.read_index
     }
 }
