@@ -63,6 +63,7 @@ type ServeHandle = Arc<Mutex<Option<ServerHandle>>>;
 /// The node handle: create or join a cluster, serve it, and read and write its replicated KV
 ///
 /// `Clone` is cheap: every clone shares the same underlying Raft node.
+#[derive(Clone)]
 pub struct EzKv {
     /// Node ID
     node_id: u64,
@@ -83,32 +84,13 @@ pub struct EzKv {
     /// A lock-free reader onto the KV's latest published view
     view_rx: ViewReceiver,
 
-    /// The limits [`crate::write`] checks a transaction against before proposing it
-    kv_limits: KvLimits,
-
-    /// `EzConfig::ledger_capacity`, stamped into every command this node proposes
-    /// (ech0-media#30) - see `crate::kv::ledger`'s module docs for why `apply` never reads it
-    /// back out of a node's own configuration instead.
-    ledger_capacity: usize,
-
-    /// `EzConfig::write_deadline`, the total budget [`crate::EzKv::write`] and
-    /// [`crate::EzKv::write_with_id`] retry across leadership changes before answering
-    /// `Indeterminate` (ech0-media#30)
-    write_deadline: Duration,
-
-    /// `EzConfig::json_body_limit`, for [`crate::server::bind`] (ech0-media#26)
-    json_body_limit: usize,
-
-    /// `EzConfig::snapshot_max_bytes`, for [`crate::server::bind`] (ech0-media#26)
-    snapshot_max_bytes: usize,
-
     /// The actix `ServerHandle` for the address `serve`/`serve_with` bound, once bound
     serve_handle: ServeHandle,
 
-    /// The cluster token every route on the internal port checks `Authorization: Bearer` against
-    /// (ech0-media#29); `Arc<str>` so cloning this handle - which happens often, in every test
-    /// harness helper - never reallocates it.
-    cluster_token: Arc<str>,
+    /// The configuration this node was started with, shared by every clone of this handle:
+    /// whatever another module needs from it is read through one of the accessors below, never
+    /// copied into a field of its own.
+    config: Arc<EzConfig>,
 
     /// The typed inter-node RPC facade this node hands out through [`Self::rpc`]
     rpc: Rpc,
@@ -135,11 +117,6 @@ pub struct EzKv {
     /// [`Self::last_leader_contact`]
     leader_contact: LeaderContact,
 
-    /// This node's own external-port address, as registered in the node registry
-    /// (`EzConfig::external_addr`, ech0-media#33) - remembered so
-    /// [`crate::registry::EzKv::update_node_meta`] can re-register with the same address
-    external_addr: Arc<str>,
-
     /// The self-registration task [`crate::registry::spawn_self_registration`] started at
     /// construction, if it has not finished yet - [`Self::shutdown`] aborts it, so "retries until
     /// it succeeds" does not mean "forever, even after this node has stopped" (ech0-media#33)
@@ -149,46 +126,6 @@ pub struct EzKv {
     /// [`Self::spawn_leader_task`](crate::leader_task), holding every registered factory and
     /// whichever leadership epoch's runs are currently active
     leader_tasks: Arc<LeaderTasks>,
-
-    /// `EzConfig::liveness_threshold`, read by the built-in liveness task (`crate::liveness`)
-    liveness_threshold: Duration,
-
-    /// `EzConfig::liveness_grace`, read by the built-in liveness task (`crate::liveness`)
-    liveness_grace: Duration,
-
-    /// `EzConfig::liveness_check_interval`, read by the built-in liveness task (`crate::liveness`)
-    liveness_check_interval: Duration,
-}
-
-impl Clone for EzKv {
-    fn clone(&self) -> Self {
-        Self {
-            node_id: self.node_id,
-            addr: self.addr.clone(),
-            raft: self.raft.clone(),
-            promotion: self.promotion.clone(),
-            view_rx: self.view_rx.clone(),
-            kv_limits: self.kv_limits,
-            ledger_capacity: self.ledger_capacity,
-            write_deadline: self.write_deadline,
-            json_body_limit: self.json_body_limit,
-            snapshot_max_bytes: self.snapshot_max_bytes,
-            serve_handle: self.serve_handle.clone(),
-            cluster_token: self.cluster_token.clone(),
-            rpc: self.rpc.clone(),
-            read_index: self.read_index.clone(),
-            watch: self.watch.clone(),
-            registry_rx: self.registry_rx.clone(),
-            cluster_rx: self.cluster_rx.clone(),
-            leader_contact: self.leader_contact.clone(),
-            external_addr: self.external_addr.clone(),
-            self_registration: self.self_registration.clone(),
-            leader_tasks: self.leader_tasks.clone(),
-            liveness_threshold: self.liveness_threshold,
-            liveness_grace: self.liveness_grace,
-            liveness_check_interval: self.liveness_check_interval,
-        }
-    }
 }
 
 impl EzKv {
@@ -290,7 +227,6 @@ impl EzKv {
                 "EzConfig::cluster_token must not be empty: refusing to start a node with an unauthenticated internal port",
             ));
         }
-        let cluster_token: Arc<str> = Arc::from(config.cluster_token.as_str());
 
         // Same "fail on nothing but the caller's own arguments" discipline as the token check
         // above and `to_raft_config` below (ech0-media#34): a shorter grace than threshold could
@@ -316,22 +252,10 @@ impl EzKv {
         // cluster's membership. A configuration this node cannot run with must not first cost the
         // cluster a learner that then has to be removed by hand.
         let raft_config = Arc::new(config.to_raft_config()?);
-        let kv_limits = config.kv_limits;
-        let ledger_capacity = config.ledger_capacity;
-        let write_deadline = config.write_deadline;
-        let json_body_limit = config.json_body_limit;
-        let snapshot_max_bytes = config.snapshot_max_bytes;
-        let liveness_threshold = config.liveness_threshold;
-        let liveness_grace = config.liveness_grace;
-        let liveness_check_interval = config.liveness_check_interval;
-        let watch_limits = config.watch_limits;
-        // Remembered for `crate::registry::EzKv::update_node_meta` to re-register with the same
-        // address later; `node_meta` is only ever needed once, for the startup registration below.
-        let external_addr: Arc<str> = Arc::from(config.external_addr.as_str());
-        let node_meta = config.node_meta.clone();
+        let config = Arc::new(config);
 
         // Open user storage as the two stores openraft asks for
-        let (log, sm) = open(storage, watch_limits).await?;
+        let (log, sm) = open(storage, config.watch_limits).await?;
         let view_rx = sm.subscribe_view();
         let registry_rx = sm.subscribe_registry();
         let watch = sm.publisher();
@@ -352,7 +276,7 @@ impl EzKv {
             //
             // The seed is asked before this node has an id, so `AdminClient` carries the token
             // itself rather than going through the per-node `Transport` built below.
-            let admin = AdminClient::new(seed_addr, cluster_token.as_ref());
+            let admin = AdminClient::new(seed_addr, &config.cluster_token);
 
             let id = admin.node_id().await?;
             let enter = MembershipChange::Add {
@@ -383,11 +307,11 @@ impl EzKv {
         // fault-injection rules. `with_faults` only exists under the `fault-injection` feature;
         // shadowing rather than a `mut` binding keeps a non-feature build from warning about a
         // binding that is never mutated.
-        let transport = Transport::new(node_id, cluster_token.clone())?;
+        let transport = Transport::new(node_id, config.cluster_token.as_str())?;
         #[cfg(feature = "fault-injection")]
         let transport = transport.with_faults(config.faults.clone());
 
-        let network = EzNetworkFactory::new(transport.clone(), snapshot_max_bytes);
+        let network = EzNetworkFactory::new(transport.clone(), config.snapshot_max_bytes);
 
         // Create OpenRaft instance
         let raft = Raft::new(node_id, raft_config, network, log, sm)
@@ -420,7 +344,7 @@ impl EzKv {
         // The `ez.write` handler (ech0-media#30) is registered the same way, for the same
         // reason: any node forwarding a write here must be answered, whether or not this node
         // ever calls its own `write`.
-        crate::write::register_forward_handler(&rpc, raft.clone(), kv_limits, ledger_capacity);
+        crate::write::register_forward_handler(&rpc, raft.clone(), config.kv_limits, config.ledger_capacity);
 
         // Asking now, answered later. The leader holds the request until this node has caught up,
         // which cannot happen until `serve` is running, so the wait belongs there and not here.
@@ -439,31 +363,26 @@ impl EzKv {
             raft,
             promotion: Arc::new(Mutex::new(promotion)),
             view_rx,
-            kv_limits,
-            ledger_capacity,
-            write_deadline,
-            json_body_limit,
-            snapshot_max_bytes,
             serve_handle: Arc::new(Mutex::new(None)),
-            cluster_token,
+            config,
             rpc,
             read_index,
             watch,
             registry_rx,
             cluster_rx,
             leader_contact: LeaderContact::default(),
-            external_addr,
             self_registration: Arc::new(Mutex::new(None)),
             leader_tasks: LeaderTasks::new(),
-            liveness_threshold,
-            liveness_grace,
-            liveness_check_interval,
         };
 
         // Started last, once `ez` itself exists to hand the task a working handle: this node
         // registers or updates its own entry, retrying under one request id until it succeeds
         // (ech0-media#33). `Self::shutdown` aborts it if it is still retrying.
-        let handle = crate::registry::spawn_self_registration(ez.clone(), ez.external_addr.to_string(), node_meta);
+        let handle = crate::registry::spawn_self_registration(
+            ez.clone(),
+            ez.config.external_addr.clone(),
+            ez.config.node_meta.clone(),
+        );
         *ez.self_registration.lock().unwrap() = Some(handle);
 
         // Also started last, for the same reason: this node's leader-task supervisor needs a
@@ -480,28 +399,28 @@ impl EzKv {
 
     /// The limits `crate::write` checks a transaction against before proposing it
     pub(crate) fn kv_limits(&self) -> KvLimits {
-        self.kv_limits
+        self.config.kv_limits
     }
 
     /// `EzConfig::ledger_capacity`, for `crate::write` to stamp into every command this node
     /// proposes
     pub(crate) fn ledger_capacity(&self) -> usize {
-        self.ledger_capacity
+        self.config.ledger_capacity
     }
 
     /// `EzConfig::write_deadline`, the total budget `crate::write`'s retry loop is bounded by
     pub(crate) fn write_deadline(&self) -> Duration {
-        self.write_deadline
+        self.config.write_deadline
     }
 
     /// `EzConfig::json_body_limit`, for [`crate::server::bind`]
     pub(crate) fn json_body_limit(&self) -> usize {
-        self.json_body_limit
+        self.config.json_body_limit
     }
 
     /// `EzConfig::snapshot_max_bytes`, for [`crate::server::bind`]
     pub(crate) fn snapshot_max_bytes(&self) -> usize {
-        self.snapshot_max_bytes
+        self.config.snapshot_max_bytes
     }
 
     /// This node's leader-task supervisor, for [`Self::spawn_leader_task`] (defined in
@@ -512,17 +431,17 @@ impl EzKv {
 
     /// `EzConfig::liveness_threshold`, for the built-in liveness task (`crate::liveness`)
     pub(crate) fn liveness_threshold(&self) -> Duration {
-        self.liveness_threshold
+        self.config.liveness_threshold
     }
 
     /// `EzConfig::liveness_grace`, for the built-in liveness task (`crate::liveness`)
     pub(crate) fn liveness_grace(&self) -> Duration {
-        self.liveness_grace
+        self.config.liveness_grace
     }
 
     /// `EzConfig::liveness_check_interval`, for the built-in liveness task (`crate::liveness`)
     pub(crate) fn liveness_check_interval(&self) -> Duration {
-        self.liveness_check_interval
+        self.config.liveness_check_interval
     }
 
     /// This node's latest published view of the KV
@@ -565,7 +484,7 @@ impl EzKv {
     /// This node's own external-port address, as registered in the node registry
     /// (`EzConfig::external_addr`, ech0-media#33)
     pub(crate) fn external_addr(&self) -> &str {
-        &self.external_addr
+        &self.config.external_addr
     }
 
     /// Check if this node is the leader
@@ -748,7 +667,7 @@ impl EzKv {
 
     /// This node's cluster token, for [`crate::server::bind`]'s auth middleware
     pub(crate) fn cluster_token(&self) -> &str {
-        &self.cluster_token
+        &self.config.cluster_token
     }
 
     /// The follower-side ReadIndex coalescer, for `crate::read::EzKv::linearizable_view`
