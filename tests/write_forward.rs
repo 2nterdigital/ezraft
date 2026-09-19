@@ -40,6 +40,37 @@ async fn a_followers_write_forwards_and_is_immediately_visible_locally() -> io::
     Ok(())
 }
 
+/// What `KvLimits` allows must be writable from *any* node. A forwarded write travels as one
+/// inter-node RPC, so that route has to admit a transaction as large as the limits do - not
+/// whatever smaller default the HTTP server applies to a route nobody configured.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_forwards_a_transaction_as_large_as_the_limits_allow() -> io::Result<()> {
+    let (addr_a, a, _data_a) = founding_node().await?;
+    let (_, b, _data_b) = joined_voter(&addr_a).await?;
+    wait_for_voters(&a, BTreeSet::from([0, b.node_id()]), "the joining voter is promoted").await?;
+    assert!(!b.is_leader());
+
+    // As many maximum-size values as fit under the per-transaction byte limit: fifteen 64 KiB
+    // values by default, well over a megabyte once they are base64 text inside a JSON body.
+    let limits = KvLimits::default();
+    let key = |i: usize| format!("big/{i:02}");
+    let puts = limits.max_txn_bytes / (limits.max_value_bytes + key(0).len());
+    assert!(puts >= 2, "the default limits admit several maximum-size values per transaction");
+    let txn = (0..puts).fold(ezraft::Txn::new(), |txn, i| txn.put(key(i), vec![0xA5u8; limits.max_value_bytes]));
+
+    let revision = b.write(txn).await.map_err(|e| io::Error::other(e.to_string()))?;
+
+    for view in [b.view(), a.view()] {
+        assert_eq!(revision, view.revision());
+        for i in 0..puts {
+            let stored = view.get(&key(i)).map(|kv| kv.value.len());
+            assert_eq!(Some(limits.max_value_bytes), stored, "{} is stored whole", key(i));
+        }
+    }
+
+    Ok(())
+}
+
 /// A learner - never a voter, never eligible to lead - must be able to write the same way: it
 /// only ever forwards.
 #[tokio::test(flavor = "multi_thread")]
