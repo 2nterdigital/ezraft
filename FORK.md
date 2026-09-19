@@ -96,6 +96,15 @@
   openraft 的 `BasicNode` 换成底座自己的 `Node { internal_addr }`。`TransportError` 区分 `Timeout` 与
   `Unreachable` 并新增 `Unauthorized`（对 openraft 的映射不变）；测试钩子里超过预算的延迟现在报告为
   `Timeout`。新增依赖 `subtle`。新增 `tests/rpc.rs`、`tests/auth.rs`。
+- [#25 存储崩溃注入与断电恢复测试](https://github.com/2nterdigital/ech0-media/issues/25)：
+  仅新增测试代码。`tests/common/crash.rs`：`CrashStorage` 包装真实 `RedbStorage`，在指定的第 N 次 `persist`
+  **之前**（该次调用不落盘、不留痕迹）或**之后**（已落盘，但仍向调用方报错）"断电"，此后该实例的每次写入与
+  读取都失败，测试再从同一 redb 文件重启节点；同时记录每次 persist 的种类与 Meta 所携带的 vote，使断电点能
+  精确落在"记录投票的那次 persist"上而不是猜下标。`tests/crash_recovery.rs`：三节点集群上对一段固定的已确认
+  写入序列扫描每个断电点（follower 作受害节点全量扫描 12 个点；leader 作受害节点用较短序列扫描 8 个点，
+  因其崩溃还会触发换届），每次重启后断言已确认写入全部存在、三副本的值与 `create_rev`/`mod_rev` 完全一致、
+  集群继续服务写入；断电点落在 vote 持久化前后时，磁盘上的 vote 与断电时机精确对应，且任一 term 至多一个
+  leader。断电点按 persist 计数选取，无时序依赖。未在 `RedbStorage` 或适配层发现缺陷。
 
 ## 验证命令
 
