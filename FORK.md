@@ -3,8 +3,8 @@
 本仓库是 [原版 ezraft](https://github.com/drmingdrmer/ezraft) 的完全分叉，作为
 [ech0-media](https://github.com/2nterdigital/ech0-media) 的**底座**：在原版之上扩展复制 KV、任意节点读写、
 变更订阅、节点间 RPC、集群观测与生产级存储。规划与决策见
-[底座扩展 spec：第一个里程碑](https://github.com/2nterdigital/ech0-media/issues/21)；术语以 ech0-media 的
-`CONTEXT.md` 为准（底座、上游、原版 ezraft、节点、内部端口、集群 token、revision、变更……）。
+[底座扩展 spec：第一个里程碑](https://github.com/2nterdigital/ech0-media/issues/21)；术语以 ech0-media 仓库的
+[`CONTEXT.md`](https://github.com/2nterdigital/ech0-media/blob/main/CONTEXT.md) 为准（底座、上游、原版 ezraft、节点、内部端口、集群 token、revision、变更……）。
 
 ## 基线
 
@@ -41,8 +41,9 @@
   "不可达/超时"与其他错误），`src/network.rs` 改为在它之上实现 openraft 网络 trait，错误映射不变。新增仅在
   cargo feature `fault-injection` 下存在的 `ezraft::fault::{Faults, Fault}`：按有向节点对 `Drop`、
   `Delay`、`DropResponse`，以及 `partition`/`isolate`/`heal`；句柄按测试集群独立、经 `EzConfig::faults`
-  传入，非进程全局。feature 默认关闭，普通构建不含任何钩子代码；自身 dev-dependency 让 `cargo test` 无需
-  额外参数即可启用。新增 `tests/common/faults.rs` 与验收测试 `tests/partition.rs`。
+  传入，非进程全局。feature 默认关闭，作为依赖被构建时不含任何钩子代码；自身 dev-dependency 让 `cargo test` 无需
+  额外参数即可启用——代价是同一仓库里的示例目标（含 #35 的 kvstore 与 #36 基准所测的二进制）也带着这个
+  feature 构建：钩子在场但无规则时只是每次出站请求多一次 `Option` 判断。新增 `tests/common/faults.rs` 与验收测试 `tests/partition.rs`。
 - [#24 RedbStorage：生产存储替换样例文件存储](https://github.com/2nterdigital/ech0-media/issues/24)：
   新增生产存储 `RedbStorage`（redb 4.3.0）：每节点一个 redb 文件、三张表（log / meta / snapshot），每次
   `persist` 是一个 `Durability::Immediate` 写事务，契约不变（一批 N 条同步 N+1 次、append 同步通知完成）；
@@ -210,6 +211,61 @@
   无关。`EzConfig` 新增 `liveness_threshold` / `liveness_grace` / `liveness_check_interval`（5 s / 5 s /
   1 s，待 #36 实测）。对转发命令收到形状不符的应答时记录错误并按"无应答"处理，不再 panic（该应答来自对端）。
   原版 `timestamp_oracle` 示例已于 #27 删除（确认）。新增 `tests/leader_task.rs`、`tests/liveness.rs`。
+- [#37 底座使用指南](https://github.com/2nterdigital/ech0-media/issues/37)：
+  用新 API 重写 `docs/guide.md`（中文），**替换**原版英文指南，并同步重写 `README.md`。覆盖全部公开 API
+  及其错误语义：启动集群（create / join / join_as_learner、内部端口与集群 token、`RedbStorage`、
+  `EzConfig` 每一项）、条件事务与 revision（冲突后重读重试、上限）、任意节点写入（转发、`Indeterminate`
+  与 `write_with_id`、`LocalLag` 与 `wait_revision`）、本地视图与线性读、watch（三种 Reset 原因、
+  Progress、按 `mod_rev` 去重、游标续订）、节点间 RPC、集群观测与节点注册表、leader 专属任务与存活判定
+  （围栏为何精确、`LeaderWriteError` 每个变体该怎么办）、成员变更与管理协议、存储契约与快照、可观测性，
+  以及一张错误参考表。末尾是**给上游的使用约定**一节：热路径读本地视图并以 CAS 兜底、RoomService 读与
+  否定判断用线性读、索引在事务里自写、webhook 用 watch + leader 专属任务 + KV 游标自建、软状态由上游
+  内存缓存层经 RPC 同步、媒体面致命错误时进程退出。**指南里的每个 Rust 代码块都是 doctest**：`src/lib.rs`
+  以 `#[cfg(doctest)]` 模块 `include_str!` 整份指南，`cargo test`（或 `cargo test --doc`）会编译它们，
+  API 变了而指南没跟上会直接让测试失败；该模块只在 rustdoc 收集 doctest 时存在，不进入任何构建产物。
+- 里程碑收尾评审（对照 [spec](https://github.com/2nterdigital/ech0-media/issues/21) 与各票验收条件、对照编码规范各做一遍）
+  发现并修复的问题，按所属票登记。**正确性**：(#28) openraft 把快照构建放在独立任务里、与安装并发；构建在锁外
+  编码期间若 leader 发来的更新的快照先装好，构建完成后会把它覆盖成旧的，而日志已清理到新快照的位置——重启后
+  中间那段日志被静默跳过。构建拆成「捕获来源 / 存储结果」两步，存储时保留较新的一份（单元测试按该交错逐步
+  重放，去掉保护即失败）。(#29/#26) RPC 路由用 `web::Bytes` 取请求体，受 `PayloadConfig` 而非 `JsonConfig`
+  约束，实际上限是 actix 默认的 256 KiB：`KvLimits` 允许的大事务在 follower 上写入时每次转发都被 413 拒绝，
+  最终以 `Indeterminate` 报告一笔从未发生的写入；现在该上限等于 `json_body_limit`，`tests/write_forward.rs`
+  新增「follower 转发一个达到上限的事务」。(#26) alpha.33 的快照发送端只对 `Unreachable` 退避，对 `Network` /
+  `Timeout` 会清掉退避立刻重发整份快照；发送端超限拒发、对端 413/401/500、未知快照版本此前都映射成 `Network`，
+  形成零延迟重试循环——现在送不出去的 Raft 请求一律报告为 `Unreachable`。(#29) `RpcError::Remote` 此前还
+  装着全部 `TransportError::Other`（连接中途断开、非成功状态码、响应解不出来），非幂等 handler 的调用方无法区分
+  「handler 拒绝了」与「结果未知」；新增 `RpcError::Transport { node_id, name, message }` 承载后者，`Remote`
+  只表示对端 RPC 层的确定答复。(#27/#33) 事务的**条件数**此前没有上限（字节上限只数 key），数十万个单字节 key 的
+  条件能通过校验并编码成数 MiB；现在与操作数共用 `max_txn_ops`、各自计数（`LimitError::TooManyConditions`）。
+  节点注册表条目（`external_addr` + `meta`）此前完全没有上限，leader 本地提议一个超大 `meta` 会永久卡死复制；
+  现在按一个 value 计（`max_value_bytes`，`LimitError::NodeEntryTooLarge`），在提议入口、`update_node_meta`
+  发起节点和启动配置三处检查；`RegistryIndeterminate` 改为枚举 `RegistryWriteError { LimitExceeded,
+  Indeterminate }`。(#34) 存活判定原先只有两种结论，「没有证据」被当成 `Up`：每次换届，新 leader 的第一次
+  检查就把每个已判 `Down` 的节点改回 `Up`、保持整个宽限期、再改回 `Down`——每个死节点每次故障转移两次多余写入
+  和一次假恢复。`judge` 现在有第三种结论（无证据，保持原状），`Up` 必须来自本次 leadership 真实收到的确认；
+  从未确认过的节点改为从「本次 leadership 第一次在注册表里看到它」起算静默，加入一个已运行很久的 leadership 的
+  新节点不再被误判 `Down`；状态变化日志的 `silence_ms` 现在是静默时长而不是 leadership 年龄。顺带修复：
+  节点 `shutdown` 之后 `wait_before_next_attempt` 立即返回，使所有重试循环（写入的整个期限内）变成忙等；
+  `shutdown` 先中止自注册任务。(#31) 被移出集群的节点只能从它认定的 leader 那里得知 `NotMember`，而它再也收不到
+  任何复制、认定永远不更新：那个 leader 一旦不在，读就永远是 `NoLeader`。现在一轮 ReadIndex 在认定的 leader
+  问不到（或根本没有认定）时改问它记得的其他成员，并沿 `NotLeader` 的 leader 提示再问一跳；`NotMember` 只由
+  刚确认过自己是 leader 的节点回答（follower 的成员视图可能还没追上「把调用方加进来」的变更）；读写应答里从未
+  使用的 `leader_addr` 已删除。leader 侧读的确认现在受调用方超时约束，写入/注册表重试循环按截止时刻而不是
+  过期的剩余预算等待。(#33) 已被移除但仍在运行的节点能通过转发的 `RegisterNode` 把自己的条目写回去，直到
+  下一次对账；现在应用注册命令时按状态机自己已应用的成员配置判定，非成员不产生条目。集群 token 不再出现在
+  `EzConfig` / `AdminClient` 的 `Debug` 输出里。**文档与测试**：(#37) 指南里按 key 的 `mod_rev` 去重的示例
+  用 `prev.mod_rev` 判断删除，会把每一次删除都当成重复丢掉、也没有墓碑，改为按组的 revision 去重并说明原因；
+  `write_until_definite` 不再对 `LimitExceeded` 走 `unreachable!`；线性读的合并只发生在 follower / learner 上
+  （指南原写「同一个节点上」）；补充 `node_id()`、`addr()`、`trigger_snapshot()`、`purge_log()`。(#35)
+  kill-leader 测试原先只断言已确认写入存活，现在断言两个幸存节点的最终 revision 等于写入次数（恰好一次）。
+  (#25) 崩溃试验在三个节点的自注册全部落地之后才取 persist 基线。两处用 sleep 当同步的测试改为条件等待。
+  **结构**：命令的语义（term 围栏、幂等账本、每种命令体做什么）从存储适配层的五个分支收拢到
+  `Command::apply`，只读命令、条目的 term、已复制状态与已应用成员配置，适配层只负责喂条目和发布变化；
+  `src/write.rs` 按模块规则拆出 `write/error.rs` 与 `write/propose.rs`，根文件只留接口与组合；`Transport`
+  的 JSON 与原始体发送合并为一条路径（此前快照发送不计入测试钩子的请求计数），响应类型去掉无用的
+  `Serialize` 约束；watch hub 在构造时拿到上限，删除事后 `configure` / `reconfigure`；`EzKv` 持有
+  `Arc<EzConfig>` 而不是逐字段拷贝，`Clone` 改为 derive；`kv`、`watch`、`server` 改为私有模块（公开项本来就
+  都从 crate 根重导出）；RPC 处理器表改名 `rpc/handlers.rs` / `Handlers`，不再与节点注册表重名。
 
 ## 验证命令
 

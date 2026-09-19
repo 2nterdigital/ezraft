@@ -213,7 +213,10 @@ async fn a_dropped_response_means_the_handler_ran_exactly_once_with_no_retry() -
     faults.set(a.node_id(), b_id, Fault::DropResponse);
 
     let result = a.rpc().call::<(), ()>(b_id, "count", (), RPC_TIMEOUT).await;
-    assert!(result.is_err(), "a dropped response is a failure to the caller");
+    assert!(
+        matches!(result, Err(RpcError::Transport { node_id, .. }) if node_id == b_id),
+        "a dropped response is an unknown outcome, not the handler's own answer: {result:?}",
+    );
     assert_eq!(
         1,
         calls.load(Ordering::SeqCst),

@@ -157,10 +157,15 @@ async fn a_request_arriving_during_a_delayed_round_is_served_by_a_later_round() 
         tokio::spawn(async move { node.linearizable_view(READ_TIMEOUT).await })
     };
 
-    // Long enough that the first call's round has certainly already sent its RPC (and is now
-    // sitting inside the injected delay - everything before that point is synchronous, in-
-    // process work with no real wait), short enough to stay well inside the 300ms delay itself.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait until the first call's round has actually sent its RPC - the fault hook counts a
+    // request as it enters the injected delay - rather than guessing how long that takes.
+    tokio::time::timeout(READ_TIMEOUT, async {
+        while faults.request_count(follower_id, leader_id, READ_INDEX_PATH) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| io::Error::other("the first round never sent its RPC"))?;
 
     let second = {
         let node = b.clone();
@@ -240,6 +245,64 @@ async fn not_member_on_a_node_removed_from_the_cluster() -> io::Result<()> {
     let result = b.linearizable_view(READ_TIMEOUT).await;
     assert!(
         matches!(result, Err(ReadError::NotMember(id)) if id == b_id),
+        "{result:?}"
+    );
+
+    Ok(())
+}
+
+/// `NotMember` still reaches a removed node once the leader it knew is gone.
+///
+/// Nothing is replicated to a removed node any more, so its idea of who leads stops at whoever
+/// led when it was removed. With that node gone there is nobody left it knows to ask - while the
+/// one node that can say "you are not a member", the new leader, is one it has never heard of as
+/// a leader. It gets there by asking the other members it remembers, and following their hint.
+#[tokio::test(flavor = "multi_thread")]
+async fn not_member_on_a_removed_node_once_the_leader_it_knew_is_gone() -> io::Result<()> {
+    let (addr_a, a, _data_a) = founding_node().await?;
+    let (_, b, _data_b) = joined_voter(&addr_a).await?;
+    let (_, c, _data_c) = joined_voter(&addr_a).await?;
+    let (_, removed, _data_r) = joined_learner(&addr_a).await?;
+    let removed_id = removed.node_id();
+    let voters = BTreeSet::from([0, b.node_id(), c.node_id()]);
+    wait_for_voters(&a, voters, "b and c joined as voters").await?;
+    // An established member: it has replicated the membership that names it and everyone else,
+    // which is also the only address book it will ever have.
+    removed
+        .wait_metrics(
+            WAIT,
+            |m| m.membership_config.membership().nodes().count() == 4,
+            "the learner has replicated the whole membership",
+        )
+        .await?;
+
+    a.remove_node(removed_id).await.map_err(|e| io::Error::other(e.to_string()))?;
+    for node in [&b, &c] {
+        node.wait_metrics(
+            WAIT,
+            |m| m.committed_membership_config.membership().get_node(&removed_id).is_none(),
+            "both surviving voters have committed the removal",
+        )
+        .await?;
+    }
+
+    let old_leader = a.node_id();
+    a.shutdown().await?;
+    b.wait_metrics(
+        WAIT,
+        |m| matches!(m.current_leader, Some(id) if id != old_leader),
+        "the surviving voters elect a new leader",
+    )
+    .await?;
+    assert_eq!(
+        Some(old_leader),
+        removed.metrics().await.current_leader,
+        "nobody told the removed node about the new leader",
+    );
+
+    let result = removed.linearizable_view(READ_TIMEOUT).await;
+    assert!(
+        matches!(result, Err(ReadError::NotMember(id)) if id == removed_id),
         "{result:?}"
     );
 

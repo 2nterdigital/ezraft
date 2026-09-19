@@ -4,10 +4,11 @@
 //! - Internal Raft RPC (append entries, vote, install snapshot, transfer leader)
 //! - Admin API (joining, node roles, removal, metrics)
 //!
-//! `/api/write` and `/api/read` - a sample write/read API typed by the user's own application -
-//! do not survive `EzApp` becoming an internal implementation detail (ech0-media#27b); any-node
-//! writes and reads are `EzKv::write`/`EzKv::view` on the public handle now, and forwarding a
-//! write to the leader over HTTP is ech0-media#30.
+//! - Inter-node RPC (`/rpc/<name>`), which also carries forwarded writes and ReadIndex rounds
+//!
+//! Everything here is the internal port, behind the cluster token. The crate serves no
+//! client-facing routes: writes and reads are `EzKv::write`/`EzKv::view` on the handle, and an
+//! application's own API is its own to serve (`examples/kvstore/api.rs`).
 
 use std::io::Cursor;
 
@@ -44,17 +45,17 @@ const SNAPSHOT_FRAME_OVERHEAD_ALLOWANCE: usize = 4 * 1024;
 /// Type alias for OpenRaft types
 type C = OpenRaftTypes;
 
-/// HTTP server wrapper: `/raft/*` and the admin routes
+/// The internal port's handlers: `/raft/*`, the admin routes and inter-node RPC
 ///
-/// This is both a working server and a sample to copy: these routes are production-shaped, but
-/// an application's own routes (client writes and reads) are not this crate's to shape - see
-/// [`crate::raft::EzKv::serve_with`] to add them, and `examples/kvstore.rs` for a worked example.
-pub struct EzServer {
+/// An application's own routes (client writes and reads) are not this crate's to shape - see
+/// [`crate::raft::EzKv::serve_with`] to add some to this port, and `examples/kvstore/api.rs` for
+/// an API served on a port of its own.
+pub(crate) struct EzServer {
     raft: EzKv,
 }
 
 impl EzServer {
-    pub fn new(raft: EzKv) -> Self {
+    fn new(raft: EzKv) -> Self {
         Self { raft }
     }
 
@@ -260,10 +261,15 @@ impl EzServer {
 /// own `handle()` before the accept loop starts, so [`EzKv::shutdown`](crate::raft::EzKv::shutdown)
 /// can stop it later.
 ///
-/// `EzConfig::json_body_limit` sets the app-wide `JsonConfig` limit (every route here but
-/// `/raft/snapshot` is JSON, `configure`'s own routes included); `/raft/snapshot` gets its own
-/// `PayloadConfig`, from `EzConfig::snapshot_max_bytes`, since it is the one route whose body can
-/// legitimately be far larger than any JSON request this node accepts (ech0-media#26).
+/// `EzConfig::json_body_limit` is the app-wide request body limit (every route here but
+/// `/raft/snapshot` carries JSON, `configure`'s own routes included). It has to be set twice,
+/// because actix keeps one limit per extractor family: `JsonConfig` for the routes that extract
+/// `web::Json`, and `PayloadConfig` for the inter-node RPC route, which takes its JSON as raw
+/// `web::Bytes` to decode it per handler - left unset, that one falls back to actix's 256 KiB
+/// default, far below a transaction `KvLimits` allows, and a forwarded write that large would
+/// be refused on every retry. `/raft/snapshot` overrides the `PayloadConfig` with its own, from
+/// `EzConfig::snapshot_max_bytes`, since it is the one route whose body can legitimately be far
+/// larger than any JSON request this node accepts (ech0-media#26).
 pub(crate) fn bind<F>(raft: EzKv, configure: F) -> std::io::Result<Server>
 where F: Fn(&mut ServiceConfig) + Clone + Send + 'static {
     let addr = raft.addr().to_string();
@@ -278,6 +284,7 @@ where F: Fn(&mut ServiceConfig) + Clone + Send + 'static {
         App::new()
             .app_data(server_data.clone())
             .app_data(web::JsonConfig::default().limit(json_body_limit))
+            .app_data(PayloadConfig::new(json_body_limit))
             // Every route below - Raft, admin, RPC, and anything `configure` adds - requires
             // `Authorization: Bearer <cluster token>` (ech0-media#29): wrapping the whole `App`
             // is what makes that hold for an embedder's own routes too, with nothing for the

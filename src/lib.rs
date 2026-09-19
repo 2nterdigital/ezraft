@@ -6,26 +6,23 @@
 //!
 //! - Storage persistence via [`EzStorage`]
 //!
+//! See the guide (`docs/guide.md`) for the full API surface, every error's semantics, and the
+//! usage conventions ech0-media's own upstream code follows on top of this crate. This page stays
+//! a short orientation plus one working example.
+//!
 //! # What a cluster does
 //!
-//! A *cluster* is a set of *nodes*, each one a process running this crate. Every node keeps the
-//! same list of transactions - the *log* - in the same order. A transaction is *committed* once a
-//! majority of the nodes have stored it, which is the point at which it can no longer be lost.
-//! Each node then *applies* committed transactions to its own copy of the KV, in log order, so
-//! every node arrives at the same state, with the same `revision` and the same `create_rev`/
-//! `mod_rev` on every key.
-//!
-//! Because every node holds the whole state, any node can answer a read from memory
-//! ([`EzKv::view`]) without talking to anyone. [`EzKv::write`] works the same way: the leader
-//! proposes directly, and any other node forwards the write and retries with the same request id
-//! until either a definite outcome or a configurable deadline (ech0-media#30).
-//!
-//! A *snapshot* is the state serialized. It lets a node that has fallen too far behind be
-//! caught up in one transfer instead of replaying the log, and it lets old log entries be
-//! deleted. EzRaft builds and installs snapshots on its own.
-//!
-//! What matters for fault tolerance is that a majority survives: three nodes tolerate one
-//! failure, five tolerate two.
+//! A *cluster* is a set of *nodes*, each one a process running this crate, replicating the same
+//! log and applying it, in order, to the same key-value state machine ([`EzKv`]) - every node
+//! ends up with the same state, the same `revision`, and the same `create_rev`/`mod_rev` on every
+//! key. Because every node holds the whole state, any node answers a read from memory
+//! ([`EzKv::view`]) without talking to anyone, and any node accepts a write ([`EzKv::write`]):
+//! the leader proposes directly, any other node forwards it and retries under one request id
+//! until either a definite outcome or a configurable deadline (ech0-media#30). A *snapshot* is
+//! that state serialized, letting a node that fell too far behind catch up in one transfer
+//! instead of replaying the whole log; EzRaft builds and installs snapshots on its own. What
+//! matters for fault tolerance is that a majority survives: three nodes tolerate one failure,
+//! five tolerate two.
 //!
 //! # Quick start
 //!
@@ -86,7 +83,7 @@ mod cluster;
 mod command;
 pub mod config;
 pub mod entry;
-pub mod kv;
+mod kv;
 mod leader_task;
 mod liveness;
 mod membership;
@@ -97,12 +94,12 @@ pub mod raft;
 mod read;
 mod registry;
 mod rpc;
-pub mod server;
+mod server;
 pub mod snapshot;
 pub mod storage;
 mod transport;
 mod type_config;
-pub mod watch;
+mod watch;
 mod write;
 
 // Re-export public API
@@ -133,7 +130,7 @@ pub use openraft::RaftTypeConfig;
 pub use openraft::ServerState;
 pub use raft::EzKv;
 pub use read::ReadError;
-pub use registry::RegistryIndeterminate;
+pub use registry::RegistryWriteError;
 pub use rpc::Rpc;
 pub use rpc::RpcError;
 pub use rpc::RpcRegisterError;
@@ -156,3 +153,15 @@ pub use watch::WatchUpdate;
 pub use write::LeaderWriteError;
 pub use write::LocalLag;
 pub use write::WriteError;
+
+// Every Rust code block in the guide (`docs/guide.md`) becomes a `cargo test --doc` test through
+// this module, so the guide cannot silently drift from the implemented API: `cfg(doctest)` holds
+// only while rustdoc collects and compiles doctests (`cargo test --doc`), never for `cargo
+// build`, `cargo check`, or even `cargo doc` itself, so this module and the guide's Markdown
+// contribute nothing to a normal build or to the rendered API docs. Most of the guide's snippets
+// are function definitions that are never called (compiling them already proves the types and
+// signatures they use still match this crate); the few that run a whole node are `no_run`.
+#[cfg(doctest)]
+mod guide_doctest {
+    #![doc = include_str!("../docs/guide.md")]
+}

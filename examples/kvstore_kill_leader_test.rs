@@ -107,6 +107,26 @@ async fn sigkill_leader_while_writing_elects_a_new_leader_and_keeps_serving() ->
         }
     }
 
+    // Exactly once. Every successful transaction advances the revision by exactly one, and the
+    // writer's were the only transactions this cluster ever saw - so a write applied a second
+    // time under its retried request id would leave the revision past the number of writes.
+    assert_eq!(
+        WRITE_COUNT as usize,
+        acked_final.len(),
+        "the writer got a definite success for every write"
+    );
+    for api in &survivor_apis {
+        let status = wait_for_status(api, Instant::now() + WAIT, |s| {
+            s["revision"].as_u64().is_some_and(|revision| revision >= u64::from(WRITE_COUNT))
+        })
+        .await?;
+        assert_eq!(
+            Some(u64::from(WRITE_COUNT)),
+            status["revision"].as_u64(),
+            "{api}: every write took effect exactly once"
+        );
+    }
+
     // A new leader took over - some node other than the one just killed.
     let new_leader_status = wait_for_status(survivor_apis[0], Instant::now() + WAIT, |s| {
         s["leader_id"].as_u64().is_some_and(|id| id != leader_id)

@@ -53,13 +53,6 @@ pub(crate) struct Applied {
     pub(crate) changes: Option<Changes>,
 }
 
-/// What [`KvState::apply_registry_command`] produced
-pub(crate) struct RegistryApplied {
-    /// The registry, as it stands after this call, if the command actually ran. `None` when the
-    /// request id was already recorded: nothing changed, so there is nothing new to publish.
-    pub(crate) registry: Option<Registry>,
-}
-
 /// The KV state machine: the user's key space, the revision counter, and the foundation-internal
 /// state block
 ///
@@ -77,8 +70,9 @@ pub(crate) struct KvState {
     /// The KV's own revision counter: `0` before any transaction has ever committed, incremented
     /// by exactly one on every transaction whose conditions all hold.
     revision: u64,
-    /// The foundation-internal state block - see [`InternalState`]'s own docs. Carried through
-    /// untouched by every [`apply`](Self::apply) call today, since nothing writes to it yet.
+    /// The foundation-internal state block - see [`InternalState`]'s own docs. A transaction's
+    /// [`apply`](Self::apply) never touches it; the ledger and the registry are written through
+    /// [`Self::apply_idempotent`] and [`Self::apply_registry_command`].
     internal: InternalState,
 }
 
@@ -159,12 +153,13 @@ impl KvState {
 
     /// Apply one registry command, consulting the same idempotency ledger first
     ///
-    /// `mutate` is handed the current registry to change in place - `crate::registry` (the
-    /// register-or-update and remove command handlers) is the only caller, and it is the one that
-    /// knows which mutation a given command means. Registry commands never fail once accepted
-    /// (there is no condition to fail), so - unlike [`Self::apply_idempotent`] - there is no
-    /// `Result` here: consulting the ledger only decides whether to run `mutate` again, never
-    /// whether it succeeds.
+    /// `mutate` is handed the current registry to change in place: [`crate::command`] knows which
+    /// mutation a given command means, this only knows when to run it. Registry commands never
+    /// fail once accepted (there is no condition to fail), so there is nothing to report but the
+    /// registry itself ([`Self::apply_idempotent`] has an outcome to carry too), and only if
+    /// `mutate` really changed it: a retried request id never runs `mutate` again, and a command
+    /// that found nothing to do (a status set on an entry that is gone, a reconciliation with
+    /// nothing stale) is recorded like any other but gives subscribers nothing new to hear about.
     ///
     /// Never advances `self.revision` and never produces a [`Changes`] group (ech0-media#33): the
     /// registry is foundation-internal state, not part of the user's key space.
@@ -173,16 +168,16 @@ impl KvState {
         request_id: RequestId,
         ledger_capacity: usize,
         mutate: impl FnOnce(&mut Registry),
-    ) -> RegistryApplied {
+    ) -> Option<Registry> {
         if self.internal.ledger.get(request_id).is_some() {
-            return RegistryApplied { registry: None };
+            return None;
         }
 
+        let before = self.internal.registry.clone();
         mutate(&mut self.internal.registry);
         self.internal.ledger.record(request_id, LedgerOutcome::Registry, ledger_capacity);
-        RegistryApplied {
-            registry: Some(self.internal.registry.clone()),
-        }
+
+        (self.internal.registry != before).then(|| self.internal.registry.clone())
     }
 
     /// Evaluate `txn`'s conditions and, if they all hold, apply its ops
@@ -286,9 +281,9 @@ impl KvState {
 
 /// Every key in `kv` that starts with `prefix`, in key order
 ///
-/// Shared by [`KvState::apply`]'s `DeletePrefix` handling and (via [`View::prefix`]) reads, so
-/// the two agree on exactly what a prefix matches - see `view.rs` for the raw-string-prefix
-/// semantics this implies (a prefix like `"room/1"` matches `"room/10"` too).
+/// What [`KvState::apply`]'s `DeletePrefix` deletes. [`View::prefix`] scans the same way, so a
+/// delete and a read agree on exactly what a prefix matches - see `view.rs` for the
+/// raw-string-prefix semantics this implies (a prefix like `"room/1"` matches `"room/10"` too).
 fn keys_with_prefix<'a>(kv: &'a OrdMap<Arc<str>, StoredValue>, prefix: &'a str) -> impl Iterator<Item = Arc<str>> + 'a {
     kv.range::<_, str>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
         .take_while(move |(key, _)| key.starts_with(prefix))
@@ -837,7 +832,7 @@ mod tests {
             registry.set(1, node_info("127.0.0.1:9001"));
         });
 
-        let registry = applied.registry.expect("a first registration must be published");
+        let registry = applied.expect("a first registration must be published");
         assert_eq!(Some(node_info("127.0.0.1:9001")), registry.get(1));
         assert_eq!(
             0,
@@ -861,10 +856,7 @@ mod tests {
             registry.set(1, node_info("127.0.0.1:9999"));
         });
 
-        assert!(
-            retried.registry.is_none(),
-            "a deduplicated command has nothing new to publish"
-        );
+        assert!(retried.is_none(), "a deduplicated command has nothing new to publish");
         assert_eq!(
             Some(node_info("127.0.0.1:9001")),
             state.registry().get(1),
@@ -883,7 +875,7 @@ mod tests {
             registry.remove(1);
         });
 
-        let registry = applied.registry.expect("a removal must be published");
+        let registry = applied.expect("a removal must be published");
         assert_eq!(None, registry.get(1));
     }
 

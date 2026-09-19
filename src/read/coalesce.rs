@@ -1,7 +1,7 @@
 //! Follower-side coalescing for the `ez.read_index` RPC: at most one round in flight per node
 //!
-//! A "round" is one attempt at getting a read position from this node's believed leader: at
-//! most one RPC call - or none at all, if no leader is currently known.
+//! A "round" is one attempt at getting a read position from this node's believed leader:
+//! ordinarily exactly one RPC call ([`round`] says when it takes more: a stale or unknown leader).
 //! [`ReadIndexCoalescer`] is a single background task (spawned once, in
 //! [`crate::raft::EzKv::new`]) that owns all of its state as plain local variables in
 //! [`run`] - no lock is ever held, none is even needed - and callers reach it only through a
@@ -49,8 +49,8 @@ pub(crate) type RoundOutcome = Result<EzLogId, Arc<RoundError>>;
 /// Why one `ez.read_index` round did not produce a read position
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RoundError {
-    /// This node knows of no leader right now (`RaftMetrics::current_leader` is `None`); no RPC
-    /// was even attempted
+    /// This node knows of no leader right now (`RaftMetrics::current_leader` is `None`), and no
+    /// other member it knows of could be asked for one
     #[error("no leader is currently known")]
     NoLeaderKnown,
 
@@ -61,14 +61,6 @@ pub(crate) enum RoundError {
         asked: u64,
         /// The leader that node hinted at instead, if it named one
         leader_id: Option<u64>,
-        /// That hinted leader's address, if any
-        ///
-        /// Not read anywhere yet: today's retry just waits for this node's own `current_leader`
-        /// metric to catch up on the next round rather than addressing the hint directly, since
-        /// every acceptance scenario this ticket covers converges either way. A future round
-        /// could act on it to shave off a wasted round-trip on a stale-leader-hint chain.
-        #[allow(dead_code, reason = "kept for a future round that retries against the hint directly")]
-        leader_addr: Option<String>,
     },
 
     /// The leader's own, authoritative membership no longer counts this node
@@ -168,30 +160,76 @@ async fn run(node_id: u64, raft: ORRaft, rpc: Rpc, mut rx: mpsc::UnboundedReceiv
     }
 }
 
-/// One round: look up the currently believed leader and ask it for a read position with exactly
-/// one RPC call - or, if this node knows of no leader at all, fail without sending anything
+/// One round: ask the node this one believes leads for a read position
+///
+/// A believed leader that names another node is followed there, once; and a believed leader that
+/// cannot be asked at all - or no believed leader - has the other members this node knows of
+/// asked in its place, for the same one hop. A member hardly needs any of this: its own metrics
+/// catch up with a change of leader by themselves, and a later round asks the right node anyway.
+/// A node that has been *removed* does need it: nothing is replicated to it any more, so its idea
+/// of who leads stops at whoever led when it was removed - while the current leader, the only
+/// node that can tell it [`RoundError::NotMember`], is one it would otherwise never ask. One hop
+/// only: a chain of hints is a cluster mid-election, which the caller's own retry loop handles.
 async fn round(node_id: u64, raft: &ORRaft, rpc: &Rpc) -> RoundOutcome {
-    let Some(leader_id) = raft.metrics().borrow_watched().current_leader else {
-        return Err(Arc::new(RoundError::NoLeaderKnown));
+    let (believed, mut others) = {
+        let metrics_rx = raft.metrics();
+        let metrics = metrics_rx.borrow_watched();
+        let members = metrics.membership_config.membership().nodes().map(|(id, _)| *id);
+        (
+            metrics.current_leader,
+            members.filter(|id| *id != node_id).collect::<Vec<_>>(),
+        )
     };
 
+    let answer = match believed {
+        Some(leader) => match ask(leader, node_id, raft, rpc).await {
+            Err(RoundError::Rpc(_)) => {
+                others.retain(|id| *id != leader);
+                ask_any(&others, node_id, raft, rpc).await
+            }
+            answer => answer,
+        },
+        None => ask_any(&others, node_id, raft, rpc).await,
+    };
+
+    match answer {
+        Err(RoundError::NotLeader {
+            asked,
+            leader_id: Some(hinted),
+        }) if hinted != asked => ask(hinted, node_id, raft, rpc).await,
+        answer => answer,
+    }
+    .map_err(Arc::new)
+}
+
+/// With no leader to ask: ask `members` in turn until one of them answers at all
+///
+/// The first answer stands, whatever it is - a member that knows of no leader either means the
+/// cluster has none right now, and asking the rest would only repeat it.
+async fn ask_any(members: &[u64], node_id: u64, raft: &ORRaft, rpc: &Rpc) -> Result<EzLogId, RoundError> {
+    for member in members {
+        match ask(*member, node_id, raft, rpc).await {
+            Err(RoundError::Rpc(_)) => continue,
+            answer => return answer,
+        }
+    }
+    Err(RoundError::NoLeaderKnown)
+}
+
+/// Ask `leader_id` for a read position, with exactly one RPC call
+async fn ask(leader_id: u64, node_id: u64, raft: &ORRaft, rpc: &Rpc) -> Result<EzLogId, RoundError> {
     // Generous but bounded: long enough that a healthy leader always answers well within it,
     // short enough that a leader that genuinely cannot confirm a quorum does not hold this round
     // open indefinitely. `EzKv::linearizable_view`'s own retry loop is what actually enforces a
     // caller's timeout; this only bounds one round's own RPC.
     let round_timeout = Duration::from_millis(raft.config().election_timeout_max);
 
-    match rpc.call::<u64, ReadIndexReply>(leader_id, READ_INDEX_RPC_NAME, node_id, round_timeout).await {
-        Ok(ReadIndexReply::Granted { log_id }) => Ok(log_id),
-        Ok(ReadIndexReply::NotLeader {
-            leader_id: hint,
-            leader_addr,
-        }) => Err(Arc::new(RoundError::NotLeader {
+    match rpc.call::<u64, ReadIndexReply>(leader_id, READ_INDEX_RPC_NAME, node_id, round_timeout).await? {
+        ReadIndexReply::Granted { log_id } => Ok(log_id),
+        ReadIndexReply::NotLeader { leader_id: hint } => Err(RoundError::NotLeader {
             asked: leader_id,
             leader_id: hint,
-            leader_addr,
-        })),
-        Ok(ReadIndexReply::NotMember) => Err(Arc::new(RoundError::NotMember)),
-        Err(e) => Err(Arc::new(RoundError::Rpc(e))),
+        }),
+        ReadIndexReply::NotMember => Err(RoundError::NotMember),
     }
 }

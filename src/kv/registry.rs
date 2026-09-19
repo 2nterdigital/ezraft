@@ -14,14 +14,16 @@ use imbl::OrdMap;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::kv::KvLimits;
+use crate::kv::LimitError;
 use crate::kv::bytes_codec;
 
 /// Whether the foundation currently believes a node is reachable
 ///
-/// Stored and exposed here; nothing in this milestone ever sets it to [`Self::Down`] - a future
-/// leader-only liveness task (ech0-media#34) is what will, based on heartbeat acknowledgement.
-/// Every entry starts, and every re-registration resets it to, [`Self::Up`]: a node registering or
-/// updating its own entry is, by definition, up right now.
+/// Stored and exposed here, decided elsewhere: the leader's built-in liveness task
+/// (`crate::liveness`, ech0-media#34) sets it from heartbeat acknowledgements, writing only when it
+/// changes. Every entry starts, and every re-registration resets it to, [`Self::Up`]: a node
+/// registering or updating its own entry is, by definition, up right now.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeStatus {
     /// The foundation has no reason to believe this node is unreachable
@@ -105,6 +107,24 @@ pub struct RegisterNode {
     pub(crate) meta: Bytes,
 }
 
+impl RegisterNode {
+    /// Check this entry's size before it is proposed: `external_addr` plus `meta` is held to
+    /// `max_value_bytes`, like any single value
+    ///
+    /// An entry with no bound would be committed to the leader's own log without complaint and
+    /// then refused by every follower's request body limit, on every retry, forever.
+    pub(crate) fn validate(&self, limits: &KvLimits) -> Result<(), LimitError> {
+        let actual = self.external_addr.len() + self.meta.len();
+        if actual > limits.max_value_bytes {
+            return Err(LimitError::NodeEntryTooLarge {
+                actual,
+                max: limits.max_value_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Remove a node's registry entry
 ///
 /// The command body [`crate::EzKv::remove_node`] proposes, on the leader, once the matching
@@ -139,6 +159,25 @@ mod tests {
             meta: Bytes::from_static(b"meta"),
             status: NodeStatus::Up,
         }
+    }
+
+    #[test]
+    fn an_entry_is_held_to_the_size_of_a_single_value() {
+        let limits = KvLimits {
+            max_value_bytes: 8,
+            ..KvLimits::default()
+        };
+        let entry = |addr: &str, meta: &'static [u8]| RegisterNode {
+            node_id: 1,
+            external_addr: addr.to_string(),
+            meta: Bytes::from_static(meta),
+        };
+
+        assert_eq!(Ok(()), entry("addr", b"meta").validate(&limits));
+        assert_eq!(
+            Err(LimitError::NodeEntryTooLarge { actual: 9, max: 8 }),
+            entry("addr", b"meta!").validate(&limits)
+        );
     }
 
     #[test]

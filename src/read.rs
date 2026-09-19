@@ -113,8 +113,6 @@ enum ReadIndexReply {
     NotLeader {
         /// The leader this node knows of instead, if any
         leader_id: Option<u64>,
-        /// That leader's address, if any
-        leader_addr: Option<String>,
     },
     /// The caller is not a member of this node's current membership
     NotMember,
@@ -143,32 +141,34 @@ pub(crate) fn register_read_index_handler(rpc: &Rpc, raft: ORRaft) {
 /// without waiting for this node's own apply - the caller (a follower or learner) does that
 /// locally, against its own applied index, once it has the position
 ///
-/// `caller` is checked against this node's own current membership *first*, and authoritatively:
-/// a node can be removed from the cluster and, once the leader stops replicating to it, never
-/// again receive anything that would update its own local membership view - this RPC is the one
-/// place a removed node reliably learns that it no longer counts.
+/// Leadership is confirmed *first*, and only then is `caller` checked against this node's
+/// membership. A node can be removed from the cluster and, once the leader stops replicating to
+/// it, never again receive anything that would update its own local membership view - this RPC is
+/// the one place a removed node reliably learns that it no longer counts. But only a node that
+/// has just confirmed it leads may say so: its membership is the cluster's, where a follower's
+/// may simply not have caught up with the very change that added the caller.
 async fn leader_read_index(raft: &ORRaft, caller: u64) -> ReadIndexReply {
+    let linearizer = match raft.get_read_linearizer(ReadPolicy::ReadIndex).await {
+        Ok(linearizer) => linearizer,
+        Err(RaftError::APIError(LinearizableReadError::ForwardToLeader(fwd))) => {
+            return ReadIndexReply::NotLeader {
+                leader_id: fwd.leader_id,
+            };
+        }
+        // No quorum could be confirmed, or the engine itself has stopped: either way this node
+        // cannot vouch for a read position right now, and it knows of no better leader to name.
+        Err(RaftError::APIError(LinearizableReadError::QuorumNotEnough(_))) | Err(RaftError::Fatal(_)) => {
+            return ReadIndexReply::NotLeader { leader_id: None };
+        }
+    };
+
     let is_member = raft.metrics().borrow_watched().membership_config.membership().get_node(&caller).is_some();
     if !is_member {
         return ReadIndexReply::NotMember;
     }
 
-    match raft.get_read_linearizer(ReadPolicy::ReadIndex).await {
-        Ok(linearizer) => ReadIndexReply::Granted {
-            log_id: to_ez_log_id(linearizer.read_log_id()),
-        },
-        Err(RaftError::APIError(LinearizableReadError::ForwardToLeader(fwd))) => ReadIndexReply::NotLeader {
-            leader_id: fwd.leader_id,
-            leader_addr: fwd.leader_node.map(|node| node.internal_addr),
-        },
-        // No quorum could be confirmed, or the engine itself has stopped: either way this node
-        // cannot vouch for a read position right now, and it knows of no better leader to name.
-        Err(RaftError::APIError(LinearizableReadError::QuorumNotEnough(_))) | Err(RaftError::Fatal(_)) => {
-            ReadIndexReply::NotLeader {
-                leader_id: None,
-                leader_addr: None,
-            }
-        }
+    ReadIndexReply::Granted {
+        log_id: to_ez_log_id(linearizer.read_log_id()),
     }
 }
 
@@ -227,7 +227,12 @@ impl EzKv {
             }
 
             let attempt = if self.is_leader() {
-                self.leader_attempt().await
+                // A quorum round of its own, which a leader cut off from its quorum never
+                // finishes: bounded here, or it would answer late by however long that takes.
+                match tokio::time::timeout(remaining, self.leader_attempt()).await {
+                    Ok(attempt) => attempt,
+                    Err(_elapsed) => return Err(ReadError::NoLeader),
+                }
             } else {
                 self.follower_attempt(remaining).await
             };
