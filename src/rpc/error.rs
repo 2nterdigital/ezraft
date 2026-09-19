@@ -37,9 +37,28 @@ pub enum RpcError {
     #[error("node {0} rejected the cluster token")]
     Unauthorized(u64),
 
-    /// The target was reached and authenticated, but the call still did not produce a typed
-    /// result: no handler is registered under this name, the request or the response would not
-    /// decode, or the handler itself returned an error. The message says which.
+    /// The exchange with `node_id` broke down after the request may already have reached it: the
+    /// connection dropped before a complete answer arrived, or the answer was not one this
+    /// node's RPC layer understands - a non-success HTTP status (a request over the peer's body
+    /// limit, for one), or a body that would not decode
+    ///
+    /// Like [`Self::Timeout`], the outcome is unknown: the handler may have run.
+    #[error("RPC call to node {node_id} ('{name}') failed in transit: {message}")]
+    Transport {
+        /// The node id the call was addressed to
+        node_id: u64,
+        /// The name that was called
+        name: String,
+        /// What went wrong, as far as this node could tell
+        message: String,
+    },
+
+    /// The target's RPC layer answered, and the answer is not a typed result: no handler is
+    /// registered under this name, the request would not decode into the handler's request type,
+    /// or the handler itself returned an error. The message says which.
+    ///
+    /// Unlike [`Self::Timeout`] and [`Self::Transport`] this is a definite answer: whatever the
+    /// message reports is what happened on the target.
     #[error("{0}")]
     Remote(String),
 }

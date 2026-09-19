@@ -537,11 +537,16 @@ async fn call_handler(node: &EzKv, target: u64) -> Result<String, RpcError> {
 
 | 变体 | 含义 | 调用方应当怎么做 |
 | --- | --- | --- |
-| `Timeout { node_id, name }` | `timeout` 到了还没等到答复 | 远端 handler 可能仍在跑；是否重试取决于它是不是幂等的 |
-| `Unreachable { node_id, name }` | 连不上目标节点（测试构建里也可能是被故意丢弃的请求） | 同上，通常等一下再试 |
+| `Timeout { node_id, name }` | `timeout` 到了还没等到答复 | **结果未知**：远端 handler 可能仍在跑；是否重试取决于它是不是幂等的 |
+| `Unreachable { node_id, name }` | 连不上目标节点（测试构建里也可能是被故意丢弃的请求） | 请求没有送达，handler 没有运行；通常等一下再试，或者换一个节点 |
 | `NotMember(u64)` | 目标节点不在当前成员配置里 | 重试解决不了，先刷新成员信息 |
 | `Unauthorized(u64)` | 目标节点用 `401` 拒绝了，集群 token 不匹配 | 检查配置，不要重试 |
-| `Remote(String)` | 到达并通过了鉴权，但没能产生一个类型化结果——没有这个名字的处理器、请求或响应解码失败、或者 handler 自己返回了错误；消息里会说明具体是哪一种 | 按消息判断：未知名字/解码失败通常是调用方的 bug；handler 自己的错误按业务语义处理 |
+| `Transport { node_id, name, message }` | 请求可能已经送达，但这次交换在途中坏掉了：连接在完整答复到达之前断开，或者答复不是 RPC 层能理解的东西（非成功的 HTTP 状态，例如请求体超过对端上限；或解不出来的响应体） | **结果未知**，和 `Timeout` 一样对待：handler 可能已经运行过 |
+| `Remote(String)` | 对端的 RPC 层给出了**确定的**答复，只是它不是一个类型化结果——没有这个名字的处理器、请求解不成 handler 的请求类型、或者 handler 自己返回了错误；消息里会说明具体是哪一种 | 按消息判断：未知名字/解码失败通常是调用方的 bug；handler 自己的错误按业务语义处理 |
+
+区分「确定的答复」和「结果未知」对非幂等的 handler 很重要（例如让另一个节点创建一个 PipeTransport）：
+拿到 `Remote` 可以确信对端说的就是发生了的事；拿到 `Timeout` 或 `Transport` 则必须假设 handler 可能已经
+执行过，先查询或清理，再决定要不要重试。
 
 `RpcRegisterError`：`Reserved(String)`（名字以 `ez.` 开头）、`AlreadyRegistered(String)`（这个名字已
 经注册过）。
@@ -890,11 +895,12 @@ feature 时才存在（默认关闭，正常构建完全不含这部分代码，
 | `ReadError::NoLeader` | 超时内没能确认到一个 leader | 值得在预算内重试，选举通常几个心跳就结束 |
 | `ReadError::NotMember(u64)` | 这个节点已经不在当前成员配置里 | 重试解决不了 |
 | `ReadError::NotCaughtUp { read_index, applied_index }` | 读位置已确认，但本地应用没在超时内追上 | 已提交，加大超时或稍后重试 |
-| `RpcError::Timeout { node_id, name }` | 调用超时未获得答复 | 远端 handler 可能仍在跑；是否重试取决于它是否幂等 |
-| `RpcError::Unreachable { node_id, name }` | 连不上目标节点 | 同上 |
+| `RpcError::Timeout { node_id, name }` | 调用超时未获得答复 | 结果未知：远端 handler 可能仍在跑；是否重试取决于它是否幂等 |
+| `RpcError::Unreachable { node_id, name }` | 连不上目标节点 | 请求没有送达；等一下再试或换节点 |
 | `RpcError::NotMember(u64)` | 目标不在当前成员配置里 | 重试解决不了，先刷新成员信息 |
 | `RpcError::Unauthorized(u64)` | 目标拒绝了集群 token | 检查配置，不要重试 |
-| `RpcError::Remote(String)` | 到达且鉴权通过，但没能产生类型化结果（未知名字/解码失败/handler 自身错误） | 按消息判断 |
+| `RpcError::Transport { node_id, name, message }` | 请求可能已送达，但交换在途中坏掉（连接中断、非成功状态码、响应解不出来） | 结果未知，与 `Timeout` 同样对待 |
+| `RpcError::Remote(String)` | 对端 RPC 层的确定答复，但不是类型化结果（未知名字/请求解码失败/handler 自身错误） | 按消息判断 |
 | `RpcRegisterError::Reserved(String)` | 名字以 `ez.` 开头 | 换一个名字 |
 | `RpcRegisterError::AlreadyRegistered(String)` | 这个名字已经注册过 | 检查是不是重复注册，不要用同名覆盖 |
 | `RegistryIndeterminate { request_id }` | `update_node_meta` 在 `write_deadline` 内没有确认结果 | 注册/更新一旦被接受就不会失败；可以重新调用一次 `update_node_meta` |

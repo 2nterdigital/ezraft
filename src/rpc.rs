@@ -183,7 +183,11 @@ impl Rpc {
                 name: name.to_string(),
             }),
             Err(TransportError::Unauthorized(_)) => Err(RpcError::Unauthorized(node_id)),
-            Err(TransportError::Other(msg)) => Err(RpcError::Remote(format!("'{name}': {msg}"))),
+            Err(TransportError::Other(message)) => Err(RpcError::Transport {
+                node_id,
+                name: name.to_string(),
+                message,
+            }),
         }
     }
 
@@ -193,8 +197,15 @@ impl Rpc {
         Req: Serialize + Send + 'static,
         Resp: DeserializeOwned + Send + 'static,
     {
-        let body =
-            serde_json::to_vec(&req).map_err(|e| RpcError::Remote(format!("'{name}': request did not encode: {e}")))?;
+        // The same taxonomy as a call over the network, where a request that will not encode and
+        // a response that will not decode both surface from the transport.
+        let in_transit = |message: String| RpcError::Transport {
+            node_id: self.node_id,
+            name: name.to_string(),
+            message,
+        };
+
+        let body = serde_json::to_vec(&req).map_err(|e| in_transit(format!("request did not encode: {e}")))?;
 
         let value = tokio::time::timeout(timeout, self.registry.dispatch(name, body)).await.map_err(|_elapsed| {
             RpcError::Timeout {
@@ -203,8 +214,8 @@ impl Rpc {
             }
         })?;
 
-        let outcome: Outcome<Resp> = serde_json::from_value(value)
-            .map_err(|e| RpcError::Remote(format!("'{name}': response did not decode: {e}")))?;
+        let outcome: Outcome<Resp> =
+            serde_json::from_value(value).map_err(|e| in_transit(format!("response did not decode: {e}")))?;
 
         outcome.into_rpc_result(name)
     }
