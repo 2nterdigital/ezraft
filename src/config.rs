@@ -66,7 +66,8 @@ pub struct EzConfig {
     ///
     /// `None` (the default) derives it from [`Self::snapshot_interval`] as the interval itself,
     /// its documented minimum, so changing only the interval can never produce an inconsistent
-    /// pair. Provisional until benchmarked (ech0-media#36).
+    /// pair. ech0-media#36's follower catch-up measurement ran against this default and gave no
+    /// reason to change it (`FORK.md`, 参数定值).
     pub replication_lag_threshold: Option<u64>,
 
     /// The shared secret every request on the internal port must present as
@@ -85,8 +86,10 @@ pub struct EzConfig {
     /// node that accepts the call, and again on the leader before it enters the log - so that a
     /// node with different limits than the rest can never make replicas diverge.
     ///
-    /// Defaults (1 KiB key, 64 KiB value, 128 ops, 1 MiB total) match ech0-media#27's spec and
-    /// are provisional until benchmarked (ech0-media#36).
+    /// Defaults (1 KiB key, 64 KiB value, 128 ops, 1 MiB total) are ech0-media#27's. They are
+    /// limits on what callers may ask for rather than tuning values: ech0-media#36 measured what
+    /// depends on them (the request body limit, snapshot size and timing) and left them as they
+    /// are.
     pub kv_limits: KvLimits,
 
     /// Size, count and timing limits for `watch`/`view_and_watch` subscriptions (ech0-media#32):
@@ -205,8 +208,10 @@ pub struct EzConfig {
     /// task's internal commands never forward, so there is no second, longer budget to reuse for
     /// them - this is the one configured value both share.
     ///
-    /// Default: provisional until benchmarked (ech0-media#36); 10 seconds, matching ech0-media#15's
-    /// spec.
+    /// Default: 10 seconds (ech0-media#15). ech0-media#36 measured a leader failover at about
+    /// 5.3-6 seconds with the default heartbeat, so one deadline covers one failover with room to
+    /// spare - which is what lets a write issued during an election succeed rather than come back
+    /// `Indeterminate` (`FORK.md`, 参数定值).
     pub write_deadline: Duration,
 
     /// This node's client-facing signaling address, registered in the node registry

@@ -141,8 +141,9 @@ async fn main() -> io::Result<()> {
 
 `EzConfig` 收纳了这个节点的全部可调项。除 `cluster_token` 外都有默认值，`EzConfig::default()` 可以直接
 起步。下表列出每个字段的作用；**除了少数几个有意留白或按设计固定的字段外，具体默认数值不在本指南里重复
-——它们标在 `EzConfig` 对应字段自己的文档注释上，并且在 ech0-media#36 完成真实进程集群上的基准测试之前
-都是暂定值，正式默认值会记录进 `FORK.md`**。这样做是为了让本指南不会因为一次调参就过时。
+——它们标在 `EzConfig` 对应字段自己的文档注释上；每一项的测定方法、测得数值与取舍记录在 `FORK.md`
+「参数定值」一节（ech0-media#36 在真实进程三节点集群上实测，全部默认值维持不变）**。这样做是为了让
+本指南不会因为一次调参就过时。
 
 | 字段 | 作用 |
 | --- | --- |
@@ -232,8 +233,8 @@ async fn increment(node: &EzKv, key: &str) -> Result<u64, WriteError> {
 
 `Txn::validate(&self, limits: &KvLimits)` 在事务真正被提议*之前*检查大小与数量：`KvLimits` 有
 `max_key_bytes`、`max_value_bytes`、`max_txn_ops`（操作数的上限，同时也是条件数的上限，两者各自计数）、
-`max_txn_bytes`（事务里全部 key、value 字节数之和，涵盖 `conditions` 与 `ops` 两边）四项，通过 `EzConfig::kv_limits` 配置（默认值同样待 ech0-media#36
-实测，见上一节）。`EzKv::write`/`write_with_id` 先用**发起节点自己的**限制检查一遍（不满足就地拒绝，不
+`max_txn_bytes`（事务里全部 key、value 字节数之和，涵盖 `conditions` 与 `ops` 两边）四项，通过 `EzConfig::kv_limits` 配置（默认值见字段
+文档注释）。`EzKv::write`/`write_with_id` 先用**发起节点自己的**限制检查一遍（不满足就地拒绝，不
 发出任何请求），转发到 leader 之后 leader 还会用**自己的**限制再检查一遍——两节点配置不同时，不允许因为
 检查发生在哪个节点上而让副本产生分歧。超限返回 `WriteError::LimitExceeded(LimitError)`，`LimitError`
 的每个变体都带着具体超限的 key/大小/上限，见「错误参考表」。
@@ -510,8 +511,8 @@ impl Folded {
 
 保留窗口本身是每节点一份的内存环形缓冲，按组数和字节数两个上限截断（`EzConfig::watch_limits` 的
 `max_window_groups`/`max_window_bytes`），不进快照、不跨节点复制；每个订阅者的待投递队列长度上限是
-`subscriber_queue_len`，`Progress` 的限速间隔是 `progress_interval`——四个数值同样待 ech0-media#36
-实测，见「启动集群」一节里 `EzConfig` 那张表的说明。
+`subscriber_queue_len`，`Progress` 的限速间隔是 `progress_interval`——四个默认值经 ech0-media#36 实测
+后维持不变（小变更下先触顶的是组数上限，字节上限防的是异常大的 value），见 `FORK.md`「参数定值」。
 
 watch 是**每个节点自己的**订阅：leader 和 follower 各自的订阅者看到的是各自节点应用到的变更，不是从
 leader 单点扇出；这正是「给上游的使用约定」里「接入节点信令热路径」应当依赖本地视图与本地 watch 的原因
@@ -765,8 +766,9 @@ async fn expire_empty_room(ctx: LeaderCtx, room: &str) {
 
 `EzConfig` 里跟存活判定有关的三个字段：`liveness_threshold`（判定「静默过久」的门槛）、
 `liveness_grace`（新 leader 宽限期，必须不小于 `liveness_threshold`，否则启动即报错）、
-`liveness_check_interval`（这个任务重新评估心跳与核对成员配置的节奏）——数值同样待
-ech0-media#36 实测，见「启动集群」一节。
+`liveness_check_interval`（这个任务重新评估心跳与核对成员配置的节奏）。默认 5 秒 / 5 秒 / 1 秒：
+ech0-media#36 实测一个 follower 失联后约 5.2 秒被判 `Down`，leader 被杀后约 5.3–6 秒选出新 leader
+（默认心跳间隔下），见 `FORK.md`「参数定值」。
 
 ## 成员变更
 

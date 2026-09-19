@@ -77,7 +77,7 @@
   `install_snapshot_timeout`——此前整份快照 POST 只有 150 ms 预算）；超限在两端都是明确错误（发送端拒发并
   记日志，接收端 `413`）。openraft 的 `max_payload_entries` 改由 body 上限与 `kv_limits.max_txn_bytes` 推导
   （默认值下为 4），保证单次 `/raft/append` 不会超过上限；body 上限装不下一个最大事务时启动即报错，而不是日后
-  卡死复制。以上默认值均待 #36 实测。`Transport` 新增 `TrafficClass`（Heartbeat / Replication / Snapshot），
+  卡死复制。以上默认值经 #36 实测后维持不变。`Transport` 新增 `TrafficClass`（Heartbeat / Replication / Snapshot），
   经 openraft 的 `new_heartbeat_client` / `new_snapshot_client` 钩子各用独立 `reqwest` 连接池，心跳与
   ReadIndex 探测不会排在大快照或大批量 append 之后。测试钩子新增按流量类别的规则（`set_class` /
   `clear_class`），验收测试据此在快照被延迟数个选举超时期间断言各节点 term 不变。快照构建、发送、安装有结构化
@@ -144,7 +144,7 @@
   （`SnapshotInstalled`）时先发 Reset；`After(rev)` 指向尚未到达的 revision 时等待。`Progress` 与 `Changes`
   走同一有序队列、同一把锁，按订阅者限速，保证不会早于 revision 不大于它的 `Changes`，且 revision 停止推进后
   仍会送达。节点 `shutdown()` 后流在交付已有内容后结束（`None`），不会永久挂起。`EzConfig` 新增
-  `watch_limits`（默认 10000 组 / 64 MiB / 队列 1024 / 1 秒，待 #36 实测）。每次 Reset 有结构化 `tracing`
+  `watch_limits`（默认 10000 组 / 64 MiB / 队列 1024 / 1 秒，经 #36 实测后维持不变）。每次 Reset 有结构化 `tracing`
   日志。新增 `tests/watch.rs`、`watch_reset.rs`、`watch_progress.rs`、`watch_resume.rs`、`watch_restart.rs`。
 - [#30 任意节点写入：转发、同请求 id 重试与幂等](https://github.com/2nterdigital/ech0-media/issues/30)：
   `write(txn)` 在任意节点可用：发起节点先校验上限、分配请求 id（新增公开类型 `RequestId`，ULID），是 leader 则
@@ -209,7 +209,7 @@
   结构化 `tracing` 日志。同一任务用 `CommandBody::ReconcileRegistry` 清理已不在成员配置中的注册表条目
   （`remove_node` 两步之间 leader 崩溃留下的窗口），`apply` 依据状态机自己已应用的成员配置判定，与节点配置
   无关。`EzConfig` 新增 `liveness_threshold` / `liveness_grace` / `liveness_check_interval`（5 s / 5 s /
-  1 s，待 #36 实测）。对转发命令收到形状不符的应答时记录错误并按"无应答"处理，不再 panic（该应答来自对端）。
+  1 s，经 #36 实测后维持不变）。对转发命令收到形状不符的应答时记录错误并按"无应答"处理，不再 panic（该应答来自对端）。
   原版 `timestamp_oracle` 示例已于 #27 删除（确认）。新增 `tests/leader_task.rs`、`tests/liveness.rs`。
 - [#37 底座使用指南](https://github.com/2nterdigital/ech0-media/issues/37)：
   用新 API 重写 `docs/guide.md`（中文），**替换**原版英文指南，并同步重写 `README.md`。覆盖全部公开 API
@@ -223,6 +223,23 @@
   内存缓存层经 RPC 同步、媒体面致命错误时进程退出。**指南里的每个 Rust 代码块都是 doctest**：`src/lib.rs`
   以 `#[cfg(doctest)]` 模块 `include_str!` 整份指南，`cargo test`（或 `cargo test --doc`）会编译它们，
   API 变了而指南没跟上会直接让测试失败；该模块只在 rustdoc 收集 doctest 时存在，不进入任何构建产物。
+- [#36 基准测试与参数定值](https://github.com/2nterdigital/ech0-media/issues/36)：
+  新增真实进程三节点集群上的可重复基准测试驱动 `examples/bench.rs` + `examples/bench/`（`make bench`；
+  `Cargo.toml` 新增 `[[example]] bench`，不参与 `cargo test`），测定快照超时与体积上限、请求体上限与
+  `max_payload_entries`、幂等账本容量、watch 环形缓冲与订阅队列、存活判定阈值与宽限期、每批写入的 fsync
+  成本、ReadIndex 对 leader 的负载、HTTP/1.1 并发开连接行为共 8 项，方法、数值与取舍写入本文件「参数定值」
+  一节；`EzConfig`、`WatchLimits`、`KvLimits` 的文档注释去掉 "provisional"、改为引用测得结果。**数值全部
+  维持原样**（`snapshot_timeout` 30 s、`snapshot_max_bytes` 64 MiB、`json_body_limit` 8 MiB、
+  `ledger_capacity` 100000、`liveness_threshold` / `liveness_grace` 5 s、`liveness_check_interval` 1 s、
+  `WatchLimits` 四项）：测得结果都落在既有默认值的安全边际内，而 localhost 单机基准测不出真实网络与磁盘
+  并发，故不下调任何一项。`examples/kvstore.rs` 为此新增六个可选 CLI 覆盖（`--snapshot-interval`、
+  `--json-body-limit`、`--liveness-threshold-ms` / `--liveness-grace-ms` / `--liveness-check-interval-ms`、
+  `--log-filter`，默认值与 `EzConfig::default()` 一致）；`examples/harness.rs` 的 `Example` 新增
+  `build_release` 与 `log_path` 并派生 `Clone`；`examples/api_client.rs` 改为共享一个 `reqwest::Client`
+  （此前每次调用新建一个，基准的数万次调用会耗尽本机临时端口）。**三项设计变更建议只记录证据、未实施**，
+  留待另行决定：按字节切分 append（`PartialSuccess`）、组提交、leader 侧 ReadIndex 合并或 LeaseRead。
+  其中最需要上游留意的是**写入吞吐**：每条日志一次 `Durability::Immediate` 事务、不做组提交，本机
+  （APFS，单次 fsync 约 27 ms）整个集群的写入吞吐约 55–75 次/秒，且与并发度无关。
 - 里程碑收尾评审（对照 [spec](https://github.com/2nterdigital/ech0-media/issues/21) 与各票验收条件、对照编码规范各做一遍）
   发现并修复的问题，按所属票登记。**正确性**：(#28) openraft 把快照构建放在独立任务里、与安装并发；构建在锁外
   编码期间若 leader 发来的更新的快照先装好，构建完成后会把它覆盖成旧的，而日志已清理到新快照的位置——重启后
@@ -334,8 +351,8 @@ ezraft = { path = "../ezraft" }
 
 ## 参数定值（ech0-media#36）
 
-在真实进程三节点集群（`examples/kvstore` 示例，release 构建，本机磁盘上的真实 `RedbStorage`）上测定第 9
-阶段遗留的全部暂定默认值。测定方法与数值的机读版本见新增的基准测试驱动 `examples/bench.rs`（`make bench`，
+在真实进程三节点集群（`examples/kvstore` 示例，release 构建，本机磁盘上的真实 `RedbStorage`）上测定此前
+各票留下的全部暂定默认值。测定方法与数值的机读版本见新增的基准测试驱动 `examples/bench.rs`（`make bench`，
 或 `cargo run --release --example bench`；`cargo run --release --example bench -- --only <name>`
 单跑一个场景，用于迭代）。
 
@@ -380,6 +397,13 @@ fsync 成本，条数上限为 4 就可能成为真实瓶颈；此时应在 `Net
 节*而非按条数切分超大 append，并用 openraft 的 `AppendEntriesResponse::PartialSuccess` 应答，使小事
 务仍能按上百条打包，同时不破坏 body 上限对最坏情况的约束。本票只记录证据与方案，不改动已定设计。
 
+按字节切分还有一个与吞吐无关的理由（里程碑收尾评审发现）：`max_payload_entries` 的推导假设一条事务编码
+成 JSON 后不超过其原始字节数的 2 倍。value 的 base64（4/3 倍）加结构开销满足这个假设，但 key 是 JSON
+字符串，控制字符会被转义成 6 个字节——一批 4 条、key 几乎全由控制字符组成的最大事务可以超过
+`json_body_limit`，follower 会一直以 413 拒绝这一批。条件数与注册表条目的上限已经补上（见改动清单的评审
+条目），这一条需要刻意构造的输入才会触发，未单独处理；按字节切分后只要求「单条能装进一个请求」，该假设
+随之消失。
+
 ### 幂等账本容量（`ledger_capacity`）
 
 **方法**：每次写入无论内容都会新增一条账本记录（即使是空事务），因此以 2000 个空事务
@@ -406,9 +430,7 @@ API 无法单独拆开，见下一节），因此是偏保守的上界；按此�
 生效，字节上限主要防的是异常大 value 的场景。
 
 **决定**：`WatchLimits` 的四项默认值（1 万组 / 64 MiB / 队列 1024 / 1 秒 `Progress` 间隔）均维持不
-变。**注**：`WatchLimits::default()` 定义在 `src/watch.rs`（不在本票 `src/config.rs` 的文件所有权
-范围内），其文档注释里的 "provisional until benchmarked (ech0-media#36)" 字样未被本票清除，留给下一
-个改动该文件的人一并处理（见交付报告）。
+变。
 
 ### 存活判定阈值与宽限期（`liveness_threshold` / `liveness_grace` / `liveness_check_interval`）
 

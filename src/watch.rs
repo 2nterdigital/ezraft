@@ -100,8 +100,10 @@ pub enum ResetCause {
 
 /// Size, count and timing limits for `watch` subscriptions on one node
 ///
-/// Defaults are provisional until benchmarked (ech0-media#36), matching the shape of
-/// [`crate::KvLimits`] and configurable the same way, through [`crate::EzConfig::watch_limits`].
+/// Configurable through [`crate::EzConfig::watch_limits`]. ech0-media#36 measured these defaults
+/// (about 4 KB of memory per retained small write at most, fan-out latency flat from 1 to 100
+/// subscribers) and kept them; with small changes the group count binds long before the byte
+/// limit, which is there for unusually large values (`FORK.md`, 参数定值).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WatchLimits {
     /// Maximum number of change groups the retained window keeps. Default: 10,000.
