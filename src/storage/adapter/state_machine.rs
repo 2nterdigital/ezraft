@@ -10,6 +10,8 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use futures::StreamExt;
 use openraft::EntryPayload;
@@ -69,6 +71,15 @@ pub struct StateMachineStore {
     /// A `view()` reader clone, handed out again by [`Self::subscribe_view`]; lock-free and
     /// never touches `sm_state`.
     view_rx: ViewReceiver,
+
+    /// This node's own id, attached to the snapshot build/install tracing events (DESIGN.md §8,
+    /// ech0-media#26) - `crate::raft::EzKv::new` sets it exactly once via [`Self::set_node_id`],
+    /// right after this store is constructed, because `crate::storage::adapter::open` (and so
+    /// this constructor) runs *before* the node id is known: a restart reads it back from the
+    /// very log store `open` returns, and a join asks a seed for one. A plain constructor
+    /// argument would need that ordering reversed, which is more than this ticket's tracing-only
+    /// mandate for this file calls for.
+    node_id: Arc<OnceLock<u64>>,
 }
 
 impl Clone for StateMachineStore {
@@ -79,6 +90,7 @@ impl Clone for StateMachineStore {
             snapshot: self.snapshot.clone(),
             publisher: self.publisher.clone(),
             view_rx: self.view_rx.clone(),
+            node_id: self.node_id.clone(),
         }
     }
 }
@@ -130,6 +142,7 @@ impl StateMachineStore {
             snapshot: Arc::new(Mutex::new(snapshot)),
             publisher: Arc::new(publisher),
             view_rx,
+            node_id: Arc::new(OnceLock::new()),
         })
     }
 
@@ -137,6 +150,21 @@ impl StateMachineStore {
     /// `apply` by more than a pointer swap.
     pub(crate) fn subscribe_view(&self) -> ViewReceiver {
         self.view_rx.clone()
+    }
+
+    /// Record this node's own id, once, for the snapshot build/install tracing events
+    ///
+    /// Called exactly once, by `crate::raft::EzKv::new`, right after this store is constructed -
+    /// see the field's own doc comment for why the node id cannot be a constructor argument here.
+    /// A second call (which should never happen) is silently ignored rather than panicking: a
+    /// tracing field is not worth a node's availability.
+    pub(crate) fn set_node_id(&self, node_id: u64) {
+        let _ = self.node_id.set(node_id);
+    }
+
+    /// This node's own id, if [`Self::set_node_id`] has run yet
+    fn node_id(&self) -> Option<u64> {
+        self.node_id.get().copied()
     }
 }
 
@@ -203,17 +231,30 @@ impl RaftStateMachine<OpenRaftTypes> for StateMachineStore {
         snapshot_meta: &EzSnapshotMeta,
         snapshot_data: EzSnapshotData,
     ) -> Result<(), std::io::Error> {
+        let start = Instant::now();
+
         // Extract snapshot data
         let mut cursor = snapshot_data;
         cursor.seek(SeekFrom::Start(0))?;
         let mut data = Vec::new();
         cursor.read_to_end(&mut data)?;
+        let size_bytes = data.len();
 
         // Deserialized before anything keeps it. Bytes that do not parse - a corrupt transfer, a
         // peer of an incompatible version - are this transfer's problem, and persisting them would
         // make them every later start's problem too: [`Self::new`] reads the stored snapshot and
         // would fail on the same bytes, with the state they replaced already gone.
-        let export: KvExport = serde_json::from_slice(&data)?;
+        let export: KvExport = serde_json::from_slice(&data).inspect_err(|e| {
+            tracing::warn!(
+                node_id = ?self.node_id(),
+                last_log_id = ?snapshot_meta.last_log_id,
+                size_bytes,
+                elapsed_ms = start.elapsed().as_millis(),
+                error = %e,
+                outcome = "failed",
+                "failed to install a snapshot: invalid snapshot data",
+            );
+        })?;
         let kv = KvState::restore(export.revision, export.entries);
 
         // Update storage state
@@ -239,6 +280,15 @@ impl RaftStateMachine<OpenRaftTypes> for StateMachineStore {
             self.publisher.reset(view);
         }
 
+        tracing::info!(
+            node_id = ?self.node_id(),
+            last_log_id = ?snapshot_meta.last_log_id,
+            size_bytes,
+            elapsed_ms = start.elapsed().as_millis(),
+            outcome = "ok",
+            "installed a snapshot",
+        );
+
         Ok(())
     }
 
@@ -254,6 +304,8 @@ impl RaftSnapshotBuilder<OpenRaftTypes> for StateMachineStore {
     type SnapshotData = EzSnapshotData;
 
     async fn build_snapshot(&mut self) -> Result<EzSnapshot, std::io::Error> {
+        let start = Instant::now();
+
         // Get current state machine state and build snapshot data
         let (last_applied, last_membership, snapshot_data) = {
             let sm = self.sm_state.lock().await;
@@ -275,6 +327,15 @@ impl RaftSnapshotBuilder<OpenRaftTypes> for StateMachineStore {
             storage.persist(Persist::Snapshot(new_snapshot(&snapshot_meta, &snapshot_data))).await?;
             *cached = Some(new_snapshot(&snapshot_meta, &snapshot_data));
         }
+
+        tracing::info!(
+            node_id = ?self.node_id(),
+            last_log_id = ?last_applied,
+            size_bytes = snapshot_data.len(),
+            elapsed_ms = start.elapsed().as_millis(),
+            outcome = "ok",
+            "built a snapshot",
+        );
 
         Ok(new_snapshot(&snapshot_meta, &snapshot_data))
     }
