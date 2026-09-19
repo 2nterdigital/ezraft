@@ -313,23 +313,36 @@ mod tests {
 
     use super::*;
     use crate::command::Command;
+    use crate::command::CommandBody;
+    use crate::kv::RequestId;
     use crate::kv::Txn;
     use crate::snapshot::EzSnapshotMeta;
     use crate::type_config::EzVote;
 
     /// A log entry carrying a small, distinguishable `Txn`: a single `Put` whose value encodes
-    /// `n`, so entries built with different `n` compare unequal and are easy to tell apart.
+    /// `n`, so entries built with different `n` compare unequal and are easy to tell apart. The
+    /// request id and ledger capacity play no role in this conformance suite - a fresh id and an
+    /// arbitrary capacity are enough for a `Command` this storage layer only ever writes and
+    /// reads back byte-for-byte.
     fn log_entry(term: u64, index: u64, n: u64) -> EzEntry {
         EzEntry {
             log_id: (term, index),
-            payload: EntryPayload::Normal(Command::Txn(Txn::new().put("k", Bytes::from(n.to_le_bytes().to_vec())))),
+            payload: EntryPayload::Normal(Command {
+                request_id: RequestId::new(),
+                ledger_capacity: 100,
+                body: CommandBody::Txn(Txn::new().put("k", Bytes::from(n.to_le_bytes().to_vec()))),
+            }),
         }
     }
 
     /// The pair a caller compares an entry against: its log id and the numeric marker `log_entry`
     /// encoded into it.
     fn parts(entry: &EzEntry) -> ((u64, u64), u64) {
-        let EntryPayload::Normal(Command::Txn(txn)) = &entry.payload else {
+        let EntryPayload::Normal(Command {
+            body: CommandBody::Txn(txn),
+            ..
+        }) = &entry.payload
+        else {
             panic!("expected a Txn payload, got {:?}", entry.payload);
         };
         let [crate::kv::Op::Put { value, .. }] = txn.ops.as_slice() else {

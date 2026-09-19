@@ -46,8 +46,10 @@ bytes       = { version = "1.12.1" }
 derive_more = { version = "2.1.1", features = ["display"] }
 futures     = { version = "0.3" }
 # The KV state machine is an immutable persistent ordered map: taking a view clones the root,
-# O(1), and readers never block `apply`.
-imbl        = { version = "7.0.2" }
+# O(1), and readers never block `apply`. `serde` gives the idempotency ledger's `OrdMap` fields
+# (ech0-media#30) plain Serialize/Deserialize impls that postcard can round-trip, the same
+# discipline every other type inside the snapshot's `InternalState` block follows.
+imbl        = { version = "7.0.2", features = ["serde"] }
 # The snapshot codec (ech0-media#28): a compact positional binary format with no
 # `deserialize_any`, so every KV vocabulary type round-trips through it unmodified (see
 # `src/kv/bytes_codec.rs`). `alloc` is all `to_allocvec`/`from_bytes` need; no `derive` feature,
@@ -70,6 +72,9 @@ tokio       = { version = "1.39", default-features = false, features = ["macros"
 # the elections, write forwarding and watch resets still to come). Libraries never install a
 # subscriber.
 tracing     = { version = "0.1" }
+# `RequestId` (ech0-media#30): a ULID is a fixed-width, plain-serde-friendly idempotency key with
+# no coordination needed to generate one on whichever node a write is called on.
+ulid        = { version = "3.0.0", features = ["serde"] }
 
 [features]
 # Test-only network fault injection (ech0-media#23): drop, delay, or hide the response of

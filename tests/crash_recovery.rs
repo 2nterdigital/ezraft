@@ -227,6 +227,11 @@ impl Trial {
         &self.nodes[self.victim]
     }
 
+    /// The one voter no trial ever crashes: [`Victim`] only ever names slot 0 or slot 1
+    fn survivor(&self) -> &EzKv {
+        &self.nodes[2]
+    }
+
     /// Stop the victim and start a fresh, plain `RedbStorage` instance on the same file, at the
     /// same address - the crash-and-restart this whole ticket is about. Only valid to call once
     /// the victim has actually crashed: this does not itself do any power-loss simulation.
@@ -299,24 +304,14 @@ async fn build_trial(victim: Victim) -> io::Result<Trial> {
     })
 }
 
-/// Like `write_through_leader`, but any error - not just `NotLeader` - moves on to the next node:
-/// a crash victim that was leading fails its own callers with something other than `NotLeader`
-/// once its storage starts erroring, and the cluster must still complete the write through
-/// whichever node takes over.
-async fn write_tolerant(nodes: &[&EzKv], txn: Txn) -> io::Result<u64> {
-    let deadline = tokio::time::Instant::now() + WAIT.expect("cluster waits are bounded");
-
-    loop {
-        for node in nodes {
-            if let Ok(revision) = node.write(txn.clone()).await {
-                return Ok(revision);
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(io::Error::other("no node accepted the write within the wait budget"));
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+/// Write through the one voter no trial ever crashes
+///
+/// `write` works on any node: it forwards to whoever leads and retries under the same request id
+/// across the victim leader's crash and the election that follows, so every write here takes effect
+/// exactly once. Trying each node in turn instead would spend a whole write deadline on the crashed
+/// victim, and re-issuing the transaction elsewhere under a new request id is not exactly-once.
+async fn write_through_survivor(trial: &Trial, txn: Txn) -> io::Result<u64> {
+    trial.survivor().write(txn).await.map_err(|e| io::Error::other(e.to_string()))
 }
 
 /// This node's whole state, keyed by key - `View::prefix` already carries `create_rev`/`mod_rev`,
@@ -359,9 +354,8 @@ async fn discover_persist_range(victim: Victim, writes: &[Txn]) -> io::Result<us
 /// Wait until the victim has caught up to `trial.nodes[0]`'s log, or has crashed trying -
 /// whichever happens first.
 ///
-/// A write's `Ok` only proves *some* node (usually the leader) persisted and applied it -
-/// `EzKv::write` answers from the node it was called on, per the publish-before-reply design
-/// (DESIGN.md §5). For a follower victim, replication to it is a background process the caller of
+/// A write's `Ok` only proves the node it was called on, and a quorum, persisted and applied it.
+/// For a follower victim, replication to it is a background process the caller of
 /// `write` never waits on, so checking `is_crashed()` right after the write loop would race an
 /// armed point that has not been reached yet. `trial.nodes[0]` is always the reference: for a
 /// follower victim it is the leader that never crashes in this scenario, so its log is the true
@@ -410,7 +404,7 @@ async fn run_crash_point(victim: Victim, writes: &[Txn], point: CrashPoint) -> i
 
     let mut acknowledged: Vec<(String, Bytes, u64)> = Vec::new();
     for txn in writes {
-        let revision = write_tolerant(&trial.all(), txn.clone()).await?;
+        let revision = write_through_survivor(&trial, txn.clone()).await?;
         let (key, value) = put_kv(txn);
         acknowledged.push((key, value, revision));
     }
@@ -421,7 +415,7 @@ async fn run_crash_point(victim: Victim, writes: &[Txn], point: CrashPoint) -> i
         trial.restart_victim().await?;
 
         let tail = set("after-crash", "ok");
-        let revision = write_tolerant(&trial.all(), tail.clone()).await?;
+        let revision = write_through_survivor(&trial, tail.clone()).await?;
         let (key, value) = put_kv(&tail);
         acknowledged.push((key, value, revision));
     }
@@ -680,7 +674,7 @@ async fn run_vote_crash(when: CrashWhen, delta: usize) -> io::Result<()> {
     trial.nodes[trial.victim] = restarted;
 
     wait_for_applied(trial.victim_node(), &trial.nodes[0]).await?;
-    let revision = write_tolerant(&trial.all(), set("after-vote-crash", "ok")).await?;
+    let revision = write_through_survivor(&trial, set("after-vote-crash", "ok")).await?;
     for node in trial.all() {
         wait_for_revision(node, revision).await?;
     }

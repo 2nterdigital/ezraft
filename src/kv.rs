@@ -31,10 +31,12 @@
 //! `KvState` (crate-internal, wired into the Raft state machine by
 //! `crate::storage::adapter::state_machine`) holds the user's KV, the revision counter, and a
 //! third sibling field for foundation-internal replicated state - never part of the user key
-//! space above. It is empty today; the idempotency ledger (ech0-media#30) and the node registry
-//! (ech0-media#33) add fields to it, applied by the same `apply` call and folded into the same
-//! snapshot without a format-version bump. See `KvState`'s own docs (`src/kv/state.rs`) for
-//! exactly where.
+//! space above. Its first tenant is the idempotency ledger (ech0-media#30): [`RequestId`] -> the
+//! first real outcome recorded for it, consulted by `KvState::apply_idempotent` before a command
+//! ever reaches `KvState::apply`, evicted first-in-first-out by entry count as a pure function of
+//! the log (see `ledger`'s own module docs). The node registry (ech0-media#33) adds a
+//! further sibling field the same way. Both are folded into the same snapshot without a
+//! format-version bump.
 //!
 //! # Snapshots
 //!
@@ -54,6 +56,7 @@
 
 mod bytes_codec;
 mod change;
+mod ledger;
 mod publish;
 mod snapshot_codec;
 mod state;
@@ -62,6 +65,7 @@ mod view;
 
 pub use change::Change;
 pub use change::Changes;
+pub use ledger::RequestId;
 pub(crate) use publish::Publisher;
 pub(crate) use publish::ViewReceiver;
 pub(crate) use snapshot_codec::decode_snapshot;

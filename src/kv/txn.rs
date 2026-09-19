@@ -261,7 +261,12 @@ impl Default for KvLimits {
 ///
 /// Names the limit that was exceeded, the offending size, and the configured maximum, so a caller
 /// can report exactly what was too big without re-deriving it from the transaction itself.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+///
+/// Plain serde derives (ech0-media#30): the calling node validates a transaction against its own
+/// limits before ever sending anything, but a forwarded write is validated *again* on whichever
+/// node actually proposes it - which may be configured with different limits - so this type must
+/// be able to travel back over that RPC.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum LimitError {
     /// A condition's or op's key was empty
     #[error("key must not be empty")]
@@ -560,6 +565,21 @@ mod tests {
 
         let packed = postcard::to_allocvec(&txn).unwrap();
         assert_eq!(txn, postcard::from_bytes(&packed).unwrap());
+    }
+
+    #[test]
+    fn limit_error_serde_round_trips_in_json_and_postcard() {
+        let err = LimitError::KeyTooLarge {
+            key: "abcde".to_string(),
+            actual: 5,
+            max: 4,
+        };
+
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(err, serde_json::from_str(&json).unwrap());
+
+        let packed = postcard::to_allocvec(&err).unwrap();
+        assert_eq!(err, postcard::from_bytes(&packed).unwrap());
     }
 
     #[test]

@@ -77,6 +77,16 @@ pub struct EzKv {
     /// The limits [`crate::write`] checks a transaction against before proposing it
     kv_limits: KvLimits,
 
+    /// `EzConfig::ledger_capacity`, stamped into every command this node proposes
+    /// (ech0-media#30) - see `crate::kv::ledger`'s module docs for why `apply` never reads it
+    /// back out of a node's own configuration instead.
+    ledger_capacity: usize,
+
+    /// `EzConfig::write_deadline`, the total budget [`crate::EzKv::write`] and
+    /// [`crate::EzKv::write_with_id`] retry across leadership changes before answering
+    /// `Indeterminate` (ech0-media#30)
+    write_deadline: Duration,
+
     /// `EzConfig::json_body_limit`, for [`crate::server::bind`] (ech0-media#26)
     json_body_limit: usize,
 
@@ -113,6 +123,8 @@ impl Clone for EzKv {
             promotion: self.promotion.clone(),
             view_rx: self.view_rx.clone(),
             kv_limits: self.kv_limits,
+            ledger_capacity: self.ledger_capacity,
+            write_deadline: self.write_deadline,
             json_body_limit: self.json_body_limit,
             snapshot_max_bytes: self.snapshot_max_bytes,
             serve_handle: self.serve_handle.clone(),
@@ -231,6 +243,8 @@ impl EzKv {
         // cluster a learner that then has to be removed by hand.
         let raft_config = Arc::new(config.to_raft_config()?);
         let kv_limits = config.kv_limits;
+        let ledger_capacity = config.ledger_capacity;
+        let write_deadline = config.write_deadline;
         let json_body_limit = config.json_body_limit;
         let snapshot_max_bytes = config.snapshot_max_bytes;
         let watch_limits = config.watch_limits;
@@ -323,6 +337,11 @@ impl EzKv {
         crate::read::register_read_index_handler(&rpc, raft.clone());
         let read_index = ReadIndexCoalescer::spawn(node_id, raft.clone(), rpc.clone());
 
+        // The `ez.write` handler (ech0-media#30) is registered the same way, for the same
+        // reason: any node forwarding a write here must be answered, whether or not this node
+        // ever calls its own `write`.
+        crate::write::register_forward_handler(&rpc, raft.clone(), kv_limits, ledger_capacity);
+
         // Asking now, answered later. The leader holds the request until this node has caught up,
         // which cannot happen until `serve` is running, so the wait belongs there and not here.
         let promotion = promote_via.map(|admin| {
@@ -341,6 +360,8 @@ impl EzKv {
             promotion: Arc::new(Mutex::new(promotion)),
             view_rx,
             kv_limits,
+            ledger_capacity,
+            write_deadline,
             json_body_limit,
             snapshot_max_bytes,
             serve_handle: Arc::new(Mutex::new(None)),
@@ -354,6 +375,17 @@ impl EzKv {
     /// The limits `crate::write` checks a transaction against before proposing it
     pub(crate) fn kv_limits(&self) -> KvLimits {
         self.kv_limits
+    }
+
+    /// `EzConfig::ledger_capacity`, for `crate::write` to stamp into every command this node
+    /// proposes
+    pub(crate) fn ledger_capacity(&self) -> usize {
+        self.ledger_capacity
+    }
+
+    /// `EzConfig::write_deadline`, the total budget `crate::write`'s retry loop is bounded by
+    pub(crate) fn write_deadline(&self) -> Duration {
+        self.write_deadline
     }
 
     /// `EzConfig::json_body_limit`, for [`crate::server::bind`]

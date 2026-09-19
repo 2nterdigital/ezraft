@@ -16,10 +16,9 @@
 //! `mod_rev` on every key.
 //!
 //! Because every node holds the whole state, any node can answer a read from memory
-//! ([`EzKv::view`]) without talking to anyone. Writes take the longer path: [`EzKv::write`]
-//! proposes on the node it is called on, so it only succeeds on the current leader (a follower
-//! gets a typed [`NotLeader`] error) - forwarding a write to whichever node leads is
-//! ech0-media#30.
+//! ([`EzKv::view`]) without talking to anyone. [`EzKv::write`] works the same way: the leader
+//! proposes directly, and any other node forwards the write and retries with the same request id
+//! until either a definite outcome or a configurable deadline (ech0-media#30).
 //!
 //! A *snapshot* is the state serialized. It lets a node that has fallen too far behind be
 //! caught up in one transfer instead of replaying the log, and it lets old log entries be
@@ -73,11 +72,13 @@
 //! # Errors
 //!
 //! [`EzKv::write`] returns a typed [`WriteError`]: a limit violation, a failed condition
-//! ([`Conflict`]), or [`NotLeader`]. Every other fallible method returns [`std::io::Error`],
-//! including the ones that fail for reasons that have nothing to do with I/O - a write that
-//! finds no leader, and one issued to a stopped node, mean the same thing to a caller: try again,
-//! or ask the node the error names. [`EzStorage`] is where a user's own storage errors
-//! originate, and those are I/O errors already.
+//! ([`Conflict`]), [`WriteError::Indeterminate`] (no definite outcome within the deadline - retry
+//! with [`EzKv::write_with_id`] and the same request id), or [`WriteError::LocalLag`] (committed,
+//! but this node has not applied it yet - retry with [`EzKv::wait_revision`]). Every other
+//! fallible method returns [`std::io::Error`], including the ones that fail for reasons that have
+//! nothing to do with I/O - a write issued to a stopped node means the same thing to a caller as
+//! any other retryable failure. [`EzStorage`] is where a user's own storage errors originate, and
+//! those are I/O errors already.
 
 pub mod admin;
 mod auth;
@@ -112,6 +113,7 @@ pub use kv::KvLimits;
 pub use kv::LimitError;
 pub use kv::Op;
 pub use kv::Page;
+pub use kv::RequestId;
 pub use kv::Txn;
 pub use kv::View;
 pub use meta::EzMeta;
@@ -140,5 +142,5 @@ pub use watch::WatchLimits;
 pub use watch::WatchStart;
 pub use watch::WatchStream;
 pub use watch::WatchUpdate;
-pub use write::NotLeader;
+pub use write::LocalLag;
 pub use write::WriteError;

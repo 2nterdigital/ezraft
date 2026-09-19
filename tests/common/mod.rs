@@ -18,7 +18,6 @@ use ezraft::KeyValue;
 use ezraft::RedbStorage;
 use ezraft::Txn;
 use ezraft::View;
-use ezraft::WriteError;
 
 /// A `Put` on `key` = `value`, the shape almost every test's transaction is
 pub fn set(key: &str, value: &str) -> Txn {
@@ -109,32 +108,22 @@ pub const WAIT: Option<Duration> = Some(Duration::from_secs(30));
 /// How often a polling wait re-checks its condition
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Write `txn` through whichever of `nodes` currently leads
+/// Write `txn` on the first of `nodes` that accepts it
 ///
-/// `EzKv::write` only succeeds on the leader - forwarding is ech0-media#30 - and answers
-/// [`WriteError::NotLeader`] everywhere else, including briefly right after an election or a
-/// membership change while the new leader's lease is not yet valid (openraft alpha.33 accepts a
-/// write only under a quorum-acknowledged lease; `EzKv::write` itself already waits out that
-/// particular gap on the node that is about to lead). This is the harness's replacement for the old
-/// `/api/write`-based "write through whoever leads, whichever node that is": it retries every
-/// handle in turn until one accepts the write or the wait budget runs out.
+/// Superseded by ech0-media#30: `EzKv::write` now forwards to the leader and retries with the
+/// same request id on its own, so calling it on any one live node already suffices - callers
+/// across this suite still pass more than one handle (from when only the leader itself could
+/// accept a write), so this keeps trying the rest only as a defensive fallback if the first one
+/// given happens to error.
 pub async fn write_through_leader(nodes: &[&EzKv], txn: Txn) -> io::Result<u64> {
-    let deadline = tokio::time::Instant::now() + WAIT.expect("cluster waits are bounded");
-
-    loop {
-        for node in nodes {
-            match node.write(txn.clone()).await {
-                Ok(revision) => return Ok(revision),
-                Err(WriteError::NotLeader(_)) => continue,
-                Err(e) => return Err(io::Error::other(e.to_string())),
-            }
+    let mut last_err = None;
+    for node in nodes {
+        match node.write(txn.clone()).await {
+            Ok(revision) => return Ok(revision),
+            Err(e) => last_err = Some(io::Error::other(e.to_string())),
         }
-
-        if tokio::time::Instant::now() >= deadline {
-            return Err(io::Error::other("no node accepted the write within the wait budget"));
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
     }
+    Err(last_err.unwrap_or_else(|| io::Error::other("write_through_leader called with no nodes")))
 }
 
 /// Wait until `node`'s local view has reached at least `revision`, and return that view

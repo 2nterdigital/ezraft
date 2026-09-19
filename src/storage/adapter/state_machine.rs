@@ -29,6 +29,7 @@ use openraft::storage::RaftStateMachine;
 use tokio::sync::Mutex;
 
 use crate::command::Command;
+use crate::command::CommandBody;
 use crate::kv::KvState;
 use crate::kv::Publisher;
 use crate::kv::ViewReceiver;
@@ -205,17 +206,22 @@ impl RaftStateMachine<OpenRaftTypes> for StateMachineStore {
             sm.last_applied = Some(log_id);
 
             let resp = match entry.payload {
-                EntryPayload::Normal(Command::Txn(txn)) => {
-                    // Publish before answering the writer (ech0-media#16): only a transaction
-                    // that actually changed the view - i.e. did not conflict - has anything new
-                    // to publish. The change group moves to the publisher; the writer hears only
-                    // the revision it committed at.
-                    let outcome = sm.kv.apply(&txn).map(|changes| {
-                        let revision = changes.revision;
+                EntryPayload::Normal(Command {
+                    request_id,
+                    ledger_capacity,
+                    body: CommandBody::Txn(txn),
+                }) => {
+                    // The idempotency ledger (ech0-media#30) is consulted *inside*
+                    // `apply_idempotent`, before `txn` ever runs: a retried request id comes back
+                    // as the outcome already recorded for it, with `changes: None`. Publish before
+                    // answering the writer (ech0-media#16) only applies to a freshly executed
+                    // command - a deduplicated one changed nothing, so there is nothing new to
+                    // publish.
+                    let applied = sm.kv.apply_idempotent(request_id, ledger_capacity as usize, &txn);
+                    if let Some(changes) = applied.changes {
                         self.publisher.publish(sm.kv.view(), changes);
-                        revision
-                    });
-                    Some(outcome)
+                    }
+                    Some(applied.outcome)
                 }
                 EntryPayload::Membership(membership) => {
                     sm.membership = StoredMembership::new(Some(log_id), membership);
