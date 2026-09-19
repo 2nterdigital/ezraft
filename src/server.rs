@@ -45,17 +45,17 @@ const SNAPSHOT_FRAME_OVERHEAD_ALLOWANCE: usize = 4 * 1024;
 /// Type alias for OpenRaft types
 type C = OpenRaftTypes;
 
-/// HTTP server wrapper: `/raft/*` and the admin routes
+/// The internal port's handlers: `/raft/*`, the admin routes and inter-node RPC
 ///
-/// This is both a working server and a sample to copy: these routes are production-shaped, but
-/// an application's own routes (client writes and reads) are not this crate's to shape - see
-/// [`crate::raft::EzKv::serve_with`] to add them, and `examples/kvstore.rs` for a worked example.
-pub struct EzServer {
+/// An application's own routes (client writes and reads) are not this crate's to shape - see
+/// [`crate::raft::EzKv::serve_with`] to add some to this port, and `examples/kvstore/api.rs` for
+/// an API served on a port of its own.
+pub(crate) struct EzServer {
     raft: EzKv,
 }
 
 impl EzServer {
-    pub fn new(raft: EzKv) -> Self {
+    fn new(raft: EzKv) -> Self {
         Self { raft }
     }
 

@@ -83,7 +83,7 @@ mod cluster;
 mod command;
 pub mod config;
 pub mod entry;
-pub mod kv;
+mod kv;
 mod leader_task;
 mod liveness;
 mod membership;
@@ -94,12 +94,12 @@ pub mod raft;
 mod read;
 mod registry;
 mod rpc;
-pub mod server;
+mod server;
 pub mod snapshot;
 pub mod storage;
 mod transport;
 mod type_config;
-pub mod watch;
+mod watch;
 mod write;
 
 // Re-export public API
