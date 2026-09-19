@@ -82,6 +82,23 @@ async fn three_node_kvstore_cluster_writes_and_reads() -> io::Result<()> {
     assert_eq!("k2", prefixed[0].key);
     assert_eq!("v2b", text(&prefixed[0].value));
 
+    // Every node registered the address its own external API listens on, and the registry is
+    // replicated: any node can tell a client where to reach any other, which is what lets an
+    // application redirect a client instead of relaying for it.
+    let mut expected_addrs = vec![api_a.clone(), api_b.clone(), api_c.clone()];
+    expected_addrs.sort();
+    for api in &apis {
+        wait_for_status(api, Instant::now() + WAIT, |status| {
+            let mut addrs: Vec<String> = status["nodes"]
+                .as_array()
+                .map(|nodes| nodes.iter().filter_map(|n| n["external_addr"].as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            addrs.sort();
+            addrs == expected_addrs
+        })
+        .await?;
+    }
+
     let pids = [a.pid(), b.pid(), c.pid()];
     drop(a);
     drop(b);

@@ -20,7 +20,7 @@
 //! | `POST /tx` | a transaction (see [`TxnRequest`]) | `200` [`TxnResponse`], or an error below |
 //! | `GET /view?key=` or `?prefix=` | the local view ([`EzKv::view`]) | `200` a [`ezraft::KeyValue`] or `[ezraft::KeyValue]`, `404` if the key is absent |
 //! | `GET /linearizable?key=`/`?prefix=`/`&timeout_ms=` | [`EzKv::linearizable_view`] | same as `/view`, or an error below |
-//! | `GET /status` | [`EzKv::metrics`], [`EzKv::view`] | `200` [`StatusResponse`] |
+//! | `GET /status` | [`EzKv::cluster`], [`EzKv::registry`], [`EzKv::last_leader_contact`] | `200` [`StatusResponse`] |
 //! | `GET /watch?prefix=&after=` | [`EzKv::watch`]/[`EzKv::view_and_watch`] | `200`, newline-delimited JSON, chunked, never ends on its own |
 //!
 //! `POST /tx` errors ([`WriteError`](ezraft::WriteError), via [`write_error_response`]):
@@ -230,8 +230,7 @@ fn read_error_response(err: &ReadError) -> HttpResponse {
     }
 }
 
-/// `GET /status`: node id, leadership, revision, and - until ech0-media#33's `EzKv::cluster()`
-/// lands - an approximation of cluster membership read through [`EzKv::metrics`]
+/// What `GET /status` answers: this node, the cluster as it sees it, and the node registry
 #[derive(Serialize)]
 struct StatusResponse {
     node_id: u64,
@@ -242,26 +241,52 @@ struct StatusResponse {
     leader_id: Option<u64>,
     voters: Vec<u64>,
     learners: Vec<u64>,
+    /// Whether this node is still part of the cluster at all
+    is_member: bool,
+    /// How long ago this node last heard from the leader; `null` if it never has, `0` on the
+    /// leader itself. A node that has lost touch still answers reads from its local view, and
+    /// this is how a caller tells that those reads may be stale.
+    last_leader_contact_ms: Option<u64>,
+    /// Where clients reach every node the cluster knows of, and whether the cluster considers it
+    /// up - the node registry, which is how a client gets redirected to another node
+    nodes: Vec<NodeStatusResponse>,
 }
 
-/// `GET /status`
-async fn handle_status(node: web::Data<EzKv>) -> HttpResponse {
-    let metrics = node.metrics().await;
-    let membership = metrics.membership_config.membership();
+#[derive(Serialize)]
+struct NodeStatusResponse {
+    node_id: u64,
+    external_addr: String,
+    status: String,
+}
 
-    // WIRING POINT (ech0-media#33): once `EzKv::cluster()` exists, replace this whole handler
-    // body with a read of its `ClusterState` (role, term, leader, voters/learners, whether this
-    // node is still a member) - push-updated rather than polled through openraft's raw
-    // `RaftMetrics` the way this approximation has to, absent that ticket.
+/// `GET /status`: this node's view of the cluster, without asking anyone else
+///
+/// Everything here is local and already pushed to this node: [`EzKv::cluster`] is a watch that
+/// changes only when the cluster does, and [`EzKv::registry`] is the replicated node registry as
+/// this node has applied it.
+async fn handle_status(node: web::Data<EzKv>) -> HttpResponse {
+    let cluster = node.cluster().borrow().clone();
+
     HttpResponse::Ok().json(StatusResponse {
-        node_id: node.node_id(),
+        node_id: cluster.node_id,
         is_leader: node.is_leader(),
         revision: node.view().revision(),
-        role: format!("{:?}", metrics.state),
-        term: metrics.current_term,
-        leader_id: metrics.current_leader,
-        voters: membership.voter_ids().collect(),
-        learners: membership.learner_ids().collect(),
+        role: format!("{:?}", cluster.role),
+        term: cluster.term,
+        leader_id: cluster.current_leader,
+        voters: cluster.voters.into_iter().collect(),
+        learners: cluster.learners.into_iter().collect(),
+        is_member: cluster.is_member,
+        last_leader_contact_ms: node.last_leader_contact().map(|elapsed| elapsed.as_millis() as u64),
+        nodes: node
+            .registry()
+            .iter()
+            .map(|(node_id, info)| NodeStatusResponse {
+                node_id,
+                external_addr: info.external_addr,
+                status: format!("{:?}", info.status),
+            })
+            .collect(),
     })
 }
 

@@ -127,11 +127,10 @@ async fn main() -> io::Result<()> {
 
     let config = EzConfig {
         cluster_token: args.token.clone(),
-        // WIRING POINT (ech0-media#33): once `EzConfig` grows `external_addr` (the node registry
-        // ticket), thread `args.api_addr` through here so every node registers the address its
-        // own external API listens on - `--api-addr` is already this node's whole answer to
-        // "where do clients reach me", precisely so the registry has it to hand out.
-        // external_addr: args.api_addr.clone(),
+        // What this node registers in the cluster's node registry: `--api-addr` is its whole
+        // answer to "where do clients reach me", so any node can hand a client the address of
+        // any other (`GET /status` lists them).
+        external_addr: args.api_addr.clone(),
         ..EzConfig::default()
     };
 
