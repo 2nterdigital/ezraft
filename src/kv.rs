@@ -80,6 +80,7 @@ pub(crate) use registry::RemoveNode;
 pub(crate) use registry::SetStatus;
 pub(crate) use snapshot_codec::decode_snapshot;
 pub(crate) use snapshot_codec::encode_snapshot;
+pub(crate) use state::InternalState;
 pub(crate) use state::KvState;
 pub use txn::Condition;
 pub use txn::Conflict;

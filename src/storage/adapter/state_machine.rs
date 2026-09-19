@@ -32,9 +32,11 @@ use tokio::sync::Mutex;
 use crate::command::Command;
 use crate::command::CommandBody;
 use crate::command::CommandOutcome;
+use crate::kv::InternalState;
 use crate::kv::KvState;
 use crate::kv::Publisher;
 use crate::kv::Registry;
+use crate::kv::View;
 use crate::kv::ViewReceiver;
 use crate::kv::decode_snapshot;
 use crate::kv::encode_snapshot;
@@ -441,50 +443,87 @@ impl RaftSnapshotBuilder<OpenRaftTypes> for StateMachineStore {
     async fn build_snapshot(&mut self) -> Result<EzSnapshot, std::io::Error> {
         let start = Instant::now();
 
-        // Hold the lock only long enough to clone O(1) state: the persistent map's root
-        // (`KvState::view`), the (today empty) internal state block, `last_applied` and the
-        // membership. Encoding - O(n) over every key, and CPU work once the state is large -
-        // happens after the lock is released, off this async worker thread: `apply` and `view()`
-        // proceed at full speed while a snapshot is being encoded.
-        let (view, internal, last_applied, last_membership) = {
-            let sm = self.sm_state.lock().await;
-            (
-                sm.kv.view(),
-                sm.kv.internal_state(),
-                sm.last_applied,
-                sm.membership.clone(),
-            )
-        };
-
-        let snapshot_data = tokio::task::spawn_blocking(move || encode_snapshot(&view, &internal))
+        // Encoding - O(n) over every key, and CPU work once the state is large - happens with no
+        // lock held, off this async worker thread: `apply` and `view()` proceed at full speed
+        // while a snapshot is being encoded.
+        let SnapshotSource { view, internal, meta } = self.capture_snapshot_source().await;
+        let data = tokio::task::spawn_blocking(move || encode_snapshot(&view, &internal))
             .await
             .map_err(|e| std::io::Error::other(format!("snapshot encoding task panicked: {e}")))?
             .map_err(std::io::Error::other)?;
+        let size_bytes = data.len();
 
-        let snapshot_meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership,
-        };
-
-        // Persist before returning: openraft purges logs covered by this snapshot right after,
-        // and a durable purge point with no durable snapshot is an unrecoverable state.
-        {
-            let mut cached = self.snapshot.lock().await;
-            let mut storage = self.storage.lock().await;
-            storage.persist(Persist::Snapshot(new_snapshot(&snapshot_meta, &snapshot_data))).await?;
-            *cached = Some(new_snapshot(&snapshot_meta, &snapshot_data));
-        }
+        let stored = self.store_built_snapshot(meta, data).await?;
 
         tracing::info!(
             node_id = ?self.node_id(),
-            last_log_id = ?last_applied,
-            size_bytes = snapshot_data.len(),
+            last_log_id = ?stored.meta.last_log_id,
+            size_bytes,
             elapsed_ms = start.elapsed().as_millis(),
             outcome = "ok",
             "built a snapshot",
         );
 
-        Ok(new_snapshot(&snapshot_meta, &snapshot_data))
+        Ok(stored)
+    }
+}
+
+/// What a snapshot is built from: the state machine as of one applied log position
+struct SnapshotSource {
+    view: View,
+    internal: InternalState,
+    meta: EzSnapshotMeta,
+}
+
+impl StateMachineStore {
+    /// Capture what a snapshot is built from, holding the state machine lock only long enough
+    /// to clone O(1) state: the persistent map's root ([`KvState::view`]), the internal state
+    /// block, `last_applied` and the membership.
+    async fn capture_snapshot_source(&self) -> SnapshotSource {
+        let sm = self.sm_state.lock().await;
+        SnapshotSource {
+            view: sm.kv.view(),
+            internal: sm.kv.internal_state(),
+            meta: SnapshotMeta {
+                last_log_id: sm.last_applied,
+                last_membership: sm.membership.clone(),
+            },
+        }
+    }
+
+    /// Store a snapshot this node built, unless one at least as recent is already in place, and
+    /// return whichever is in place afterwards
+    ///
+    /// openraft runs a build in a task of its own, concurrently with everything else the state
+    /// machine does - including installing a snapshot the leader sent. That install can land
+    /// between this build capturing its source and getting here, and it is always the newer of
+    /// the two: a leader only sends a snapshot beyond what this node has committed. Storing the
+    /// built one over it would leave storage holding a snapshot *behind* the point openraft
+    /// already purged the log to on the install's behalf, and the next restart would restore
+    /// that older state and silently skip the purged entries in between.
+    ///
+    /// Persisted before returning: openraft purges the log covered by a built snapshot right
+    /// after, and a durable purge point with no durable snapshot is an unrecoverable state.
+    async fn store_built_snapshot(&self, meta: EzSnapshotMeta, data: Vec<u8>) -> Result<EzSnapshot, std::io::Error> {
+        let mut cached = self.snapshot.lock().await;
+
+        if let Some(current) = cached.as_ref()
+            && current.meta.last_log_id >= meta.last_log_id
+        {
+            tracing::info!(
+                node_id = ?self.node_id(),
+                built = ?meta.last_log_id,
+                in_place = ?current.meta.last_log_id,
+                "discarded a built snapshot: one at least as recent is already in place",
+            );
+            return Ok(new_snapshot(&current.meta, current.snapshot.get_ref()));
+        }
+
+        let mut storage = self.storage.lock().await;
+        storage.persist(Persist::Snapshot(new_snapshot(&meta, &data))).await?;
+        *cached = Some(new_snapshot(&meta, &data));
+
+        Ok(new_snapshot(&meta, &data))
     }
 }
 
@@ -576,6 +615,74 @@ mod tests {
     fn with_unsupported_version(mut bytes: Vec<u8>) -> Vec<u8> {
         bytes[4..6].copy_from_slice(&0xFFFFu16.to_le_bytes());
         bytes
+    }
+
+    /// openraft builds a snapshot in a task of its own, so an install can land between the build
+    /// capturing its source and storing its result. Run exactly that interleaving, one step at a
+    /// time: the older, built snapshot must not replace the newer, installed one - openraft has
+    /// already purged the log up to the installed one, so a restart from the older snapshot would
+    /// silently skip every entry in between.
+    #[tokio::test]
+    async fn a_snapshot_built_from_older_state_never_replaces_a_newer_installed_one() {
+        let store = SnapshotStore::default();
+        let persisted = store.snapshot.clone();
+        let (_log, mut sm) = open(store).await.unwrap();
+        sm.install_snapshot(
+            &snapshot_meta(10),
+            Cursor::new(valid_snapshot_bytes(1, &[("a", b"1", 1, 1)])),
+        )
+        .await
+        .unwrap();
+
+        // The build captures the state machine at index 10 ...
+        let SnapshotSource { view, internal, meta } = sm.capture_snapshot_source().await;
+        let built = encode_snapshot(&view, &internal).unwrap();
+
+        // ... the leader's snapshot at index 20 is installed while it is still encoding ...
+        let installed = valid_snapshot_bytes(2, &[("a", b"1", 1, 1), ("b", b"2", 2, 2)]);
+        sm.install_snapshot(&snapshot_meta(20), Cursor::new(installed.clone())).await.unwrap();
+
+        // ... and only then does the build get to store its result.
+        let in_place = sm.store_built_snapshot(meta, built).await.unwrap();
+
+        assert_eq!(
+            snapshot_meta(20),
+            in_place.meta,
+            "the build reports the snapshot that is in place"
+        );
+        assert_eq!(
+            Some((snapshot_meta(20), installed.clone())),
+            persisted.lock().unwrap().clone(),
+            "storage still holds the installed snapshot",
+        );
+        let served = sm.get_current_snapshot().await.unwrap().unwrap();
+        assert_eq!(
+            snapshot_meta(20),
+            served.meta,
+            "a lagging follower is still served the installed snapshot"
+        );
+        assert_eq!(installed, served.snapshot.into_inner());
+    }
+
+    /// The guard above must not get in the way of the ordinary case: a snapshot built from
+    /// state beyond the one in place replaces it.
+    #[tokio::test]
+    async fn a_snapshot_built_from_newer_state_replaces_the_one_in_place() {
+        let store = SnapshotStore::default();
+        let persisted = store.snapshot.clone();
+        let (_log, mut sm) = open(store).await.unwrap();
+        sm.install_snapshot(
+            &snapshot_meta(10),
+            Cursor::new(valid_snapshot_bytes(1, &[("a", b"1", 1, 1)])),
+        )
+        .await
+        .unwrap();
+
+        let newer = valid_snapshot_bytes(2, &[("a", b"1", 1, 1), ("b", b"2", 2, 2)]);
+        let in_place = sm.store_built_snapshot(snapshot_meta(11), newer.clone()).await.unwrap();
+
+        assert_eq!(snapshot_meta(11), in_place.meta);
+        assert_eq!(Some((snapshot_meta(11), newer)), persisted.lock().unwrap().clone());
     }
 
     /// A snapshot whose bytes do not decode must be refused whole. Keeping it would outlive the
