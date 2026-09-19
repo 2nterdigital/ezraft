@@ -82,6 +82,20 @@
   `clear_class`），验收测试据此在快照被延迟数个选举超时期间断言各节点 term 不变。快照构建、发送、安装有结构化
   `tracing` 日志，`tracing` 转为正式依赖。不启用 Pre-Vote（有意为之）。新增 `tests/large_snapshot.rs`、
   `tests/snapshot_limits.rs`、`tests/snapshot_fault.rs`。
+- [#29 节点间 RPC 与集群 token 鉴权](https://github.com/2nterdigital/ech0-media/issues/29)：
+  内部端口的全部路由（`/raft/*`、`/api/*`、RPC 前缀，以及经 `serve_with` 挂载的路由）要求
+  `Authorization: Bearer <集群 token>`：新增 `src/auth.rs`，一个中间件包住整个 `App`，用 `subtle` 做常数时间
+  比较，凭证缺失或错误一律 `401` 且不进入任何 handler，凭证从不写日志。`EzConfig::cluster_token` 必填
+  （为空则节点拒绝启动）；`Transport` 与 `AdminClient` 发出的每个请求都带 token，对端返回 `401` 时每个
+  对端只告警一次。新增 `src/rpc.rs` + `src/rpc/`：`kv.rpc()` 提供
+  `register::<Req, Resp>(name, handler)` 与 `call::<Req, Resp>(node_id, name, req, timeout)`——JSON、
+  内部端口固定前缀 `POST /rpc/<name>`、按节点 id 经当前成员配置寻址、公开接口不含 actix 类型；错误为
+  `Timeout` / `Unreachable` / `NotMember` / `Unauthorized` / `Remote(..)`；**不自动重试**，调用方 drop 只取消
+  本端；重名注册报错；名称前缀 `ez.` 保留给底座自身（公开 `register` 拒绝，crate 内部入口接受）；调用自身节点
+  走本地直派。RPC 使用独立连接池（`TrafficClass::Rpc`，与 #26 的三类 Raft 流量并列）。成员配置的节点类型由
+  openraft 的 `BasicNode` 换成底座自己的 `Node { internal_addr }`。`TransportError` 区分 `Timeout` 与
+  `Unreachable` 并新增 `Unauthorized`（对 openraft 的映射不变）；测试钩子里超过预算的延迟现在报告为
+  `Timeout`。新增依赖 `subtle`。新增 `tests/rpc.rs`、`tests/auth.rs`。
 
 ## 验证命令
 
