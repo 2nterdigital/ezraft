@@ -154,6 +154,14 @@ impl StateMachineStore {
         self.view_rx.clone()
     }
 
+    /// A clone of the single publisher, for `crate::watch::EzKv::watch`/`view_and_watch`
+    /// (ech0-media#32) to register subscriptions through - the same instance
+    /// [`RaftStateMachine::apply`] and [`RaftStateMachine::install_snapshot`] publish through, so
+    /// a subscription and the view it starts at are always consistent.
+    pub(crate) fn publisher(&self) -> Arc<Publisher> {
+        self.publisher.clone()
+    }
+
     /// Record this node's own id, once, for the snapshot build/install tracing events
     ///
     /// Called exactly once, by `crate::raft::EzKv::new`, right after this store is constructed -

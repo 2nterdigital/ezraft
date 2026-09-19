@@ -10,6 +10,7 @@ use openraft::Config;
 use openraft::SnapshotPolicy;
 
 use crate::kv::KvLimits;
+use crate::watch::WatchLimits;
 
 /// Configuration for EzRaft
 ///
@@ -86,6 +87,14 @@ pub struct EzConfig {
     /// are provisional until benchmarked (ech0-media#36).
     pub kv_limits: KvLimits,
 
+    /// Size, count and timing limits for `watch`/`view_and_watch` subscriptions (ech0-media#32):
+    /// the retained window's group count and byte size, each subscriber's queue length, and the
+    /// `Progress` rate limit.
+    ///
+    /// Defaults (10,000 groups, 64 MiB, a queue of 1024, a 1-second `Progress` interval) are
+    /// provisional until benchmarked (ech0-media#36).
+    pub watch_limits: WatchLimits,
+
     /// Maximum size of a JSON request body for the Raft and admin/RPC routes
     /// (`actix_web::web::JsonConfig`, ech0-media#26) - every route except `/raft/snapshot`, which
     /// carries the snapshot as a raw body instead (see [`Self::snapshot_max_bytes`]).
@@ -161,6 +170,7 @@ impl Default for EzConfig {
             snapshot_log_to_keep: None,
             replication_lag_threshold: None,
             kv_limits: KvLimits::default(),
+            watch_limits: WatchLimits::default(),
             json_body_limit: 8 * 1024 * 1024,
             snapshot_max_bytes: 64 * 1024 * 1024,
             snapshot_timeout: Duration::from_secs(30),

@@ -348,3 +348,9 @@ pub use faults::*;
 mod crash;
 #[allow(unused_imports)]
 pub use crash::*;
+
+/// Helpers for driving and asserting on `watch`/`view_and_watch` streams: see
+/// `tests/common/watch.rs`.
+mod watch;
+#[allow(unused_imports)]
+pub use watch::*;

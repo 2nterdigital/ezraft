@@ -25,6 +25,7 @@ use crate::admin::AdminClient;
 use crate::admin::MembershipChange;
 use crate::config::EzConfig;
 use crate::kv::KvLimits;
+use crate::kv::Publisher;
 use crate::kv::View;
 use crate::kv::ViewReceiver;
 use crate::network::EzNetworkFactory;
@@ -96,6 +97,11 @@ pub struct EzKv {
     /// The follower-side ReadIndex coalescer behind [`crate::read`]'s
     /// `EzKv::linearizable_view` (ech0-media#31)
     read_index: ReadIndexCoalescer,
+
+    /// The single publish source's watch side, for `crate::watch::EzKv::watch`/`view_and_watch`
+    /// (ech0-media#32) to register subscriptions through - the very instance [`Self::view`] reads
+    /// from, so a subscription and the view it starts at are always consistent.
+    watch: Arc<Publisher>,
 }
 
 impl Clone for EzKv {
@@ -113,6 +119,7 @@ impl Clone for EzKv {
             cluster_token: self.cluster_token.clone(),
             rpc: self.rpc.clone(),
             read_index: self.read_index.clone(),
+            watch: self.watch.clone(),
         }
     }
 }
@@ -226,10 +233,18 @@ impl EzKv {
         let kv_limits = config.kv_limits;
         let json_body_limit = config.json_body_limit;
         let snapshot_max_bytes = config.snapshot_max_bytes;
+        let watch_limits = config.watch_limits;
 
         // Open user storage as the two stores openraft asks for
         let (log, sm) = open(storage).await?;
         let view_rx = sm.subscribe_view();
+        let watch = sm.publisher();
+        // The watch hub is built with default limits (it exists before `EzConfig` reaches it -
+        // see `crate::kv::publish::Publisher::new`'s own doc comment); this is the one place that
+        // narrows or widens it to the node's real configuration. Safe to do here, before anything
+        // below starts this node's Raft engine: no transaction can be applied yet and no caller
+        // holds this handle yet to have registered a subscription against the old limits.
+        watch.configure_watch(watch_limits);
 
         // Determine node_id, and whether a promotion has to follow. A node that already has an id
         // has joined before, so neither the seed nor the promotion applies to it again: what it
@@ -332,6 +347,7 @@ impl EzKv {
             cluster_token,
             rpc,
             read_index,
+            watch,
         })
     }
 
@@ -541,6 +557,10 @@ impl EzKv {
     pub async fn shutdown(&self) -> Result<(), io::Error> {
         self.raft.shutdown().await.map_err(io::Error::other)?;
 
+        // Nothing will be applied again, so nothing will be published again: end every watch
+        // stream rather than leave its consumer waiting on a node that is gone.
+        self.watch.close_watch();
+
         let handle = self.serve_handle.lock().unwrap().take();
         if let Some(handle) = handle {
             handle.stop(true).await;
@@ -645,5 +665,10 @@ impl EzKv {
     /// The follower-side ReadIndex coalescer, for `crate::read::EzKv::linearizable_view`
     pub(crate) fn read_index(&self) -> &ReadIndexCoalescer {
         &self.read_index
+    }
+
+    /// The single publish source's watch side, for `crate::watch::EzKv::watch`/`view_and_watch`
+    pub(crate) fn watch_publisher(&self) -> &Publisher {
+        &self.watch
     }
 }
