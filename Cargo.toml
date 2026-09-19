@@ -12,6 +12,11 @@ license       = "MIT OR Apache-2.0"
 readme        = "README.md"
 repository    = "https://github.com/drmingdrmer/ezraft"
 
+# This is the 2nterdigital fork (see FORK.md). It keeps the crate name so the code reads like the
+# original, which is exactly why it must never reach crates.io: consumers take it as a git
+# dependency pinned to a full commit SHA on `dev`.
+publish = false
+
 # Each example keeps its end-to-end test beside it, as `<example>_test.rs`, and
 # the two tests share `harness.rs`. Auto-discovery would take all three for
 # examples and fail to build them, so every example is declared below instead.

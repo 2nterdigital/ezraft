@@ -192,19 +192,39 @@ pub fn expected_map(range: std::ops::Range<u32>) -> BTreeMap<String, String> {
 /// `ForwardToLeader`; finding the leader belongs to the server layer, and this
 /// is the path that exercises it. So any test that does not know which node
 /// leads - after a failover, a transfer, or a demotion - writes through here.
+///
+/// A write refused for want of a leader lease is retried. openraft alpha.33 accepts a write only
+/// while the leader holds a lease acknowledged by a quorum, and a leader has none for a moment
+/// after it is elected or after the voter set changes under it: it answers with a
+/// `ForwardToLeader` naming nobody, which the sample `/api/write` handler passes on as a 500.
+/// That moment ends with the next heartbeat round, so it is waited out here rather than failing
+/// whichever test happens to write during it.
 pub async fn http_write(addr: &str, req: Request) -> io::Result<Response> {
-    let resp = reqwest::Client::new()
-        .post(format!("http://{}/api/write", addr))
-        .json(&req)
-        .send()
-        .await
-        .map_err(io::Error::other)?;
+    const NO_LEASE_YET: &str = "has to forward request to: None";
 
-    let status = resp.status();
-    let text = resp.text().await.map_err(io::Error::other)?;
-    assert!(status.is_success(), "POST /api/write responded {}: {}", status, text);
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + WAIT.expect("cluster waits are bounded");
 
-    Ok(serde_json::from_str(&text)?)
+    loop {
+        let resp = client
+            .post(format!("http://{}/api/write", addr))
+            .json(&req)
+            .send()
+            .await
+            .map_err(io::Error::other)?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(io::Error::other)?;
+
+        if !status.is_success() && text.contains(NO_LEASE_YET) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+
+        assert!(status.is_success(), "POST /api/write responded {}: {}", status, text);
+
+        return Ok(serde_json::from_str(&text)?);
+    }
 }
 
 /// Serve a node in the background, which is also where a join's promotion is
