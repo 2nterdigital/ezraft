@@ -31,12 +31,40 @@ pub struct EzConfig {
     /// After this many entries since the last snapshot, the framework builds a new one -
     /// [`crate::EzStorage::persist`] receives [`crate::Persist::Snapshot`] - and the entries it
     /// covers become eligible for deletion via [`crate::Persist::DeleteLogs`]. The distance kept
-    /// before deletion is derived from this value.
+    /// before deletion is [`Self::snapshot_log_to_keep`], a separate, independently configurable
+    /// value.
     ///
     /// The default is low enough that a first demo session exercises the whole persist
     /// lifecycle, snapshot and log deletion included, instead of leaving those paths untested.
     /// Default: 500
     pub snapshot_interval: u64,
+
+    /// Log entries kept on disk even after a snapshot already covers them
+    ///
+    /// Maps to openraft's `max_in_snapshot_log_to_keep`: entries below `last_snapshot_index -
+    /// snapshot_log_to_keep` become eligible for deletion via [`crate::Persist::DeleteLogs`];
+    /// entries not yet covered by any snapshot are never purged regardless of this value. Keeping
+    /// a margin lets a follower that only lagged slightly catch up by replaying log entries
+    /// instead of installing a whole snapshot.
+    ///
+    /// `None` (the default) derives it from [`Self::snapshot_interval`] as `snapshot_interval / 5`,
+    /// openraft's own 1:5 ratio between its defaults (5000 logs since the last snapshot, 1000
+    /// kept), so changing only the interval keeps the two consistent. Provisional until
+    /// benchmarked (ech0-media#36).
+    pub snapshot_log_to_keep: Option<u64>,
+
+    /// How far behind in log replication a follower must fall before the leader switches to
+    /// sending it a whole snapshot instead of individual log entries
+    ///
+    /// Maps directly to openraft's `Config::replication_lag_threshold`. openraft's own docs note
+    /// this should be at least `snapshot_interval` (which `to_raft_config`, crate-internal,
+    /// derives `Config::snapshot_policy` from) - `EzKv::create`/`join` refuse to start a node
+    /// whose value is smaller, since a snapshot could then never catch a lagging follower up.
+    ///
+    /// `None` (the default) derives it from [`Self::snapshot_interval`] as the interval itself,
+    /// its documented minimum, so changing only the interval can never produce an inconsistent
+    /// pair. Provisional until benchmarked (ech0-media#36).
+    pub replication_lag_threshold: Option<u64>,
 
     /// The shared secret every request on the internal port must present as
     /// `Authorization: Bearer <cluster_token>` - `/raft/*`, `/api/*`, the RPC prefix, and any
@@ -129,6 +157,9 @@ impl Default for EzConfig {
             heartbeat_interval: Duration::from_millis(500),
             cluster_token: String::new(),
             snapshot_interval: 500,
+            // Both derived from `snapshot_interval` unless set: see the fields' own docs.
+            snapshot_log_to_keep: None,
+            replication_lag_threshold: None,
             kv_limits: KvLimits::default(),
             json_body_limit: 8 * 1024 * 1024,
             snapshot_max_bytes: 64 * 1024 * 1024,
@@ -146,6 +177,28 @@ impl EzConfig {
     /// Election timeout is calculated as 3x to 6x the heartbeat interval.
     pub(crate) fn to_raft_config(&self) -> Result<Config, io::Error> {
         let heartbeat_ms = self.heartbeat_interval.as_millis() as u64;
+
+        // openraft's own docs on `replication_lag_threshold` (which `snapshot_policy` below is
+        // built from `snapshot_interval` to match): "This value should be greater than
+        // snapshot_policy.SnapshotPolicy.LogsSinceLast, otherwise transmitting a snapshot may not
+        // fix the lagging." Checked here, with a message naming both configured values, rather
+        // than left to surface however openraft's own `validate()` (below) would report it - or,
+        // worse, not report it at all, since openraft's `validate()` does not actually check this
+        // combination itself.
+        let snapshot_log_to_keep = self.snapshot_log_to_keep.unwrap_or(self.snapshot_interval / 5);
+        let replication_lag_threshold = self.replication_lag_threshold.unwrap_or(self.snapshot_interval);
+
+        if replication_lag_threshold < self.snapshot_interval {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "replication_lag_threshold ({}) must be at least snapshot_interval ({}): a value \
+                     smaller than the snapshot policy's own threshold means a snapshot may never catch a \
+                     lagging follower up",
+                    replication_lag_threshold, self.snapshot_interval
+                ),
+            ));
+        }
 
         // Bound how many log entries openraft may batch into one `/raft/append` request so the
         // worst case never exceeds `json_body_limit` - see that field's own doc comment for why
@@ -174,11 +227,8 @@ impl EzConfig {
             election_timeout_min: heartbeat_ms * 3,
             election_timeout_max: heartbeat_ms * 6,
             snapshot_policy: SnapshotPolicy::LogsSinceLast(self.snapshot_interval),
-            // Keep openraft's default proportions: retain 1/5 of the interval for
-            // lagging followers, and openraft requires the lag threshold to be at
-            // least the snapshot interval or a snapshot may not fix the lag.
-            max_in_snapshot_log_to_keep: self.snapshot_interval / 5,
-            replication_lag_threshold: self.snapshot_interval,
+            max_in_snapshot_log_to_keep: snapshot_log_to_keep,
+            replication_lag_threshold,
             install_snapshot_timeout: self.snapshot_timeout.as_millis() as u64,
             max_payload_entries,
             // Pre-Vote stays off, matching openraft's own default (`enable_pre_vote: None`): a
@@ -217,5 +267,84 @@ mod tests {
 
         assert_eq!(io::ErrorKind::InvalidInput, err.kind());
         assert!(err.to_string().contains("json_body_limit"), "unexpected error: {err}");
+    }
+
+    /// The three snapshot parameters take effect: each configured value reaches openraft's
+    /// `Config` unchanged, not silently re-derived from `snapshot_interval` the way the previous,
+    /// non-configurable defaults were.
+    #[test]
+    fn the_three_snapshot_parameters_reach_the_raft_config_unchanged() {
+        let config = EzConfig {
+            snapshot_interval: 50,
+            snapshot_log_to_keep: Some(7),
+            replication_lag_threshold: Some(90),
+            ..EzConfig::default()
+        };
+
+        let raft_config = config.to_raft_config().unwrap();
+
+        assert_eq!(SnapshotPolicy::LogsSinceLast(50), raft_config.snapshot_policy);
+        assert_eq!(7, raft_config.max_in_snapshot_log_to_keep);
+        assert_eq!(90, raft_config.replication_lag_threshold);
+    }
+
+    /// Left unset, the two derived parameters follow the interval (`snapshot_interval / 5`, and the
+    /// lag threshold equal to the interval - its documented minimum), so nodes that never touch
+    /// them behave exactly as before this ticket.
+    #[test]
+    fn unset_snapshot_parameters_are_derived_from_the_interval() {
+        let raft_config = EzConfig::default().to_raft_config().unwrap();
+
+        assert_eq!(SnapshotPolicy::LogsSinceLast(500), raft_config.snapshot_policy);
+        assert_eq!(100, raft_config.max_in_snapshot_log_to_keep);
+        assert_eq!(500, raft_config.replication_lag_threshold);
+    }
+
+    /// Changing only the interval must not produce an inconsistent pair: the derived lag threshold
+    /// follows it instead of staying at the old interval and failing validation.
+    #[test]
+    fn changing_only_the_interval_keeps_the_derived_parameters_consistent() {
+        let config = EzConfig {
+            snapshot_interval: 2000,
+            ..EzConfig::default()
+        };
+
+        let raft_config = config.to_raft_config().unwrap();
+
+        assert_eq!(400, raft_config.max_in_snapshot_log_to_keep);
+        assert_eq!(2000, raft_config.replication_lag_threshold);
+    }
+
+    /// An inconsistent combination - a lag threshold below the snapshot interval, which openraft's
+    /// own docs warn may leave a snapshot unable to fix a lagging follower - is refused with a
+    /// message naming both configured values, not left to fail obscurely later.
+    #[test]
+    fn a_replication_lag_threshold_below_the_snapshot_interval_is_refused() {
+        let config = EzConfig {
+            snapshot_interval: 500,
+            replication_lag_threshold: Some(100),
+            ..EzConfig::default()
+        };
+
+        let err = config.to_raft_config().unwrap_err();
+
+        assert_eq!(io::ErrorKind::InvalidInput, err.kind());
+        assert!(
+            err.to_string().contains("replication_lag_threshold") && err.to_string().contains("snapshot_interval"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A lag threshold exactly equal to the snapshot interval is openraft's documented minimum,
+    /// not an off-by-one over it - it must be accepted, matching the defaults themselves.
+    #[test]
+    fn a_replication_lag_threshold_equal_to_the_snapshot_interval_is_accepted() {
+        let config = EzConfig {
+            snapshot_interval: 500,
+            replication_lag_threshold: Some(500),
+            ..EzConfig::default()
+        };
+
+        assert!(config.to_raft_config().is_ok());
     }
 }

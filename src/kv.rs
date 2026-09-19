@@ -29,12 +29,21 @@
 //! # Foundation-internal state
 //!
 //! `KvState` (crate-internal, wired into the Raft state machine by
-//! `crate::storage::adapter::state_machine`) holds exactly the user's KV and the revision
-//! counter today. The idempotency ledger (ech0-media#30) and the node registry (ech0-media#33)
-//! are foundation-internal replicated state - never part of the user key space above - and belong
-//! in a sibling field next to the KV inside `KvState`, applied by the same `apply` call and folded
-//! into the same snapshot (ech0-media#28). See the note on `KvState` (`src/kv/state.rs`) for
+//! `crate::storage::adapter::state_machine`) holds the user's KV, the revision counter, and a
+//! third sibling field for foundation-internal replicated state - never part of the user key
+//! space above. It is empty today; the idempotency ledger (ech0-media#30) and the node registry
+//! (ech0-media#33) add fields to it, applied by the same `apply` call and folded into the same
+//! snapshot without a format-version bump. See `KvState`'s own docs (`src/kv/state.rs`) for
 //! exactly where.
+//!
+//! # Snapshots
+//!
+//! `snapshot_codec` (crate-internal) is the postcard encoding of the whole state machine: a
+//! small header carrying a magic and a format version, checked before anything else is
+//! interpreted, ahead of the v1 body (every key, the current revision, and the internal state
+//! block above). `crate::storage::adapter::state_machine` calls it to build and install
+//! snapshots; an unknown version is a typed, explicit error that stops the node rather than
+//! guessing at a layout it does not know.
 //!
 //! # Publishing views
 //!
@@ -46,6 +55,7 @@
 mod bytes_codec;
 mod change;
 mod publish;
+mod snapshot_codec;
 mod state;
 mod txn;
 mod view;
@@ -54,6 +64,8 @@ pub use change::Change;
 pub use change::Changes;
 pub(crate) use publish::Publisher;
 pub(crate) use publish::ViewReceiver;
+pub(crate) use snapshot_codec::decode_snapshot;
+pub(crate) use snapshot_codec::encode_snapshot;
 pub(crate) use state::KvState;
 pub use txn::Condition;
 pub use txn::Conflict;

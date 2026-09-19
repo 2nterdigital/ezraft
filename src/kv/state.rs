@@ -9,6 +9,8 @@
 use std::sync::Arc;
 
 use imbl::OrdMap;
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::kv::change::Change;
 use crate::kv::change::Changes;
@@ -21,18 +23,28 @@ use crate::kv::view::StoredValue;
 use crate::kv::view::View;
 use crate::kv::view::to_key_value;
 
-/// The KV state machine: the user's key space, and the revision counter it is keyed by
+/// The foundation-internal replicated state block, next to the user's KV
+///
+/// Empty today - nothing populates or reads it yet. It exists so the idempotency ledger
+/// (ech0-media#30) and the node registry (ech0-media#33) have a fixed place to add fields to:
+/// applied by the same [`KvState::apply`] call as the user's KV, and folded into the same
+/// snapshot right next to it (`crate::kv::snapshot_codec`), without ever bumping the snapshot's
+/// format version. Plain serde derives only (no `tag`/`untagged`/`flatten`/
+/// `skip_serializing_if`/`default`): this type is embedded directly in the postcard snapshot
+/// body.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InternalState {}
+
+/// The KV state machine: the user's key space, the revision counter, and the foundation-internal
+/// state block
 ///
 /// # Where foundation-internal state goes
 ///
-/// Today this struct holds exactly the user's KV and its revision counter - nothing else shares
-/// the snapshot yet. The idempotency ledger (ech0-media#30) and the node registry
-/// (ech0-media#33) are foundation-internal replicated state: never part of the user key space in
-/// `kv` above, but applied by this same [`apply`](Self::apply) call and folded into the same
-/// snapshot (ech0-media#28). Adding one means adding a sibling field here (for example `ledger:
-/// IdempotencyLedger`), threading it through `apply` alongside `kv`, and including it in whatever
-/// `#[derive(Serialize, Deserialize)]` snapshot wrapper ech0-media#28 builds around this struct -
-/// `kv` and `revision` do not change shape to make room for it.
+/// `internal` is the foundation-internal replicated state block: never part of the user key
+/// space in `kv` above, applied by this same [`apply`](Self::apply) call, and folded into the
+/// same snapshot next to `kv` (ech0-media#28). It is empty today - the idempotency ledger
+/// (ech0-media#30) and the node registry (ech0-media#33) add fields to [`InternalState`] itself,
+/// not to `KvState`, so the snapshot's v1 layout never needs a version bump for them.
 pub(crate) struct KvState {
     /// The user's key space: `Arc<str>` keys so revisions that touch only a few keys share the
     /// rest of their key strings by pointer instead of cloning them.
@@ -40,6 +52,9 @@ pub(crate) struct KvState {
     /// The KV's own revision counter: `0` before any transaction has ever committed, incremented
     /// by exactly one on every transaction whose conditions all hold.
     revision: u64,
+    /// The foundation-internal state block - see [`InternalState`]'s own docs. Carried through
+    /// untouched by every [`apply`](Self::apply) call today, since nothing writes to it yet.
+    internal: InternalState,
 }
 
 impl KvState {
@@ -48,6 +63,7 @@ impl KvState {
         Self {
             kv: OrdMap::new(),
             revision: 0,
+            internal: InternalState::default(),
         }
     }
 
@@ -59,6 +75,16 @@ impl KvState {
     /// the view reads.
     pub(crate) fn view(&self) -> View {
         View::new(self.revision, self.kv.clone())
+    }
+
+    /// A cheap clone of the foundation-internal state block, for building a snapshot
+    ///
+    /// O(1) today, the same bound [`Self::view`] gives the user's KV: the block is empty, and
+    /// ledger/registry tickets that add fields to [`InternalState`] must keep it that way (an
+    /// `Arc`-backed persistent structure, the same discipline `kv` itself follows), so building a
+    /// snapshot never has to block `apply` to read this either.
+    pub(crate) fn internal_state(&self) -> InternalState {
+        self.internal.clone()
     }
 
     /// Evaluate `txn`'s conditions and, if they all hold, apply its ops
@@ -141,21 +167,13 @@ impl KvState {
         Ok(Changes { revision, items })
     }
 
-    /// Every entry, in key order, and the revision counter
+    /// Rebuild a state machine from a decoded snapshot's parts
     ///
-    /// The smallest crate-internal seam that lets the Raft adapter serialize this state machine
-    /// into a snapshot and rebuild it from one: ech0-media#28 replaces the encoding this feeds
-    /// (postcard, a format version), not this pair of methods. Kept tiny and obvious on purpose -
-    /// see `src/kv.rs`'s module docs.
-    pub(crate) fn export(&self) -> (u64, Vec<KeyValue>) {
-        (
-            self.revision,
-            self.kv.iter().map(|(key, stored)| to_key_value(key, stored)).collect(),
-        )
-    }
-
-    /// Rebuild a state machine from what [`Self::export`] produced
-    pub(crate) fn restore(revision: u64, entries: Vec<KeyValue>) -> Self {
+    /// The counterpart to [`Self::view`] and [`Self::internal_state`]: `crate::kv::snapshot_codec`
+    /// is what actually produces `entries` (from a view's `prefix("")`, off the state machine's
+    /// lock) and `internal`, so this is the smallest seam that lets the Raft adapter rebuild an
+    /// identical state machine from what a snapshot decode handed back.
+    pub(crate) fn restore(revision: u64, entries: Vec<KeyValue>, internal: InternalState) -> Self {
         let mut kv = OrdMap::new();
         for entry in entries {
             kv.insert(Arc::<str>::from(entry.key.as_str()), StoredValue {
@@ -164,7 +182,7 @@ impl KvState {
                 mod_rev: entry.mod_rev,
             });
         }
-        Self { kv, revision }
+        Self { kv, revision, internal }
     }
 }
 
@@ -574,14 +592,15 @@ mod tests {
     }
 
     #[test]
-    fn export_then_restore_reproduces_the_same_view() {
+    fn restoring_from_a_view_reproduces_the_same_state() {
         let mut state = KvState::new();
         state.apply(&txn().put("a", Bytes::from_static(b"1"))).unwrap();
         state.apply(&txn().put("b", Bytes::from_static(b"2"))).unwrap();
         state.apply(&txn().put("a", Bytes::from_static(b"3"))).unwrap();
 
-        let (revision, entries) = state.export();
-        let restored = KvState::restore(revision, entries);
+        let view = state.view();
+        let entries: Vec<crate::kv::KeyValue> = view.prefix("").collect();
+        let restored = KvState::restore(view.revision(), entries, state.internal_state());
 
         assert_eq!(state.view().revision(), restored.view().revision());
         let original: Vec<crate::kv::KeyValue> = state.view().prefix("").collect();
@@ -593,8 +612,8 @@ mod tests {
     }
 
     #[test]
-    fn restoring_an_empty_export_gives_an_empty_state_at_that_revision() {
-        let restored = KvState::restore(0, Vec::new());
+    fn restoring_empty_entries_gives_an_empty_state_at_that_revision() {
+        let restored = KvState::restore(0, Vec::new(), InternalState::default());
         assert_eq!(0, restored.view().revision());
         assert_eq!(0, restored.view().prefix("").count());
     }
