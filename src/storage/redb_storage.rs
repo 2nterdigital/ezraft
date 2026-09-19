@@ -287,7 +287,9 @@ where T: EzApp {
     // One range scan rather than `end - start` individual lookups, and every index in the
     // range must be there in order: a gap must be reported, not returned as a shorter log that
     // Raft would read as the end of the entries.
-    let mut logs = Vec::with_capacity((end - start) as usize);
+    // Capped: the range is the caller's to choose, and a reservation sized by an open-ended one
+    // (`0..u64::MAX`) would abort the process before a single row was read.
+    let mut logs = Vec::with_capacity(usize::try_from(end - start).unwrap_or(usize::MAX).min(4096));
     let mut next = start;
     for row in table.range(start..end).map_err(|e| wrap("scan the log table", e))? {
         let (index, bytes) = row.map_err(|e| wrap("read a log entry", e))?;
