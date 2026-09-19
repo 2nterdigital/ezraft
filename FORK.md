@@ -36,6 +36,13 @@
   `make publish_check` 由"验证可发布"改为"验证发布被拒"；GitHub 默认分支设为 `dev`。顺带修复一个基线
   flake：alpha.33 的写入要求 leader 持有 quorum 确认过的租约，换届或投票集变更后的瞬间会以不带 leader 的
   `ForwardToLeader` 拒绝写入，测试工具的 `http_write` 现在会等过这一瞬间（真正的修复是 #30 的同请求 id 重试）。
+- [#23 网络故障注入：仅测试构建的丢包、延迟、分区钩子](https://github.com/2nterdigital/ech0-media/issues/23)：
+  新增 `src/transport.rs`——节点对外发请求的唯一出口 `Transport`（知道本节点 id 与目标节点 id；区分
+  "不可达/超时"与其他错误），`src/network.rs` 改为在它之上实现 openraft 网络 trait，错误映射不变。新增仅在
+  cargo feature `fault-injection` 下存在的 `ezraft::fault::{Faults, Fault}`：按有向节点对 `Drop`、
+  `Delay`、`DropResponse`，以及 `partition`/`isolate`/`heal`；句柄按测试集群独立、经 `EzConfig::faults`
+  传入，非进程全局。feature 默认关闭，普通构建不含任何钩子代码；自身 dev-dependency 让 `cargo test` 无需
+  额外参数即可启用。新增 `tests/common/faults.rs` 与验收测试 `tests/partition.rs`。
 
 ## 验证命令
 
