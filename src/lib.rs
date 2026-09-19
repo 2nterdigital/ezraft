@@ -87,6 +87,7 @@ mod command;
 pub mod config;
 pub mod entry;
 pub mod kv;
+mod membership;
 pub mod meta;
 mod network;
 pub mod node_role;
