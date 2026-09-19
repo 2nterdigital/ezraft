@@ -119,12 +119,13 @@ pub struct EzConfig {
     /// this node will ever attempt to *send* (ech0-media#26).
     ///
     /// Exceeding it is an explicit error on both sides: the sending node refuses to start a
-    /// transfer over its own configured maximum (logged, and reported to openraft as a network
-    /// error, so replication backs off and retries rather than wedging - raising the limit is what
-    /// lets a later retry succeed); the receiving node's `/raft/snapshot` route answers a body over
-    /// its own configured maximum with `413` (`actix_web::web::PayloadConfig`) before ever
-    /// attempting to decode it. A cluster where nodes disagree on this value can have a leader
-    /// whose snapshots are too small to trip its own check but too large for a stricter follower's
+    /// transfer over its own configured maximum (logged, and reported to openraft as an
+    /// unreachable peer, so replication backs off and retries rather than wedging - raising the
+    /// limit is what lets a later retry succeed); the receiving node's `/raft/snapshot` route
+    /// answers a body over its own configured maximum with `413`
+    /// (`actix_web::web::PayloadConfig`) before ever attempting to decode it. A cluster where
+    /// nodes disagree on this value can have a leader whose snapshots are too small to trip its
+    /// own check but too large for a stricter follower's
     /// - configure it the same on every node.
     ///
     /// Default: provisional until benchmarked (ech0-media#36); 64 MiB. The snapshot design

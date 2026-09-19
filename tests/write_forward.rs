@@ -55,8 +55,13 @@ async fn a_follower_forwards_a_transaction_as_large_as_the_limits_allow() -> io:
     let limits = KvLimits::default();
     let key = |i: usize| format!("big/{i:02}");
     let puts = limits.max_txn_bytes / (limits.max_value_bytes + key(0).len());
-    assert!(puts >= 2, "the default limits admit several maximum-size values per transaction");
-    let txn = (0..puts).fold(ezraft::Txn::new(), |txn, i| txn.put(key(i), vec![0xA5u8; limits.max_value_bytes]));
+    assert!(
+        puts >= 2,
+        "the default limits admit several maximum-size values per transaction"
+    );
+    let txn = (0..puts).fold(ezraft::Txn::new(), |txn, i| {
+        txn.put(key(i), vec![0xA5u8; limits.max_value_bytes])
+    });
 
     let revision = b.write(txn).await.map_err(|e| io::Error::other(e.to_string()))?;
 

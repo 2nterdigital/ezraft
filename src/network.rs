@@ -31,7 +31,6 @@ use std::future::Future;
 
 use openraft::OptionalSend;
 use openraft::error::Infallible;
-use openraft::error::NetworkError;
 use openraft::error::RPCError;
 use openraft::error::ReplicationClosed;
 use openraft::error::StreamingError;
@@ -176,19 +175,19 @@ impl Network {
     }
 }
 
-/// What openraft hears when a request could not be delivered
+/// What openraft hears when a request could not be delivered: always `Unreachable`
 ///
-/// A peer that cannot be reached at all, one that does not answer in time, or - in test builds -
-/// one a fault dropped the request to, are all the same to openraft: "the peer could not be
-/// reached, or did not answer in time", so replication backs off instead of hammering it.
-/// `crate::rpc` keeps those two apart; the Raft path does not need to. A rejected cluster token
-/// and everything else are plain network errors.
+/// `Unreachable` is the one answer that makes openraft wait before it tries again, and waiting
+/// is right whatever went wrong - a peer that cannot be reached, one that does not answer in
+/// time, one that rejects this node's cluster token, one that refuses the request's size, or, in
+/// test builds, one a fault dropped the request to. None of those is fixed by retrying at once,
+/// and alpha.33 does exactly that on anything else: its snapshot sender backs off on
+/// `Unreachable` only, and on a `Network` or `Timeout` error resets the backoff and sends the
+/// whole snapshot again immediately, in a loop. `crate::rpc` tells these causes apart for its
+/// callers; the Raft path has no use for the distinction.
 fn to_rpc_error<Cfg>(e: &TransportError) -> RPCError<Cfg>
 where Cfg: openraft::RaftTypeConfig {
-    match e {
-        TransportError::Unreachable(_) | TransportError::Timeout(_) => RPCError::Unreachable(Unreachable::new(e)),
-        TransportError::Unauthorized(_) | TransportError::Other(_) => RPCError::Network(NetworkError::new(e)),
-    }
+    RPCError::Unreachable(Unreachable::new(e))
 }
 
 /// Implement RaftNetworkV2 for HTTP transport
@@ -210,9 +209,10 @@ impl RaftNetworkV2<C> for Network {
     ///
     /// Refuses outright, before sending anything, if `snapshot` is larger than this node's own
     /// [`EzConfig::snapshot_max_bytes`](crate::EzConfig::snapshot_max_bytes): logged, and
-    /// reported to openraft as a network error so replication backs off and retries rather than
-    /// wedging - raising the configured maximum (and this attempt eventually being retried) is
-    /// what lets a lagging node catch up.
+    /// reported to openraft as `Unreachable` - see [`to_rpc_error`] for why nothing else will do
+    /// - so replication backs off and retries rather than spinning or wedging. Raising the
+    /// configured maximum (and this attempt eventually being retried) is what lets a lagging
+    /// node catch up.
     async fn full_snapshot(
         &mut self,
         vote: VoteOf<C>,
@@ -236,7 +236,7 @@ impl RaftNetworkV2<C> for Network {
                 outcome = "refused",
                 "refusing to send a snapshot larger than the configured maximum",
             );
-            return Err(StreamingError::Network(NetworkError::from_string(format!(
+            return Err(StreamingError::Unreachable(Unreachable::from_string(format!(
                 "snapshot is {size_bytes} bytes, exceeding the configured {}-byte maximum",
                 self.snapshot_max_bytes
             ))));
@@ -247,7 +247,7 @@ impl RaftNetworkV2<C> for Network {
             meta: snapshot.meta,
         };
         let body = encode_snapshot_request(&header, &data).map_err(|e| {
-            StreamingError::Network(NetworkError::from_string(format!("encoding the snapshot header: {e}")))
+            StreamingError::Unreachable(Unreachable::from_string(format!("encoding the snapshot header: {e}")))
         })?;
 
         let start = std::time::Instant::now();
@@ -375,7 +375,10 @@ pub(crate) enum SnapshotFramingError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use openraft::Membership;
+    use openraft::Snapshot;
     use openraft::StoredMembership;
 
     use super::*;
@@ -388,6 +391,56 @@ mod tests {
                 last_membership: StoredMembership::new(None, Membership::default()),
             },
         }
+    }
+
+    /// Whatever kept a request from being delivered, openraft must hear `Unreachable`: it is
+    /// the only answer alpha.33's snapshot sender backs off on.
+    #[test]
+    fn every_transport_failure_is_reported_as_unreachable() {
+        let failures = [
+            TransportError::Unreachable("connection refused".to_string()),
+            TransportError::Timeout("no answer".to_string()),
+            TransportError::Unauthorized("rejected the cluster token".to_string()),
+            TransportError::Other("413 Payload Too Large".to_string()),
+        ];
+        for failure in failures {
+            let reported: RPCError<C> = to_rpc_error(&failure);
+            assert!(
+                matches!(reported, RPCError::Unreachable(_)),
+                "{failure} was reported as {reported}"
+            );
+        }
+    }
+
+    /// A snapshot over this node's own maximum is never sent, and is refused the same way: as
+    /// `Unreachable`, so the refusal is retried after a backoff rather than in a tight loop that
+    /// re-reads the whole snapshot each time round.
+    #[tokio::test]
+    async fn an_oversized_snapshot_is_refused_as_unreachable() {
+        let transport = Transport::new(1, "test-token").unwrap();
+        let node = Node {
+            internal_addr: "127.0.0.1:1".to_string(),
+        };
+        let mut network = EzNetworkFactory::new(transport, 8).build(2, &node, TrafficClass::Snapshot);
+
+        let snapshot = Snapshot {
+            meta: header().meta,
+            snapshot: std::io::Cursor::new(vec![0u8; 9]),
+        };
+        let refused = network
+            .full_snapshot(
+                EzVote::new(1, 1),
+                snapshot,
+                std::future::pending(),
+                RPCOption::new(Duration::from_secs(1)),
+            )
+            .await
+            .expect_err("nine bytes exceed an eight-byte maximum");
+
+        assert!(
+            matches!(refused, StreamingError::Unreachable(_)),
+            "refused as {refused}"
+        );
     }
 
     #[test]
