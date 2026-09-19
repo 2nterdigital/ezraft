@@ -187,6 +187,14 @@ impl Transport {
         Resp: Serialize + DeserializeOwned,
         Err: std::error::Error + Serialize + DeserializeOwned,
     {
+        // Additive, test-only round counting (ech0-media#31): recorded before any fault check,
+        // so a coalescing guarantee like "at most N rounds" can be verified against every
+        // attempt this node actually made, whatever a fault rule then did with it.
+        #[cfg(feature = "fault-injection")]
+        if let Some(faults) = &self.faults {
+            faults.record_request(self.from, target, class, &path.to_string());
+        }
+
         #[cfg(feature = "fault-injection")]
         if let Some(fault) = self.fault_for(target, class) {
             return self

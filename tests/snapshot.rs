@@ -17,7 +17,6 @@ use common::*;
 use ezraft::EzConfig;
 use ezraft::EzKv;
 use ezraft::EzStorage;
-use ezraft::ReadPolicy;
 
 /// A snapshot must land on disk when built, and a restarted node must rebuild
 /// the full state from that snapshot plus the log entries after it - values and revision alike.
@@ -72,7 +71,10 @@ async fn snapshot_survives_restart() -> io::Result<()> {
 
     // After the linearizable barrier, a local read must serve every write acknowledged before
     // the shutdown, and the KV's own revision counter must have survived the round trip too.
-    restarted.linearizable(ReadPolicy::ReadIndex).await?;
+    restarted
+        .linearizable_view(WAIT.expect("cluster waits are bounded"))
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?;
     assert_eq!(revision_before_restart, restarted.view().revision());
     assert_eq!(expected_map(0..15), view_map(&restarted.view()));
 
