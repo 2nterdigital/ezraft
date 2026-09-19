@@ -21,9 +21,10 @@ use openraft::async_runtime::WatchReceiver;
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::Attempt;
-use super::RetryReason;
-use super::propose;
+use super::propose::Attempt;
+use super::propose::ProposeOutcome;
+use super::propose::RetryReason;
+use super::propose::propose;
 use crate::command::CommandBody;
 use crate::command::CommandOutcome;
 use crate::kv::KvLimits;
@@ -84,12 +85,12 @@ pub(super) fn register(rpc: &Rpc, raft: ORRaft, kv_limits: KvLimits, ledger_capa
 async fn handle(raft: &ORRaft, kv_limits: KvLimits, ledger_capacity: usize, req: ForwardRequest) -> ForwardReply {
     match propose(raft, kv_limits, ledger_capacity, req.request_id, None, req.body).await {
         Err(limit_err) => ForwardReply::LimitExceeded(limit_err),
-        Ok(super::ProposeOutcome::Definite(outcome)) => ForwardReply::Outcome(outcome),
-        Ok(super::ProposeOutcome::NotLeader { leader_id }) => ForwardReply::NotLeader { leader_id },
+        Ok(ProposeOutcome::Definite(outcome)) => ForwardReply::Outcome(outcome),
+        Ok(ProposeOutcome::NotLeader { leader_id }) => ForwardReply::NotLeader { leader_id },
         // This node cannot vouch for anything right now (for instance its own engine shutting
         // down mid-propose): the honest answer is "ask someone else", exactly like naming no
         // leader at all.
-        Ok(super::ProposeOutcome::Unknown) => ForwardReply::NotLeader { leader_id: None },
+        Ok(ProposeOutcome::Unknown) => ForwardReply::NotLeader { leader_id: None },
     }
 }
 
