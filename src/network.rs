@@ -44,7 +44,6 @@ use openraft::type_config::alias::VoteOf;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::app::EzApp;
 use crate::snapshot::EzSnapshotData;
 use crate::snapshot::EzSnapshotMeta;
 use crate::transport::Transport;
@@ -53,7 +52,7 @@ use crate::type_config::EzVote;
 use crate::type_config::OpenRaftTypes;
 
 /// Type alias for OpenRaft types
-type C<T> = OpenRaftTypes<T>;
+type C = OpenRaftTypes;
 
 /// HTTP network factory
 ///
@@ -80,9 +79,7 @@ impl EzNetworkFactory {
     }
 }
 
-impl<T> RaftNetworkFactory<C<T>> for EzNetworkFactory
-where T: EzApp
-{
+impl RaftNetworkFactory<C> for EzNetworkFactory {
     type Network = Network;
 
     async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
@@ -132,17 +129,15 @@ impl Network {
 }
 
 /// Implement RaftNetworkV2 for HTTP transport
-impl<T> RaftNetworkV2<C<T>> for Network
-where T: EzApp
-{
+impl RaftNetworkV2<C> for Network {
     type SnapshotData = EzSnapshotData;
 
     async fn append_entries(
         &mut self,
-        req: AppendEntriesRequest<C<T>>,
+        req: AppendEntriesRequest<C>,
         option: RPCOption,
-    ) -> Result<AppendEntriesResponse<C<T>>, RPCError<C<T>>> {
-        let res = self.request::<_, _, Infallible, C<T>>("raft/append", req, &option).await?;
+    ) -> Result<AppendEntriesResponse<C>, RPCError<C>> {
+        let res = self.request::<_, _, Infallible, C>("raft/append", req, &option).await?;
         Ok(res.unwrap())
     }
 
@@ -150,11 +145,11 @@ where T: EzApp
     /// [`Raft::install_full_snapshot`](openraft::Raft::install_full_snapshot).
     async fn full_snapshot(
         &mut self,
-        vote: VoteOf<C<T>>,
-        snapshot: SnapshotOf<C<T>, Self::SnapshotData>,
+        vote: VoteOf<C>,
+        snapshot: SnapshotOf<C, Self::SnapshotData>,
         cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
-    ) -> Result<SnapshotResponse<C<T>>, StreamingError<C<T>>> {
+    ) -> Result<SnapshotResponse<C>, StreamingError<C>> {
         let req = SnapshotTransfer {
             vote,
             meta: snapshot.meta,
@@ -164,12 +159,12 @@ where T: EzApp
 
         tokio::select! {
             closed = &mut cancel => Err(StreamingError::Closed(closed)),
-            res = self.request::<_, _, Infallible, C<T>>("raft/snapshot", req, &option) => Ok(res?.unwrap()),
+            res = self.request::<_, _, Infallible, C>("raft/snapshot", req, &option) => Ok(res?.unwrap()),
         }
     }
 
-    async fn vote(&mut self, req: VoteRequest<C<T>>, option: RPCOption) -> Result<VoteResponse<C<T>>, RPCError<C<T>>> {
-        let res = self.request::<_, _, Infallible, C<T>>("raft/vote", req, &option).await?;
+    async fn vote(&mut self, req: VoteRequest<C>, option: RPCOption) -> Result<VoteResponse<C>, RPCError<C>> {
+        let res = self.request::<_, _, Infallible, C>("raft/vote", req, &option).await?;
         Ok(res.unwrap())
     }
 
@@ -181,10 +176,10 @@ where T: EzApp
     /// promptly instead of leaving it to time out and elect.
     async fn transfer_leader(
         &mut self,
-        req: TransferLeaderRequest<C<T>>,
+        req: TransferLeaderRequest<C>,
         option: RPCOption,
-    ) -> Result<TransferLeaderResponse<C<T>>, RPCError<C<T>>> {
-        let res = self.request::<_, _, Infallible, C<T>>("raft/transfer_leader", req, &option).await?;
+    ) -> Result<TransferLeaderResponse<C>, RPCError<C>> {
+        let res = self.request::<_, _, Infallible, C>("raft/transfer_leader", req, &option).await?;
         Ok(res.unwrap())
     }
 }

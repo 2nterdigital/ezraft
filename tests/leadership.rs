@@ -1,7 +1,7 @@
 //! Which node leads, and what moves leadership: demotion, an explicit transfer,
 //! and removal
 //!
-//! Every test drives EzRaft through its public API and real HTTP between nodes.
+//! Every test drives `EzKv` through its public API and real HTTP between nodes.
 
 mod common;
 
@@ -16,9 +16,9 @@ use common::*;
 /// them - and because the cluster must still be correct that way.
 #[tokio::test(flavor = "multi_thread")]
 async fn demoted_leader_keeps_leading_outside_the_quorum() -> io::Result<()> {
-    let (addr_a, a) = founding_node().await?;
-    let (addr_b, b) = joined_voter(&addr_a).await?;
-    let (_, c) = joined_voter(&addr_a).await?;
+    let (_, a, _data_a) = founding_node().await?;
+    let (_, b, _data_b) = joined_voter(a.addr()).await?;
+    let (_, c, _data_c) = joined_voter(a.addr()).await?;
 
     let all = BTreeSet::from([0, b.node_id(), c.node_id()]);
     wait_for_voters(&a, all, "every joined node is a voter").await?;
@@ -37,7 +37,7 @@ async fn demoted_leader_keeps_leading_outside_the_quorum() -> io::Result<()> {
     // Still leading, and still committing - on a quorum of the two voters,
     // which it is not part of.
     assert!(a.is_leader());
-    assert_eq!(Response { value: None }, http_write(&addr_a, set("k1", "v1")).await?);
+    assert_eq!(1, write_through_leader(&[&a], set("k1", "v1")).await?);
 
     // And when it does go, the voters elect one of their own.
     a.shutdown().await?;
@@ -47,7 +47,7 @@ async fn demoted_leader_keeps_leading_outside_the_quorum() -> io::Result<()> {
         "a voter takes over from the demoted leader",
     )
     .await?;
-    assert_eq!(Response { value: None }, http_write(&addr_b, set("k2", "v2")).await?);
+    assert_eq!(2, write_through_leader(&[&b, &c], set("k2", "v2")).await?);
 
     Ok(())
 }
@@ -61,9 +61,9 @@ async fn demoted_leader_keeps_leading_outside_the_quorum() -> io::Result<()> {
 /// up - can lose the race to a plain election timeout on another voter.
 #[tokio::test(flavor = "multi_thread")]
 async fn leadership_transfers_to_the_named_node() -> io::Result<()> {
-    let (addr_a, a) = founding_node().await?;
-    let (_, b) = joined_voter(&addr_a).await?;
-    let (addr_c, c) = joined_voter(&addr_a).await?;
+    let (addr_a, a, _data_a) = founding_node().await?;
+    let (_, b, _data_b) = joined_voter(&addr_a).await?;
+    let (_, c, _data_c) = joined_voter(&addr_a).await?;
 
     let all = BTreeSet::from([0, b.node_id(), c.node_id()]);
     wait_for_voters(&a, all, "every joined node is a voter").await?;
@@ -80,7 +80,7 @@ async fn leadership_transfers_to_the_named_node() -> io::Result<()> {
     )
     .await?;
 
-    assert_eq!(Response { value: None }, http_write(&addr_c, set("k1", "v1")).await?);
+    assert_eq!(1, write_through_leader(&[&c], set("k1", "v1")).await?);
 
     Ok(())
 }
@@ -89,9 +89,9 @@ async fn leadership_transfers_to_the_named_node() -> io::Result<()> {
 /// once it is out of the membership entirely, and the voters left carry on.
 #[tokio::test(flavor = "multi_thread")]
 async fn removed_leader_hands_over_leadership() -> io::Result<()> {
-    let (addr_a, a) = founding_node().await?;
-    let (addr_b, b) = joined_voter(&addr_a).await?;
-    let (_, c) = joined_voter(&addr_a).await?;
+    let (_, a, _data_a) = founding_node().await?;
+    let (_, b, _data_b) = joined_voter(a.addr()).await?;
+    let (_, c, _data_c) = joined_voter(a.addr()).await?;
 
     let all = BTreeSet::from([0, b.node_id(), c.node_id()]);
     wait_for_voters(&a, all, "every joined node is a voter").await?;
@@ -116,7 +116,7 @@ async fn removed_leader_hands_over_leadership() -> io::Result<()> {
         membership.nodes().map(|(id, _)| *id).collect::<Vec<_>>()
     );
 
-    assert_eq!(Response { value: None }, http_write(&addr_b, set("k1", "v1")).await?);
+    assert_eq!(1, write_through_leader(&[&b, &c], set("k1", "v1")).await?);
 
     Ok(())
 }

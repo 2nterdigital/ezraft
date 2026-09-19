@@ -1,24 +1,25 @@
-//! EzRaft - A beginner-friendly Raft framework built on openraft
+//! EzRaft - the foundation (底座) ech0-media builds on
 //!
-//! EzRaft runs your application on several machines at once and keeps their state identical, so
-//! the service survives losing some of them. You write two things - everything that makes the
-//! machines agree is handled internally:
+//! EzRaft runs a replicated key-value store on several machines at once and keeps their state
+//! identical, so the service survives losing some of them. You write one thing - everything that
+//! makes the machines agree is handled internally:
 //!
-//! - The application via [`EzApp`]: request/response types, state, and business logic
 //! - Storage persistence via [`EzStorage`]
 //!
 //! # What a cluster does
 //!
-//! A *cluster* is a set of *nodes*, each one a process running your application. Every node
-//! keeps the same list of requests - the *log* - in the same order. A request is *committed*
-//! once a majority of the nodes have stored it, which is the point at which it can no longer be
-//! lost. Each node then *applies* committed requests to its own copy of your state, in log
-//! order, so every node arrives at the same state. [`EzApp::apply`] is that step.
+//! A *cluster* is a set of *nodes*, each one a process running this crate. Every node keeps the
+//! same list of transactions - the *log* - in the same order. A transaction is *committed* once a
+//! majority of the nodes have stored it, which is the point at which it can no longer be lost.
+//! Each node then *applies* committed transactions to its own copy of the KV, in log order, so
+//! every node arrives at the same state, with the same `revision` and the same `create_rev`/
+//! `mod_rev` on every key.
 //!
 //! Because every node holds the whole state, any node can answer a read from memory
-//! ([`EzRaft::read`]) without talking to anyone. Writes take the longer path: they go through
-//! one node elected *leader*. [`EzRaft::write`] writes on the node it is called on, so a client
-//! that does not know which node leads goes through `POST /api/write`, which forwards.
+//! ([`EzKv::view`]) without talking to anyone. Writes take the longer path: [`EzKv::write`]
+//! proposes on the node it is called on, so it only succeeds on the current leader (a follower
+//! gets a typed [`NotLeader`] error) - forwarding a write to whichever node leads is
+//! ech0-media#30.
 //!
 //! A *snapshot* is the state serialized. It lets a node that has fallen too far behind be
 //! caught up in one transfer instead of replaying the log, and it lets old log entries be
@@ -33,101 +34,46 @@
 //! with `cargo run --example kvstore` to get a cluster going.
 //!
 //! ```no_run
-//! use std::collections::BTreeMap;
 //! use std::io;
 //!
-//! use async_trait::async_trait;
-//! use ezraft::EzApp;
 //! use ezraft::EzConfig;
-//! use ezraft::EzRaft;
+//! use ezraft::EzKv;
 //! use ezraft::RedbStorage;
-//! use serde::Deserialize;
-//! use serde::Serialize;
-//!
-//! // 1. What a client asks the cluster to do. It travels the network and goes into
-//! //    the log, hence serde; openraft prints it in its logs, hence Display.
-//! #[derive(Serialize, Deserialize, Debug, Clone, derive_more::Display)]
-//! enum Request {
-//!     #[display("Set({key})")]
-//!     Set { key: String, value: String },
-//! }
-//!
-//! // 2. What `apply` hands back to whoever issued the write.
-//! #[derive(Serialize, Deserialize, Debug, Clone)]
-//! struct Response {
-//!     value: Option<String>,
-//! }
-//!
-//! // 3. The application *is* the replicated state. A snapshot is this struct
-//! //    serialized, so serde is all it takes.
-//! #[derive(Default, Serialize, Deserialize)]
-//! struct KvApp {
-//!     data: BTreeMap<String, String>,
-//! }
-//!
-//! #[async_trait]
-//! impl EzApp for KvApp {
-//!     type Request = Request;
-//!     type Response = Response;
-//!
-//!     // Called once per committed entry, in log order, on every node.
-//!     async fn apply(&mut self, req: Request) -> Response {
-//!         match req {
-//!             Request::Set { key, value } => Response {
-//!                 value: self.data.insert(key, value),
-//!             },
-//!         }
-//!     }
-//!
-//!     type ReadRequest = String;
-//!     type ReadResponse = Option<String>;
-//!
-//!     // Answers `POST /api/read` from local state. A read never enters the
-//!     // log, so its request type is the app's own to shape.
-//!     fn read(&self, key: String) -> Option<String> {
-//!         self.data.get(&key).cloned()
-//!     }
-//! }
+//! use ezraft::Txn;
 //!
 //! #[tokio::main]
 //! async fn main() -> io::Result<()> {
-//!     // 4. Where this node's state goes. One redb file per node. `RedbStorage`
+//!     // 1. Where this node's state goes. One redb file per node. `RedbStorage`
 //!     //    is the production `EzStorage` this crate ships.
 //!     let storage = RedbStorage::open("./data/node1.redb").await?;
 //!
-//!     // 5. The first node of a cluster creates it; every other node joins
+//!     // 2. The first node of a cluster creates it; every other node joins
 //!     //    through any node already in it:
-//!     //      EzRaft::join("127.0.0.1:8081", "127.0.0.1:8080", app, storage, config)
-//!     let raft = EzRaft::create("127.0.0.1:8080", KvApp::default(), storage, EzConfig::default()).await?;
+//!     //      EzKv::join("127.0.0.1:8081", "127.0.0.1:8080", storage, config)
+//!     let node = EzKv::create("127.0.0.1:8080", storage, EzConfig::default()).await?;
 //!
-//!     raft.write(Request::Set {
-//!         key: "hello".to_string(),
-//!         value: "world".to_string(),
-//!     })
-//!     .await?;
-//!     println!("{:?}", raft.read(|app| app.data.get("hello").cloned()).await?);
+//!     // 3. Write a key, then read it back from this node's own local view - no
+//!     //    consensus round for the read, and it already reflects the write.
+//!     node.write(Txn::new().put("hello", "world")).await.map_err(io::Error::other)?;
+//!     println!("{:?}", node.view().get("hello"));
 //!
-//!     // 6. Serve the Raft RPCs peers need, plus the app API. This blocks;
+//!     // 4. Serve the Raft RPCs peers need, plus the admin API. This blocks;
 //!     //    `tokio::spawn` it when the caller has other work to do.
-//!     raft.serve().await
+//!     node.serve().await
 //! }
 //! ```
 //!
 //! # Errors
 //!
-//! Every fallible method returns [`std::io::Error`], including the ones that fail for reasons
-//! that have nothing to do with I/O. This is deliberate: a caller cannot usefully branch on the
-//! difference. A write that finds no leader, one that arrived at a follower, and one issued to
-//! a stopped node all mean the same thing to an application -- try again, or ask the node that
-//! the error names.
-//!
-//! [`EzStorage`] is where a user's own errors originate, and those are I/O errors already, so a
-//! second error type would buy nothing and cost a concept. Code that does need to tell the cases
-//! apart can reach the underlying openraft node and its typed errors through
-//! [`EzRaft::inner`](raft::EzRaft::inner).
+//! [`EzKv::write`] returns a typed [`WriteError`]: a limit violation, a failed condition
+//! ([`Conflict`]), or [`NotLeader`]. Every other fallible method returns [`std::io::Error`],
+//! including the ones that fail for reasons that have nothing to do with I/O - a write that
+//! finds no leader, and one issued to a stopped node, mean the same thing to a caller: try again,
+//! or ask the node the error names. [`EzStorage`] is where a user's own storage errors
+//! originate, and those are I/O errors already.
 
 pub mod admin;
-pub mod app;
+mod command;
 pub mod config;
 pub mod entry;
 pub mod kv;
@@ -140,19 +86,30 @@ pub mod snapshot;
 pub mod storage;
 mod transport;
 mod type_config;
+mod write;
 
 // Re-export public API
-pub use app::EzApp;
 pub use config::EzConfig;
 pub use entry::EzEntry;
 pub use entry::EzLogId;
+pub use kv::Change;
+pub use kv::Changes;
+pub use kv::Condition;
+pub use kv::Conflict;
+pub use kv::KeyValue;
+pub use kv::KvLimits;
+pub use kv::LimitError;
+pub use kv::Op;
+pub use kv::Page;
+pub use kv::Txn;
+pub use kv::View;
 pub use meta::EzMeta;
 pub use node_role::NodeRole;
 pub use openraft::RaftMetrics;
 pub use openraft::RaftTypeConfig;
 pub use openraft::ReadPolicy;
 pub use openraft::ServerState;
-pub use raft::EzRaft;
+pub use raft::EzKv;
 pub use snapshot::EzSnapshot;
 pub use snapshot::EzSnapshotMeta;
 pub use storage::EzStorage;
@@ -163,3 +120,5 @@ pub use storage::RedbStorage;
 pub use transport::fault;
 pub use type_config::EzVote;
 pub use type_config::OpenRaftTypes;
+pub use write::NotLeader;
+pub use write::WriteError;

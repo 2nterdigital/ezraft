@@ -19,7 +19,6 @@ use redb::ReadableDatabase;
 use redb::TableDefinition;
 use redb::TableError;
 
-use crate::app::EzApp;
 use crate::entry::EzEntry;
 use crate::meta::EzMeta;
 use crate::snapshot::EzSnapshot;
@@ -102,7 +101,7 @@ impl RedbStorage {
     /// # Reopening after a restart in the same process
     ///
     /// openraft's own state machine worker owns the last handle to a node's storage and drops
-    /// it - releasing redb's file lock - only *after* [`crate::EzRaft::shutdown`] returns,
+    /// it - releasing redb's file lock - only *after* [`crate::EzKv::shutdown`] returns,
     /// asynchronously, once that worker task is next scheduled. A caller that shuts a node down,
     /// drops it and immediately reopens the same path in the same process (exactly what an
     /// in-process restart test does; a real process restart never hits this, since exiting the
@@ -142,20 +141,18 @@ impl RedbStorage {
 }
 
 #[async_trait]
-impl<T> EzStorage<T> for RedbStorage
-where T: EzApp
-{
+impl EzStorage for RedbStorage {
     async fn load(&mut self) -> Result<Loaded, io::Error> {
         let db = self.db.clone();
         blocking(move || load_blocking(&db)).await
     }
 
-    async fn persist(&mut self, op: Persist<T>) -> Result<(), io::Error> {
+    async fn persist(&mut self, op: Persist) -> Result<(), io::Error> {
         let db = self.db.clone();
         blocking(move || persist_blocking(&db, op)).await
     }
 
-    async fn read_logs(&mut self, start: u64, end: u64) -> Result<Vec<EzEntry<T>>, io::Error> {
+    async fn read_logs(&mut self, start: u64, end: u64) -> Result<Vec<EzEntry>, io::Error> {
         let db = self.db.clone();
         blocking(move || read_logs_blocking(&db, start, end)).await
     }
@@ -226,8 +223,7 @@ fn load_blocking(db: &Database) -> Result<Loaded, io::Error> {
 }
 
 /// [`EzStorage::persist`], off the async runtime
-fn persist_blocking<T>(db: &Database, op: Persist<T>) -> Result<(), io::Error>
-where T: EzApp {
+fn persist_blocking(db: &Database, op: Persist) -> Result<(), io::Error> {
     let mut txn = db.begin_write().map_err(|e| wrap("begin a write transaction", e))?;
 
     // Already redb's default for a fresh transaction; set explicitly so this durability
@@ -271,8 +267,7 @@ where T: EzApp {
 }
 
 /// [`EzStorage::read_logs`], off the async runtime
-fn read_logs_blocking<T>(db: &Database, start: u64, end: u64) -> Result<Vec<EzEntry<T>>, io::Error>
-where T: EzApp {
+fn read_logs_blocking(db: &Database, start: u64, end: u64) -> Result<Vec<EzEntry>, io::Error> {
     if start >= end {
         return Ok(Vec::new());
     }
@@ -309,54 +304,39 @@ where T: EzApp {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use openraft::EntryPayload;
     use openraft::LogId;
     use openraft::Membership;
     use openraft::StoredMembership;
-    use serde::Deserialize;
-    use serde::Serialize;
     use tempfile::tempdir;
 
     use super::*;
+    use crate::command::Command;
+    use crate::kv::Txn;
     use crate::snapshot::EzSnapshotMeta;
     use crate::type_config::EzVote;
 
-    #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-    struct Counter {
-        count: u64,
-    }
-
-    #[async_trait]
-    impl EzApp for Counter {
-        type Request = u64;
-        type Response = u64;
-
-        async fn apply(&mut self, req: u64) -> u64 {
-            self.count += req;
-            self.count
-        }
-
-        type ReadRequest = ();
-        type ReadResponse = u64;
-
-        fn read(&self, _req: ()) -> u64 {
-            self.count
-        }
-    }
-
-    fn log_entry(term: u64, index: u64, request: u64) -> EzEntry<Counter> {
+    /// A log entry carrying a small, distinguishable `Txn`: a single `Put` whose value encodes
+    /// `n`, so entries built with different `n` compare unequal and are easy to tell apart.
+    fn log_entry(term: u64, index: u64, n: u64) -> EzEntry {
         EzEntry {
             log_id: (term, index),
-            payload: EntryPayload::Normal(request),
+            payload: EntryPayload::Normal(Command::Txn(Txn::new().put("k", Bytes::from(n.to_le_bytes().to_vec())))),
         }
     }
 
-    /// The pair a caller compares an entry against: its log id and the request it carries
-    fn parts(entry: &EzEntry<Counter>) -> ((u64, u64), u64) {
-        let EntryPayload::Normal(request) = &entry.payload else {
-            panic!("expected a normal payload, got {:?}", entry.payload);
+    /// The pair a caller compares an entry against: its log id and the numeric marker `log_entry`
+    /// encoded into it.
+    fn parts(entry: &EzEntry) -> ((u64, u64), u64) {
+        let EntryPayload::Normal(Command::Txn(txn)) = &entry.payload else {
+            panic!("expected a Txn payload, got {:?}", entry.payload);
         };
-        (entry.log_id, *request)
+        let [crate::kv::Op::Put { value, .. }] = txn.ops.as_slice() else {
+            panic!("expected exactly one Put op, got {:?}", txn.ops);
+        };
+        let n = u64::from_le_bytes(value.as_ref().try_into().expect("8-byte marker"));
+        (entry.log_id, n)
     }
 
     fn snapshot(index: u64, data: &[u8]) -> EzSnapshot {
@@ -376,7 +356,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut storage = RedbStorage::open(dir.path().join("node.redb")).await.unwrap();
 
-        let loaded = EzStorage::<Counter>::load(&mut storage).await.unwrap();
+        let loaded = EzStorage::load(&mut storage).await.unwrap();
         assert_eq!(EzMeta::default(), loaded.meta);
         assert!(loaded.snapshot.is_none());
     }
@@ -392,9 +372,9 @@ mod tests {
             last_log_id: Some((3, 42)),
             last_purged: None,
         };
-        EzStorage::<Counter>::persist(&mut storage, Persist::Meta(meta.clone())).await.unwrap();
+        EzStorage::persist(&mut storage, Persist::Meta(meta.clone())).await.unwrap();
 
-        let loaded = EzStorage::<Counter>::load(&mut storage).await.unwrap();
+        let loaded = EzStorage::load(&mut storage).await.unwrap();
         assert_eq!(meta, loaded.meta);
     }
 
@@ -407,7 +387,7 @@ mod tests {
             storage.persist(Persist::LogEntry(log_entry(7, index, index * 10))).await.unwrap();
         }
 
-        let all = EzStorage::<Counter>::read_logs(&mut storage, 1, 5).await.unwrap();
+        let all = EzStorage::read_logs(&mut storage, 1, 5).await.unwrap();
         let read_back: Vec<((u64, u64), u64)> = all.iter().map(parts).collect();
         assert_eq!(vec![((7, 1), 10), ((7, 2), 20), ((7, 3), 30), ((7, 4), 40)], read_back);
     }
@@ -420,7 +400,7 @@ mod tests {
         storage.persist(Persist::LogEntry(log_entry(1, 1, 10))).await.unwrap();
         storage.persist(Persist::LogEntry(log_entry(1, 3, 30))).await.unwrap();
 
-        let err = EzStorage::<Counter>::read_logs(&mut storage, 1, 4).await.expect_err("index 2 is missing");
+        let err = EzStorage::read_logs(&mut storage, 1, 4).await.expect_err("index 2 is missing");
         assert_eq!(io::ErrorKind::NotFound, err.kind());
     }
 
@@ -436,17 +416,17 @@ mod tests {
         }
 
         // Tail: drop everything from index 4 on, as a conflicting suffix would be truncated.
-        let tail: Persist<Counter> = Persist::DeleteLogs { from: 4, to: u64::MAX };
+        let tail: Persist = Persist::DeleteLogs { from: 4, to: u64::MAX };
         storage.persist(tail).await.unwrap();
-        let kept = EzStorage::<Counter>::read_logs(&mut storage, 1, 4).await.unwrap();
+        let kept = EzStorage::read_logs(&mut storage, 1, 4).await.unwrap();
         assert_eq!(3, kept.len());
-        assert!(EzStorage::<Counter>::read_logs(&mut storage, 4, 5).await.is_err());
+        assert!(EzStorage::read_logs(&mut storage, 4, 5).await.is_err());
 
         // Head: purge everything up to and including index 2, as a snapshot would compact it.
-        let head: Persist<Counter> = Persist::DeleteLogs { from: 0, to: 3 };
+        let head: Persist = Persist::DeleteLogs { from: 0, to: 3 };
         storage.persist(head).await.unwrap();
-        assert!(EzStorage::<Counter>::read_logs(&mut storage, 1, 2).await.is_err());
-        let survivor = EzStorage::<Counter>::read_logs(&mut storage, 3, 4).await.unwrap();
+        assert!(EzStorage::read_logs(&mut storage, 1, 2).await.is_err());
+        let survivor = EzStorage::read_logs(&mut storage, 3, 4).await.unwrap();
         assert_eq!(1, survivor.len());
     }
 
@@ -455,12 +435,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut storage = RedbStorage::open(dir.path().join("node.redb")).await.unwrap();
 
-        let first: Persist<Counter> = Persist::Snapshot(snapshot(10, b"first"));
-        let second: Persist<Counter> = Persist::Snapshot(snapshot(20, b"second"));
+        let first: Persist = Persist::Snapshot(snapshot(10, b"first"));
+        let second: Persist = Persist::Snapshot(snapshot(20, b"second"));
         storage.persist(first).await.unwrap();
         storage.persist(second).await.unwrap();
 
-        let loaded = EzStorage::<Counter>::load(&mut storage).await.unwrap();
+        let loaded = EzStorage::load(&mut storage).await.unwrap();
         let loaded_snapshot = loaded.snapshot.expect("a snapshot was persisted");
         assert_eq!(snapshot(20, b"second").meta, loaded_snapshot.meta);
         assert_eq!(b"second".to_vec(), loaded_snapshot.snapshot.into_inner());
@@ -475,7 +455,7 @@ mod tests {
         storage.persist(Persist::LogEntry(log_entry(1, 1, 5))).await.unwrap();
 
         assert!(path.exists());
-        let entries = EzStorage::<Counter>::read_logs(&mut storage, 1, 2).await.unwrap();
+        let entries = EzStorage::read_logs(&mut storage, 1, 2).await.unwrap();
         assert_eq!(vec![((1, 1), 5)], entries.iter().map(parts).collect::<Vec<_>>());
     }
 
@@ -489,7 +469,7 @@ mod tests {
 
         {
             let mut storage = RedbStorage::open(&path).await.unwrap();
-            let meta: Persist<Counter> = Persist::Meta(EzMeta {
+            let meta: Persist = Persist::Meta(EzMeta {
                 node_id: Some(3),
                 vote: Some(EzVote::new(2, 3)),
                 last_log_id: Some((2, 5)),
@@ -499,19 +479,19 @@ mod tests {
             for index in 1..=5 {
                 storage.persist(Persist::LogEntry(log_entry(2, index, index))).await.unwrap();
             }
-            let snap: Persist<Counter> = Persist::Snapshot(snapshot(3, b"snap"));
+            let snap: Persist = Persist::Snapshot(snapshot(3, b"snap"));
             storage.persist(snap).await.unwrap();
             // `storage`, and the redb `Database` it owns, is dropped here - releasing the file.
         }
 
         let mut reopened = RedbStorage::open(&path).await.unwrap();
-        let loaded = EzStorage::<Counter>::load(&mut reopened).await.unwrap();
+        let loaded = EzStorage::load(&mut reopened).await.unwrap();
         assert_eq!(Some(3), loaded.meta.node_id);
         assert_eq!(Some((2, 5)), loaded.meta.last_log_id);
         let snap = loaded.snapshot.expect("the snapshot survived the reopen");
         assert_eq!(b"snap".to_vec(), snap.snapshot.into_inner());
 
-        let entries = EzStorage::<Counter>::read_logs(&mut reopened, 1, 6).await.unwrap();
+        let entries = EzStorage::read_logs(&mut reopened, 1, 6).await.unwrap();
         assert_eq!(5, entries.len());
     }
 }

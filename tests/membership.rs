@@ -1,7 +1,7 @@
 //! Who is in the cluster and who counts towards a quorum: joining, promotion,
 //! demotion and removal
 //!
-//! Every test drives EzRaft through its public API and real HTTP between nodes.
+//! Every test drives `EzKv` through its public API and real HTTP between nodes.
 
 mod common;
 
@@ -9,33 +9,27 @@ use std::collections::BTreeSet;
 use std::io;
 
 use common::*;
-use ezraft::EzRaft;
+use ezraft::EzKv;
 
 /// Joining plus serving must be all it takes to become a voter, and those
 /// voters must keep the cluster alive when the founding leader dies.
 #[tokio::test(flavor = "multi_thread")]
 async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Result<()> {
     let addr_a = free_addr();
-    let a = EzRaft::create(&addr_a, KvSm::default(), node_storage().await?, config()).await?;
-    tokio::spawn({
-        let a = a.clone();
-        async move { a.serve().await }
-    });
+    let data_a = NodeData::new();
+    let a = EzKv::create(&addr_a, data_a.open().await?, config()).await?;
+    spawn_serve(&a);
     a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "founding node leads").await?;
 
     let addr_b = free_addr();
-    let b = EzRaft::join(&addr_b, &addr_a, KvSm::default(), node_storage().await?, config()).await?;
-    tokio::spawn({
-        let b = b.clone();
-        async move { b.serve().await }
-    });
+    let data_b = NodeData::new();
+    let b = EzKv::join(&addr_b, &addr_a, data_b.open().await?, config()).await?;
+    spawn_serve(&b);
 
     let addr_c = free_addr();
-    let c = EzRaft::join(&addr_c, &addr_a, KvSm::default(), node_storage().await?, config()).await?;
-    tokio::spawn({
-        let c = c.clone();
-        async move { c.serve().await }
-    });
+    let data_c = NodeData::new();
+    let c = EzKv::join(&addr_c, &addr_a, data_c.open().await?, config()).await?;
+    spawn_serve(&c);
 
     // Every node must see the final uniform config with all three voters before
     // the leader may die: a joint config still counts the founding node in its
@@ -45,20 +39,13 @@ async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Resul
         wait_for_voters(node, voters.clone(), "every promoted node is a voter").await?;
     }
 
-    assert_eq!(Response { value: None }, a.write(set("k1", "v1")).await?);
+    assert_eq!(
+        1,
+        a.write(set("k1", "v1")).await.map_err(|e| io::Error::other(e.to_string()))?
+    );
 
-    // A direct read serves from local memory - no consensus round, no log
-    // entry: the app's `read` answers the key from its own map.
-    let value: Option<String> = reqwest::Client::new()
-        .post(format!("http://{}/api/read", addr_a))
-        .json("k1")
-        .send()
-        .await
-        .map_err(io::Error::other)?
-        .json()
-        .await
-        .map_err(io::Error::other)?;
-    assert_eq!(Some("v1".to_string()), value);
+    // A direct read serves from this node's own local view - no consensus round, no log entry.
+    assert_eq!(Some("v1".to_string()), a.view().get("k1").map(|kv| text(&kv)));
 
     // Kill the leader; the two remaining voters still form a quorum.
     assert!(a.is_leader());
@@ -71,21 +58,13 @@ async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Resul
     )
     .await?;
 
-    // The new leader accepts writes (reached from a follower via forwarding)
-    // and still has the data acknowledged before the failover.
-    assert_eq!(Response { value: None }, http_write(&addr_b, set("k2", "v2")).await?);
-    assert_eq!(
-        Response {
-            value: Some("v1".into())
-        },
-        http_write(&addr_b, get("k1")).await?
-    );
-    assert_eq!(
-        Response {
-            value: Some("v2".into())
-        },
-        http_write(&addr_b, get("k2")).await?
-    );
+    // The new leader accepts writes and still has the data acknowledged before the failover.
+    // `write_through_leader` may have committed this on `c` rather than `b`, so wait for `b`'s
+    // own local view to reach that revision before reading it - a local `view()` never forwards.
+    let revision = write_through_leader(&[&b, &c], set("k2", "v2")).await?;
+    wait_for_revision(&b, revision).await?;
+    assert_eq!(Some("v1".to_string()), b.view().get("k1").map(|kv| text(&kv)));
+    assert_eq!(Some("v2".to_string()), b.view().get("k2").map(|kv| text(&kv)));
 
     Ok(())
 }
@@ -95,23 +74,21 @@ async fn join_promotes_to_voter_and_cluster_survives_leader_death() -> io::Resul
 #[tokio::test(flavor = "multi_thread")]
 async fn learner_joins_and_stays_a_learner_until_promoted() -> io::Result<()> {
     let addr_a = free_addr();
-    let a = EzRaft::create(&addr_a, KvSm::default(), node_storage().await?, config()).await?;
-    tokio::spawn({
-        let a = a.clone();
-        async move { a.serve().await }
-    });
+    let data_a = NodeData::new();
+    let a = EzKv::create(&addr_a, data_a.open().await?, config()).await?;
+    spawn_serve(&a);
     a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "founding node leads").await?;
 
     let addr_b = free_addr();
-    let b = EzRaft::join_as_learner(&addr_b, &addr_a, KvSm::default(), node_storage().await?, config()).await?;
-    tokio::spawn({
-        let b = b.clone();
-        async move { b.serve().await }
-    });
+    let data_b = NodeData::new();
+    let b = EzKv::join_as_learner(&addr_b, &addr_a, data_b.open().await?, config()).await?;
+    spawn_serve(&b);
     let b_id = b.node_id();
 
     for i in 1..3 {
-        a.write(set(&format!("k{}", i), &format!("v{}", i))).await?;
+        a.write(set(&format!("k{}", i), &format!("v{}", i)))
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))?;
     }
 
     // Being caught up is the whole condition a promotion waits for, so once the
@@ -136,7 +113,7 @@ async fn learner_joins_and_stays_a_learner_until_promoted() -> io::Result<()> {
     );
 
     // A learner is a full replica; it just does not vote.
-    assert_eq!(expected_map(1..3), b.read(|app| app.data.clone()).await?);
+    assert_eq!(expected_map(1..3), view_map(&b.view()));
 
     // A node the cluster has never heard of cannot be promoted.
     let unknown = a.promote(b_id + 1000).await.unwrap_err();
@@ -163,9 +140,9 @@ async fn learner_joins_and_stays_a_learner_until_promoted() -> io::Result<()> {
 /// the cluster: it keeps receiving the log, and the voters left still commit.
 #[tokio::test(flavor = "multi_thread")]
 async fn demoted_voter_becomes_a_learner_and_keeps_replicating() -> io::Result<()> {
-    let (addr_a, a) = founding_node().await?;
-    let (_, b) = joined_voter(&addr_a).await?;
-    let (_, c) = joined_voter(&addr_a).await?;
+    let (addr_a, a, _data_a) = founding_node().await?;
+    let (_, b, _data_b) = joined_voter(&addr_a).await?;
+    let (_, c, _data_c) = joined_voter(&addr_a).await?;
 
     let all = BTreeSet::from([0, b.node_id(), c.node_id()]);
     wait_for_voters(&a, all, "every joined node is a voter").await?;
@@ -185,9 +162,12 @@ async fn demoted_voter_becomes_a_learner_and_keeps_replicating() -> io::Result<(
 
     // This write proves both halves: the two remaining voters are a quorum on
     // their own, and the demoted node is still sent what they commit.
-    assert_eq!(Response { value: None }, a.write(set("k1", "v1")).await?);
+    assert_eq!(
+        1,
+        a.write(set("k1", "v1")).await.map_err(|e| io::Error::other(e.to_string()))?
+    );
     wait_for_applied(&c, &a).await?;
-    assert_eq!(expected_map(1..2), c.read(|app| app.data.clone()).await?);
+    assert_eq!(expected_map(1..2), view_map(&c.view()));
 
     Ok(())
 }
@@ -196,7 +176,7 @@ async fn demoted_voter_becomes_a_learner_and_keeps_replicating() -> io::Result<(
 /// commit again, not even the change that would give it one back.
 #[tokio::test(flavor = "multi_thread")]
 async fn demote_refuses_to_empty_the_voter_set() -> io::Result<()> {
-    let (_, a) = founding_node().await?;
+    let (_, a, _data_a) = founding_node().await?;
 
     let err = a.demote(0).await.unwrap_err();
     assert!(
@@ -211,7 +191,10 @@ async fn demote_refuses_to_empty_the_voter_set() -> io::Result<()> {
         BTreeSet::from([0]),
         metrics.membership_config.membership().voter_ids().collect::<BTreeSet<_>>()
     );
-    assert_eq!(Response { value: None }, a.write(set("k1", "v1")).await?);
+    assert_eq!(
+        1,
+        a.write(set("k1", "v1")).await.map_err(|e| io::Error::other(e.to_string()))?
+    );
 
     Ok(())
 }
@@ -220,9 +203,9 @@ async fn demote_refuses_to_empty_the_voter_set() -> io::Result<()> {
 /// either behind in the membership.
 #[tokio::test(flavor = "multi_thread")]
 async fn removed_nodes_leave_the_membership() -> io::Result<()> {
-    let (addr_a, a) = founding_node().await?;
-    let (_, b) = joined_voter(&addr_a).await?;
-    let (_, c) = joined_learner(&addr_a).await?;
+    let (addr_a, a, _data_a) = founding_node().await?;
+    let (_, b, _data_b) = joined_voter(&addr_a).await?;
+    let (_, c, _data_c) = joined_learner(&addr_a).await?;
 
     wait_for_voters(&a, BTreeSet::from([0, b.node_id()]), "the joining voter is promoted").await?;
 
@@ -238,7 +221,10 @@ async fn removed_nodes_leave_the_membership() -> io::Result<()> {
     assert_eq!(vec![0], membership.nodes().map(|(id, _)| *id).collect::<Vec<_>>());
     assert!(membership.learner_ids().next().is_none());
 
-    assert_eq!(Response { value: None }, a.write(set("k1", "v1")).await?);
+    assert_eq!(
+        1,
+        a.write(set("k1", "v1")).await.map_err(|e| io::Error::other(e.to_string()))?
+    );
 
     Ok(())
 }

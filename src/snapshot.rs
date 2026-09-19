@@ -1,4 +1,4 @@
-//! The snapshot: a serialized [`EzApp`](crate::EzApp) and where in the log it stands
+//! The snapshot: the serialized KV state and where in the log it stands
 
 use std::io::Cursor;
 

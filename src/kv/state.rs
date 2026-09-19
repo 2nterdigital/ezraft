@@ -3,12 +3,8 @@
 //! [`KvState::apply`] is a plain function from a [`Txn`] to a result: no clocks, no randomness,
 //! no I/O, no iteration order that depends on anything but key order. Given the same sequence of
 //! transactions, every replica ends with the same `kv`, the same `revision`, and the same
-//! `create_rev`/`mod_rev` on every key - which is the property ech0-media#27b's Raft wiring
-//! depends on to keep replicas identical.
-// Not yet called from anywhere until ech0-media#27b wires this state machine into the Raft
-// adapter (`crate::storage::adapter::state_machine`), so `apply` and `view` are unused for now.
-// The narrow `#[allow(dead_code)]` below is the marker to remove once that wiring lands.
-#![allow(dead_code)]
+//! `create_rev`/`mod_rev` on every key - which is the property the Raft wiring
+//! (`crate::storage::adapter::state_machine`) depends on to keep replicas identical.
 
 use std::sync::Arc;
 
@@ -20,6 +16,7 @@ use crate::kv::txn::Condition;
 use crate::kv::txn::Conflict;
 use crate::kv::txn::Op;
 use crate::kv::txn::Txn;
+use crate::kv::view::KeyValue;
 use crate::kv::view::StoredValue;
 use crate::kv::view::View;
 use crate::kv::view::to_key_value;
@@ -142,6 +139,32 @@ impl KvState {
 
         self.revision = revision;
         Ok(Changes { revision, items })
+    }
+
+    /// Every entry, in key order, and the revision counter
+    ///
+    /// The smallest crate-internal seam that lets the Raft adapter serialize this state machine
+    /// into a snapshot and rebuild it from one: ech0-media#28 replaces the encoding this feeds
+    /// (postcard, a format version), not this pair of methods. Kept tiny and obvious on purpose -
+    /// see `src/kv.rs`'s module docs.
+    pub(crate) fn export(&self) -> (u64, Vec<KeyValue>) {
+        (
+            self.revision,
+            self.kv.iter().map(|(key, stored)| to_key_value(key, stored)).collect(),
+        )
+    }
+
+    /// Rebuild a state machine from what [`Self::export`] produced
+    pub(crate) fn restore(revision: u64, entries: Vec<KeyValue>) -> Self {
+        let mut kv = OrdMap::new();
+        for entry in entries {
+            kv.insert(Arc::<str>::from(entry.key.as_str()), StoredValue {
+                value: entry.value,
+                create_rev: entry.create_rev,
+                mod_rev: entry.mod_rev,
+            });
+        }
+        Self { kv, revision }
     }
 }
 
@@ -548,5 +571,31 @@ mod tests {
         let all_a: Vec<crate::kv::KeyValue> = replica_a.view().prefix("").collect();
         let all_b: Vec<crate::kv::KeyValue> = replica_b.view().prefix("").collect();
         assert_eq!(all_a, all_b);
+    }
+
+    #[test]
+    fn export_then_restore_reproduces_the_same_view() {
+        let mut state = KvState::new();
+        state.apply(&txn().put("a", Bytes::from_static(b"1"))).unwrap();
+        state.apply(&txn().put("b", Bytes::from_static(b"2"))).unwrap();
+        state.apply(&txn().put("a", Bytes::from_static(b"3"))).unwrap();
+
+        let (revision, entries) = state.export();
+        let restored = KvState::restore(revision, entries);
+
+        assert_eq!(state.view().revision(), restored.view().revision());
+        let original: Vec<crate::kv::KeyValue> = state.view().prefix("").collect();
+        let round_tripped: Vec<crate::kv::KeyValue> = restored.view().prefix("").collect();
+        assert_eq!(
+            original, round_tripped,
+            "revision, create_rev and mod_rev must all survive"
+        );
+    }
+
+    #[test]
+    fn restoring_an_empty_export_gives_an_empty_state_at_that_revision() {
+        let restored = KvState::restore(0, Vec::new());
+        assert_eq!(0, restored.view().revision());
+        assert_eq!(0, restored.view().prefix("").count());
     }
 }

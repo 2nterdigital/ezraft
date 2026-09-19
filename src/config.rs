@@ -9,6 +9,8 @@ use std::time::Duration;
 use openraft::Config;
 use openraft::SnapshotPolicy;
 
+use crate::kv::KvLimits;
+
 /// Configuration for EzRaft
 ///
 /// Provides sensible defaults for all Raft timing parameters.
@@ -36,6 +38,14 @@ pub struct EzConfig {
     /// Default: 500
     pub snapshot_interval: u64,
 
+    /// Size and count limits every transaction is checked against before it is proposed - on the
+    /// node that accepts the call, and again on the leader before it enters the log - so that a
+    /// node with different limits than the rest can never make replicas diverge.
+    ///
+    /// Defaults (1 KiB key, 64 KiB value, 128 ops, 1 MiB total) match ech0-media#27's spec and
+    /// are provisional until benchmarked (ech0-media#36).
+    pub kv_limits: KvLimits,
+
     /// The test cluster's shared network fault-injection handle, if any
     ///
     /// Only present in builds compiled with the `fault-injection` cargo feature (off by
@@ -52,6 +62,7 @@ impl Default for EzConfig {
         Self {
             heartbeat_interval: Duration::from_millis(500),
             snapshot_interval: 500,
+            kv_limits: KvLimits::default(),
             #[cfg(feature = "fault-injection")]
             faults: None,
         }

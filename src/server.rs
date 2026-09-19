@@ -1,92 +1,50 @@
-//! HTTP server for EzRaft
+//! HTTP server: `/raft/*` and the admin API
 //!
 //! This module provides the HTTP server that handles:
-//! - Internal Raft RPC (append entries, vote)
+//! - Internal Raft RPC (append entries, vote, install snapshot, transfer leader)
 //! - Admin API (joining, node roles, removal, metrics)
+//!
+//! `/api/write` and `/api/read` - a sample write/read API typed by the user's own application -
+//! do not survive `EzApp` becoming an internal implementation detail (ech0-media#27b); any-node
+//! writes and reads are `EzKv::write`/`EzKv::view` on the public handle now, and forwarding a
+//! write to the leader over HTTP is ech0-media#30.
 
 use std::io::Cursor;
-use std::time::Duration;
 
 use actix_web::App;
 use actix_web::HttpServer;
+use actix_web::dev::Server;
 use actix_web::web;
 use actix_web::web::Data;
 use actix_web::web::ServiceConfig;
 use openraft::Snapshot;
-use openraft::errors::ClientWriteError;
 use openraft::errors::Infallible;
-use openraft::errors::RaftError;
 use openraft::errors::decompose::DecomposeResult;
 use openraft::raft;
 use openraft::raft::SnapshotResponse;
 
 use crate::admin::MembershipChange;
 use crate::admin::Redirect;
-use crate::app::EzApp;
 use crate::network::SnapshotTransfer;
 use crate::node_role::NodeRole;
-use crate::raft::EzRaft;
+use crate::raft::EzKv;
 use crate::type_config::OpenRaftTypes;
 
 /// Type alias for OpenRaft types
-type C<T> = OpenRaftTypes<T>;
+type C = OpenRaftTypes;
 
-/// HTTP server wrapper for EzRaft
+/// HTTP server wrapper: `/raft/*` and the admin routes
 ///
-/// This is both a working server and a sample to copy. The `/raft/*` routes and the admin
-/// handlers are what every deployment needs and can be taken as they are. The application
-/// routes cannot be: `POST /api/write` and `POST /api/read` are the smallest pair that
-/// exercises an app, not the API a real service exposes - that one has an endpoint per
-/// operation, with the path, parameters and encoding each operation deserves.
-///
-/// So copy this file into your own crate and rewrite the application handlers there.
-/// [`EzRaft::write`] and [`EzRaft::read`] are the only two entry points they need - the first
-/// goes through the log, the second reads local state.
-pub struct EzServer<T>
-where T: EzApp
-{
-    raft: EzRaft<T>,
+/// This is both a working server and a sample to copy: these routes are production-shaped, but
+/// an application's own routes (client writes and reads) are not this crate's to shape - see
+/// [`crate::raft::EzKv::serve_with`] to add them, and `examples/kvstore.rs` for a worked example.
+pub struct EzServer {
+    raft: EzKv,
 }
 
-impl<T> EzServer<T>
-where T: EzApp
-{
-    pub fn new(raft: EzRaft<T>) -> Self {
+impl EzServer {
+    pub fn new(raft: EzKv) -> Self {
         Self { raft }
-    }
-
-    /// Run the HTTP server
-    pub async fn run(self) -> std::io::Result<()> {
-        self.run_with(|_| {}).await
-    }
-
-    /// Run the HTTP server with application-specific routes
-    async fn run_with<F>(self, configure: F) -> std::io::Result<()>
-    where F: Fn(&mut ServiceConfig) + Clone + Send + 'static {
-        let addr = self.raft.addr().to_string();
-        let server_data = Data::new(self);
-
-        let server = HttpServer::new(move || {
-            let configure = configure.clone();
-            App::new()
-                .app_data(server_data.clone())
-                // Raft internal RPC
-                .route("/raft/append", web::post().to(Self::handle_append))
-                .route("/raft/vote", web::post().to(Self::handle_vote))
-                .route("/raft/snapshot", web::post().to(Self::handle_snapshot))
-                .route("/raft/transfer_leader", web::post().to(Self::handle_transfer_leader))
-                // Application API
-                .route("/api/write", web::post().to(Self::handle_write))
-                .route("/api/read", web::post().to(Self::handle_read))
-                // Admin API
-                .route("/api/node_id", web::post().to(Self::handle_node_id))
-                .route("/api/membership", web::post().to(Self::handle_membership))
-                .route("/api/metrics", web::get().to(Self::handle_metrics))
-                .configure(configure)
-        })
-        .bind(&addr)?;
-
-        server.run().await
     }
 
     /// Raft append entries RPC handler
@@ -94,9 +52,9 @@ where T: EzApp
     /// The body is the `Result` the peer's [`crate::network::Network`] expects; only a
     /// [`Fatal`](openraft::errors::Fatal) error becomes an HTTP error status.
     async fn handle_append(
-        req: web::Json<raft::AppendEntriesRequest<C<T>>>,
+        req: web::Json<raft::AppendEntriesRequest<C>>,
         ez: Data<Self>,
-    ) -> Result<web::Json<Result<raft::AppendEntriesResponse<C<T>>, Infallible>>, actix_web::Error> {
+    ) -> Result<web::Json<Result<raft::AppendEntriesResponse<C>, Infallible>>, actix_web::Error> {
         let resp = ez
             .raft
             .inner()
@@ -110,9 +68,9 @@ where T: EzApp
 
     /// Raft vote RPC handler
     async fn handle_vote(
-        req: web::Json<raft::VoteRequest<C<T>>>,
+        req: web::Json<raft::VoteRequest<C>>,
         ez: Data<Self>,
-    ) -> Result<web::Json<Result<raft::VoteResponse<C<T>>, Infallible>>, actix_web::Error> {
+    ) -> Result<web::Json<Result<raft::VoteResponse<C>, Infallible>>, actix_web::Error> {
         let resp = ez
             .raft
             .inner()
@@ -130,9 +88,9 @@ where T: EzApp
     /// silence: an election costs a timeout, a transfer costs a round trip. A leader removed from
     /// the cluster does this on its way out - one merely demoted keeps leading.
     async fn handle_transfer_leader(
-        req: web::Json<raft::TransferLeaderRequest<C<T>>>,
+        req: web::Json<raft::TransferLeaderRequest<C>>,
         ez: Data<Self>,
-    ) -> Result<web::Json<Result<raft::TransferLeaderResponse<C<T>>, Infallible>>, actix_web::Error> {
+    ) -> Result<web::Json<Result<raft::TransferLeaderResponse<C>, Infallible>>, actix_web::Error> {
         let resp = ez
             .raft
             .inner()
@@ -150,7 +108,7 @@ where T: EzApp
     async fn handle_snapshot(
         req: web::Json<SnapshotTransfer>,
         ez: Data<Self>,
-    ) -> Result<web::Json<Result<SnapshotResponse<C<T>>, Infallible>>, actix_web::Error> {
+    ) -> Result<web::Json<Result<SnapshotResponse<C>, Infallible>>, actix_web::Error> {
         let SnapshotTransfer { vote, meta, data } = req.into_inner();
         let snapshot = Snapshot {
             meta,
@@ -167,104 +125,8 @@ where T: EzApp
         Ok(web::Json(Ok(resp)))
     }
 
-    /// Application write API handler
-    ///
-    /// Takes the application's own request type as JSON, runs it through Raft, and returns
-    /// whatever the state machine's `apply` produced. This is how a client drives the cluster.
-    ///
-    /// Any node accepts a write: a follower forwards it and answers with what the leader applied,
-    /// so a client never has to track which node is currently in charge. Unlike the admin
-    /// endpoints this forwards rather than redirecting, because `/api/write` is the endpoint a
-    /// plain HTTP client uses, and following a redirect is more than one should have to do.
-    async fn handle_write(
-        req: web::Json<T::Request>,
-        ez: Data<Self>,
-    ) -> Result<web::Json<T::Response>, actix_web::Error> {
-        let req = req.into_inner();
-        let mut refused = String::new();
-
-        // Submit first and react to the answer, rather than reading the metrics to decide where
-        // to send: leadership can change between any such check and the write that follows it, so
-        // only the write itself is authoritative about who leads now.
-        //
-        // Twice at most, because exactly one answer is worth waiting on - "forward to the leader"
-        // that names no leader, which is an election in flight. The wait below ends the moment one
-        // is elected, so a short election costs only as long as it lasts.
-        for attempt in 0..2 {
-            let err = match ez.raft.inner().client_write(req.clone()).await {
-                // A user write is always answered with `Some` by `apply`; `None` exists only for
-                // framework-generated entries.
-                Ok(resp) => {
-                    let applied = resp
-                        .data
-                        .ok_or_else(|| actix_web::error::ErrorInternalServerError("write produced no response"))?;
-
-                    return Ok(web::Json(applied));
-                }
-                Err(e) => e,
-            };
-
-            let RaftError::APIError(ClientWriteError::ForwardToLeader(to_leader)) = &err else {
-                return Err(actix_web::error::ErrorInternalServerError(format!(
-                    "write failed: {}",
-                    err
-                )));
-            };
-
-            // Forwarding to ourselves would repeat this request over HTTP forever.
-            match to_leader.leader_node.as_ref().map(|n| n.addr.as_str()) {
-                Some(leader) if leader != ez.raft.addr() => {
-                    let applied = forward_write::<T>(leader, &req)
-                        .await
-                        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("write failed: {}", e)))?;
-
-                    return Ok(web::Json(applied));
-                }
-                _ => {
-                    refused = err.to_string();
-
-                    if attempt == 0 {
-                        let _ = ez
-                            .raft
-                            .inner()
-                            .wait(Some(WAIT_FOR_LEADER))
-                            .metrics(|m| m.current_leader.is_some(), "a leader to write to")
-                            .await;
-                    }
-                }
-            }
-        }
-
-        Err(actix_web::error::ErrorInternalServerError(format!(
-            "write failed: {}",
-            refused
-        )))
-    }
-
-    /// Application read API handler
-    ///
-    /// `POST /api/read` answers a read from local memory via [`EzApp::read`]: the write API puts
-    /// state in, this reads it back. Body and answer are the app's own read types, so what a read
-    /// may ask for, and what "nothing found" looks like, are the app's to decide and not this
-    /// handler's to interpret.
-    ///
-    /// Reads cost no consensus round and no log entry, and are as fresh as this node's
-    /// replication - a read that must be linearizable goes through [`EzRaft::write`] instead.
-    async fn handle_read(
-        req: web::Json<T::ReadRequest>,
-        ez: Data<Self>,
-    ) -> Result<web::Json<T::ReadResponse>, actix_web::Error> {
-        // Moved whole, because the read runs on the state machine's own task, which as far as the
-        // compiler is concerned outlives this request.
-        let req = req.into_inner();
-
-        let resp = ez.raft.read(move |app| app.read(req)).await.map_err(actix_web::error::ErrorInternalServerError)?;
-
-        Ok(web::Json(resp))
-    }
-
     /// Metrics API handler
-    async fn handle_metrics(ez: Data<Self>) -> Result<web::Json<openraft::RaftMetrics<C<T>>>, actix_web::Error> {
+    async fn handle_metrics(ez: Data<Self>) -> Result<web::Json<openraft::RaftMetrics<C>>, actix_web::Error> {
         let metrics = ez.raft.metrics().await;
         Ok(web::Json(metrics))
     }
@@ -325,12 +187,12 @@ where T: EzApp
         Ok(web::Json(Ok(())))
     }
 
-    /// This node's [`EzRaft`] if it leads, or where to ask instead
+    /// This node's [`EzKv`] if it leads, or where to ask instead
     ///
     /// Membership is the leader's to change, so every admin handler starts here. The redirect is
     /// `None` when this node knows of no leader, which is a moment to wait out rather than a
     /// failure. Both answers come from one reading of the metrics, so they cannot disagree.
-    async fn leader_or_redirect(ez: &Data<Self>) -> Result<&EzRaft<T>, Option<String>> {
+    async fn leader_or_redirect(ez: &Data<Self>) -> Result<&EzKv, Option<String>> {
         let metrics = ez.raft.metrics().await;
 
         if metrics.current_leader == Some(metrics.id) {
@@ -343,52 +205,37 @@ where T: EzApp
     }
 }
 
-pub(crate) async fn run_with<T, F>(raft: EzRaft<T>, configure: F) -> std::io::Result<()>
-where
-    T: EzApp,
-    F: Fn(&mut ServiceConfig) + Clone + Send + 'static,
-{
-    EzServer::new(raft).run_with(configure).await
-}
-
-/// How long to wait for an election to settle before giving up on writing
-const WAIT_FOR_LEADER: Duration = Duration::from_secs(10);
-
-/// How long a forwarded write may take before the leader is given up on
+/// Bind the node's HTTP server, running `configure` on top of the standard routes
 ///
-/// Generous, because the leader has to replicate and commit the request before answering.
-const FORWARD_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Binding is synchronous (it can fail immediately, e.g. `AddrInUse`); running the accept loop
+/// is not, which is why this hands back the still-unawaited [`Server`] rather than awaiting it
+/// itself - the caller ([`EzKv::serve_with`](crate::raft::EzKv::serve_with)) needs the `Server`'s
+/// own `handle()` before the accept loop starts, so [`EzKv::shutdown`](crate::raft::EzKv::shutdown)
+/// can stop it later.
+pub(crate) fn bind<F>(raft: EzKv, configure: F) -> std::io::Result<Server>
+where F: Fn(&mut ServiceConfig) + Clone + Send + 'static {
+    let addr = raft.addr().to_string();
+    let server_data = Data::new(EzServer::new(raft));
 
-/// Send a write to the leader's `/api/write` endpoint and return what it applied
-///
-/// The leader does the write on this node's behalf, so the answer is the one the caller would
-/// have got by writing to the leader directly. Reaching a peer is a transport question, so it is
-/// answered here rather than in [`EzRaft`], which is a node and knows nothing about how to talk
-/// to other ones.
-async fn forward_write<T>(leader_addr: &str, req: &T::Request) -> Result<T::Response, std::io::Error>
-where T: EzApp {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(FORWARD_WRITE_TIMEOUT)
-        .build()
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let server = HttpServer::new(move || {
+        let configure = configure.clone();
+        App::new()
+            .app_data(server_data.clone())
+            // Raft internal RPC
+            .route("/raft/append", web::post().to(EzServer::handle_append))
+            .route("/raft/vote", web::post().to(EzServer::handle_vote))
+            .route("/raft/snapshot", web::post().to(EzServer::handle_snapshot))
+            .route(
+                "/raft/transfer_leader",
+                web::post().to(EzServer::handle_transfer_leader),
+            )
+            // Admin API
+            .route("/api/node_id", web::post().to(EzServer::handle_node_id))
+            .route("/api/membership", web::post().to(EzServer::handle_membership))
+            .route("/api/metrics", web::get().to(EzServer::handle_metrics))
+            .configure(configure)
+    })
+    .bind(&addr)?;
 
-    let url = format!("http://{}/api/write", leader_addr);
-
-    let resp = client
-        .post(&url)
-        .json(req)
-        .send()
-        .await
-        .map_err(|e| std::io::Error::other(format!("forwarding write to {} failed: {}", url, e)))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(std::io::Error::other(format!("{} responded {}: {}", url, status, body)));
-    }
-
-    resp.json()
-        .await
-        .map_err(|e| std::io::Error::other(format!("failed to parse write response: {}", e)))
+    Ok(server.run())
 }

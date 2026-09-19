@@ -16,7 +16,6 @@ pub use loaded::Loaded;
 pub use persist::Persist;
 pub use redb_storage::RedbStorage;
 
-use crate::app::EzApp;
 use crate::entry::EzEntry;
 
 /// Storage persistence trait
@@ -50,7 +49,7 @@ use crate::entry::EzEntry;
 /// struct MyStorage { base_dir: PathBuf }
 ///
 /// #[async_trait]
-/// impl EzStorage<KvApp> for MyStorage {
+/// impl EzStorage for MyStorage {
 ///     async fn load(&mut self) -> Result<Loaded, io::Error> {
 ///         // 1. Load meta from base_dir/meta.json (use default if first run)
 ///         // 2. Optionally load snapshot from base_dir/snapshot
@@ -58,7 +57,7 @@ use crate::entry::EzEntry;
 ///         Ok(Loaded { meta, snapshot })
 ///     }
 ///
-///     async fn persist(&mut self, op: Persist<KvApp>) -> Result<(), io::Error> {
+///     async fn persist(&mut self, op: Persist) -> Result<(), io::Error> {
 ///         match op {
 ///             Persist::Meta(meta) => { /* write meta */ }
 ///             Persist::LogEntry(entry) => { /* write log entry */ }
@@ -67,15 +66,13 @@ use crate::entry::EzEntry;
 ///         }
 ///     }
 ///
-///     async fn read_logs(&mut self, start: u64, end: u64) -> Result<Vec<EzEntry<KvApp>>, io::Error> {
+///     async fn read_logs(&mut self, start: u64, end: u64) -> Result<Vec<EzEntry>, io::Error> {
 ///         // Read log entries in range [start, end)
 ///     }
 /// }
 /// ```
 #[async_trait]
-pub trait EzStorage<T>: Send + Sync + 'static
-where T: EzApp
-{
+pub trait EzStorage: Send + Sync + 'static {
     /// Load metadata and snapshot on startup
     ///
     /// Returns the persisted [`Loaded`] state: metadata (or default if first run) and optional
@@ -90,7 +87,7 @@ where T: EzApp
     /// Each call represents one atomic operation that should be durably persisted.
     /// The framework calls this method when state changes. See [`Persist`] for what each
     /// operation requires.
-    async fn persist(&mut self, op: Persist<T>) -> Result<(), io::Error>;
+    async fn persist(&mut self, op: Persist) -> Result<(), io::Error>;
 
     /// Read log entries within a specific index range
     ///
@@ -104,5 +101,5 @@ where T: EzApp
     /// # Returns
     /// Log entries in the range, sorted by index. Empty vec if range is empty or
     /// no entries exist in range.
-    async fn read_logs(&mut self, start: u64, end: u64) -> Result<Vec<EzEntry<T>>, io::Error>;
+    async fn read_logs(&mut self, start: u64, end: u64) -> Result<Vec<EzEntry>, io::Error>;
 }

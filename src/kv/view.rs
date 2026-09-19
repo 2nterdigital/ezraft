@@ -1,8 +1,7 @@
 //! `View`: a lock-free, point-in-time read handle over the KV
 //!
-//! `KvState::view` (crate-internal until ech0-media#27b) hands out a `View` by cloning the
-//! persistent map's root - O(1), never blocking `apply` and never blocking other readers. Every
-//! read a `View` answers
+//! `KvState::view` (crate-internal) hands out a `View` by cloning the persistent map's root -
+//! O(1), never blocking `apply` and never blocking other readers. Every read a `View` answers
 //! comes from the exact same revision, so a caller reading several keys never observes half of a
 //! multi-key transaction.
 
@@ -64,9 +63,9 @@ pub struct Page {
 /// A consistent, point-in-time view of the KV at a single revision
 ///
 /// `Clone` is O(1): it clones the persistent map's root, the same structural sharing that lets
-/// `KvState::apply` (crate-internal until ech0-media#27b) keep running while a `View` is held
-/// indefinitely - see `state::tests::a_view_taken_before_later_applies_never_changes` for the
-/// property this exists to guarantee.
+/// `KvState::apply` (crate-internal) keep running while a `View` is held indefinitely - see
+/// `state::tests::a_view_taken_before_later_applies_never_changes` for the property this exists
+/// to guarantee, and `tests/kv_view.rs` for the same property proven through `EzKv::view`.
 #[derive(Clone)]
 pub struct View {
     revision: u64,

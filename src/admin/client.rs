@@ -10,7 +10,6 @@ use tokio::time::sleep;
 
 use crate::admin::membership_change::MembershipChange;
 use crate::admin::redirect::Redirect;
-use crate::app::EzApp;
 use crate::type_config::OpenRaftTypes;
 
 /// How many times an admin request is attempted before the node gives up
@@ -70,8 +69,7 @@ impl AdminClient {
     ///
     /// Not followed to the leader and not retried, unlike the rest, because one node's view is
     /// the whole point of asking it - a follower that has fallen behind can only say so itself.
-    pub async fn metrics<T>(&self) -> Result<RaftMetrics<OpenRaftTypes<T>>, io::Error>
-    where T: EzApp {
+    pub async fn metrics(&self) -> Result<RaftMetrics<OpenRaftTypes>, io::Error> {
         let url = format!("http://{}/api/metrics", self.addr);
 
         answer(&url, client(ADMIN_TIMEOUT)?.get(&url)).await
