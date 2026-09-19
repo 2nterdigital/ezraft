@@ -24,7 +24,7 @@ Originally EzRaft gave a simple API with extensibility for building Raft apps, w
 implementing `EzStorage` (persistence) and `EzApp` (business logic) was the product. ech0-media#27
 built the foundation's own state model - `EzKv`, a replicated key-value store with conditional
 transactions and lock-free views (`src/kv.rs` + `src/kv/`), wired into the node by `EzKv` in
-`src/raft.rs` and `src/write.rs` - in place of `EzApp`, which is no longer public. `EzStorage`
+`src/raft.rs` and `src/write.rs` - in place of `EzApp`, which is gone. `EzStorage`
 (persistence) remains the one trait a user implements.
 
 - `RedbStorage` (`src/storage/redb_storage.rs`) ships as the production `EzStorage` implementation: one redb database per node, three tables (log, meta, snapshot), one `Durability::Immediate` write transaction per `persist`. It doubles as the worked example of the trait. `EzStorage` stays the extension point for anything it does not fit.

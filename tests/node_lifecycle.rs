@@ -135,8 +135,8 @@ async fn a_failed_promotion_is_finished_by_promote_not_by_restarting() -> io::Re
 ///
 /// This is the storage acceptance scenario in full: `RedbStorage` is what the crash-and-restart
 /// promise in `EzStorage`'s contract rests on, not an in-memory stand-in for it. `EzKv::shutdown`
-/// now stops the HTTP server it started, not just the Raft engine (wave S1 left this gap), which
-/// is what lets this same-process restart bind the same address again - without that, the
+/// stops the HTTP server it started, not just the Raft engine, which is what lets this
+/// same-process restart bind the same address again - without that, the
 /// restarted instance could recover its local storage but never rejoin the network.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restarted_voter_recovers_its_redb_state_and_the_cluster_keeps_serving() -> io::Result<()> {

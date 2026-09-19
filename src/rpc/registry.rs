@@ -64,7 +64,7 @@ impl<T> Outcome<T> {
 ///
 /// `RwLock`, not an async lock: every critical section here is a plain map operation with no
 /// `.await` inside it, so a `std::sync` lock held only across that operation is the simpler and
-/// cheaper choice (rust-tokio-expert: never hold a lock across `.await` - this one never does).
+/// cheaper choice - a lock must never be held across an `.await`, and this one never is.
 #[derive(Default)]
 pub(super) struct Registry {
     handlers: RwLock<HashMap<String, BoxedHandler>>,

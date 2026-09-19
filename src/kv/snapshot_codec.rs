@@ -5,9 +5,9 @@
 //! turned into bytes and back. `crate::storage::adapter::state_machine` is the only caller: it
 //! builds a snapshot by cloning the state machine's root ([`KvState::view`]) and internal state
 //! ([`KvState::internal_state`]) under its lock - O(1), both a persistent map's root and a clone
-//! of the (today empty) internal block - then calls [`encode_snapshot`] afterwards, off that lock
-//! and off the async worker thread (`spawn_blocking`): encoding a large state is CPU work, and it
-//! must never hold up `apply` or `view()`. Installing a snapshot is the reverse:
+//! of the internal block's own persistent maps - then calls [`encode_snapshot`] afterwards, off
+//! that lock and off the async worker thread (`spawn_blocking`): encoding a large state is CPU
+//! work, and it must never hold up `apply` or `view()`. Installing a snapshot is the reverse:
 //! [`decode_snapshot`] runs to completion, magic and version checked first, before a single byte of
 //! it is persisted or swapped into the live state machine.
 //!
@@ -22,10 +22,10 @@
 //! The header is parsed by hand, never through postcard: postcard is a positional format with no
 //! self-describing tags, so nothing about the body can be safely decoded until the version says
 //! which shape to expect. For version 1 the body is [`SnapshotV1`]: `revision`, then every key as
-//! a [`KeyValue`] (in the order the source [`View`] iterates them), then the (today empty)
-//! [`InternalState`] block. Tickets ech0-media#30 and ech0-media#33 add fields to `InternalState`
-//! itself - never to `SnapshotV1` directly - so the version stays `1` for as long as this
-//! milestone runs (see `crate::kv`'s own module docs).
+//! a [`KeyValue`] (in the order the source [`View`] iterates them), then the [`InternalState`]
+//! block. The idempotency ledger (ech0-media#30) and the node registry (ech0-media#33) were added
+//! as fields of `InternalState` itself - never of `SnapshotV1` directly - while nothing had been
+//! deployed yet, so the version is still `1` (see `crate::kv`'s own module docs).
 //!
 //! # Errors
 //!
@@ -78,7 +78,7 @@ pub(crate) struct DecodedSnapshot {
 ///
 /// `view.prefix("")` is the O(n) work in here - one [`KeyValue`] per key, plus the postcard
 /// encoding of the whole body. The caller's job is to have already taken `view` and `internal`
-/// cheaply (O(1): a persistent map's root and a clone of the - today empty - internal block)
+/// cheaply (O(1): a persistent map's root and a clone of the internal block's own)
 /// while holding the state machine's lock, and to call this afterwards, off that lock and off an
 /// async worker thread.
 ///

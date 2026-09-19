@@ -1,6 +1,6 @@
 //! Outbound HTTP: the single choke point every request this node sends to another node goes
-//! through - Raft append/vote/snapshot/transfer-leader and inter-node RPC today, forwarded writes
-//! and ReadIndex later.
+//! through - Raft append/vote/snapshot/transfer-leader, and inter-node RPC, which forwarded
+//! writes and ReadIndex rounds travel as.
 //!
 //! [`crate::network`] adapts this to openraft's network traits and maps [`TransportError`] to
 //! openraft's own error types; [`crate::rpc`] maps it to `RpcError`. This module only knows how

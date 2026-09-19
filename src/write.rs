@@ -139,9 +139,10 @@ pub enum LeaderWriteError {
 /// own loop proposes [`CommandBody::Txn`] and unwraps [`CommandOutcome::Txn`] out of `Done`;
 /// `crate::registry` proposes [`CommandBody::RegisterNode`]/`RemoveNode` and expects
 /// [`CommandOutcome::Registry`] instead. Neither caller can ever see the other's outcome variant
-/// in practice - each proposes only its own kind of body, and [`crate::storage::adapter`]'s apply
-/// loop answers a command with the outcome shape that matches its own `CommandBody` variant - so
-/// unwrapping the wrong one is an invariant violation, not a state either caller has to handle.
+/// from a node of this version - each proposes only its own kind of body, and
+/// [`crate::command::Command::apply`] answers a command with the outcome shape that matches its
+/// body. A forwarded command's answer is a peer's to give, though, so each caller still treats
+/// the wrong shape as no answer at all: logged, and retried.
 pub(crate) enum Attempt {
     /// Stop retrying: `Ok` is whatever the command produced, `Err` is a limit rejection that
     /// never reached the log (a [`CommandBody::Txn`] only concern - `propose` never validates any

@@ -3,8 +3,8 @@
 本仓库是 [原版 ezraft](https://github.com/drmingdrmer/ezraft) 的完全分叉，作为
 [ech0-media](https://github.com/2nterdigital/ech0-media) 的**底座**：在原版之上扩展复制 KV、任意节点读写、
 变更订阅、节点间 RPC、集群观测与生产级存储。规划与决策见
-[底座扩展 spec：第一个里程碑](https://github.com/2nterdigital/ech0-media/issues/21)；术语以 ech0-media 的
-`CONTEXT.md` 为准（底座、上游、原版 ezraft、节点、内部端口、集群 token、revision、变更……）。
+[底座扩展 spec：第一个里程碑](https://github.com/2nterdigital/ech0-media/issues/21)；术语以 ech0-media 仓库的
+[`CONTEXT.md`](https://github.com/2nterdigital/ech0-media/blob/main/CONTEXT.md) 为准（底座、上游、原版 ezraft、节点、内部端口、集群 token、revision、变更……）。
 
 ## 基线
 

@@ -74,10 +74,9 @@ const SNAPSHOT_DATA_KEY: &str = "data";
 ///
 /// # Encoding
 ///
-/// [`EzMeta`], [`EzEntry`] and the snapshot's metadata are `serde_json`, the same encoding
-/// [`crate::EzStorage`]'s other implementations use and robust to any `T::Request` an
-/// application defines. Snapshot data is stored as the raw bytes the state machine already
-/// serialized; this storage does not interpret them.
+/// [`EzMeta`], [`EzEntry`] and the snapshot's metadata are `serde_json`: self-describing, so a
+/// stored entry stays readable as the command types it carries grow. Snapshot data is stored as
+/// the raw bytes the state machine already serialized; this storage does not interpret them.
 ///
 /// [`persist`]: EzStorage::persist
 pub struct RedbStorage {

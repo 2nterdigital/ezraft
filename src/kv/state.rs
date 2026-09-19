@@ -281,9 +281,9 @@ impl KvState {
 
 /// Every key in `kv` that starts with `prefix`, in key order
 ///
-/// Shared by [`KvState::apply`]'s `DeletePrefix` handling and (via [`View::prefix`]) reads, so
-/// the two agree on exactly what a prefix matches - see `view.rs` for the raw-string-prefix
-/// semantics this implies (a prefix like `"room/1"` matches `"room/10"` too).
+/// What [`KvState::apply`]'s `DeletePrefix` deletes. [`View::prefix`] scans the same way, so a
+/// delete and a read agree on exactly what a prefix matches - see `view.rs` for the
+/// raw-string-prefix semantics this implies (a prefix like `"room/1"` matches `"room/10"` too).
 fn keys_with_prefix<'a>(kv: &'a OrdMap<Arc<str>, StoredValue>, prefix: &'a str) -> impl Iterator<Item = Arc<str>> + 'a {
     kv.range::<_, str>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
         .take_while(move |(key, _)| key.starts_with(prefix))

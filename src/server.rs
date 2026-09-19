@@ -4,10 +4,11 @@
 //! - Internal Raft RPC (append entries, vote, install snapshot, transfer leader)
 //! - Admin API (joining, node roles, removal, metrics)
 //!
-//! `/api/write` and `/api/read` - a sample write/read API typed by the user's own application -
-//! do not survive `EzApp` becoming an internal implementation detail (ech0-media#27b); any-node
-//! writes and reads are `EzKv::write`/`EzKv::view` on the public handle now, and forwarding a
-//! write to the leader over HTTP is ech0-media#30.
+//! - Inter-node RPC (`/rpc/<name>`), which also carries forwarded writes and ReadIndex rounds
+//!
+//! Everything here is the internal port, behind the cluster token. The crate serves no
+//! client-facing routes: writes and reads are `EzKv::write`/`EzKv::view` on the handle, and an
+//! application's own API is its own to serve (`examples/kvstore/api.rs`).
 
 use std::io::Cursor;
 

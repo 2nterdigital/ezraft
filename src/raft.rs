@@ -57,7 +57,7 @@ type Promotion = Arc<Mutex<Option<JoinHandle<Result<(), io::Error>>>>>;
 /// The HTTP server handle [`EzKv::serve_with`] hands to [`EzKv::shutdown`]
 ///
 /// Set once `serve`/`serve_with` has bound the node's address, and taken by `shutdown` so a node
-/// stopped that way releases the address again (wave S1 left this gap: see `FORK.md`).
+/// stopped that way releases the address again, and can be restarted on it in the same process.
 type ServeHandle = Arc<Mutex<Option<ServerHandle>>>;
 
 /// The node handle: create or join a cluster, serve it, and read and write its replicated KV
@@ -578,8 +578,8 @@ impl EzKv {
     ///
     /// Reports this node's own state, which is what a caller asking "am I the leader" wants. It
     /// is not a guarantee that the answer is still true elsewhere: a deposed leader does not
-    /// find out until it hears from the new one. Nothing here needs that guarantee -- writing
-    /// reports its own `NotLeader` when it matters, and a linearizable read
+    /// find out until it hears from the new one. Nothing here needs that guarantee -- a write
+    /// finds the real leader (or reports `Indeterminate`) by itself, and a linearizable read
     /// ([`crate::EzKv::linearizable_view`]) confirms leadership itself, on every call.
     pub fn is_leader(&self) -> bool {
         self.raft.is_leader()
