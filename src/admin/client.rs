@@ -40,12 +40,20 @@ const MEMBERSHIP_CHANGE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Every request carries `Authorization: Bearer <token>` (ech0-media#29): this client is used
 /// before a joining node has an id of its own - and so before it has a `Transport` - which is why
 /// it carries the token itself rather than going through that.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AdminClient {
     /// The node to ask
     addr: String,
     /// The cluster token every request presents as `Authorization: Bearer <token>`
     token: String,
+}
+
+/// Written out rather than derived: the token is a secret, and must never reach a log
+impl std::fmt::Debug for AdminClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { addr, token: _ } = self;
+        f.debug_struct("AdminClient").field("addr", addr).field("token", &"<redacted>").finish()
+    }
 }
 
 impl AdminClient {
