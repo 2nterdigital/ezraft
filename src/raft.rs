@@ -75,6 +75,12 @@ pub struct EzKv {
     /// The limits [`crate::write`] checks a transaction against before proposing it
     kv_limits: KvLimits,
 
+    /// `EzConfig::json_body_limit`, for [`crate::server::bind`] (ech0-media#26)
+    json_body_limit: usize,
+
+    /// `EzConfig::snapshot_max_bytes`, for [`crate::server::bind`] (ech0-media#26)
+    snapshot_max_bytes: usize,
+
     /// The actix `ServerHandle` for the address `serve`/`serve_with` bound, once bound
     serve_handle: ServeHandle,
 }
@@ -88,6 +94,8 @@ impl Clone for EzKv {
             promotion: self.promotion.clone(),
             view_rx: self.view_rx.clone(),
             kv_limits: self.kv_limits,
+            json_body_limit: self.json_body_limit,
+            snapshot_max_bytes: self.snapshot_max_bytes,
             serve_handle: self.serve_handle.clone(),
         }
     }
@@ -188,6 +196,8 @@ impl EzKv {
         // cluster a learner that then has to be removed by hand.
         let raft_config = Arc::new(config.to_raft_config()?);
         let kv_limits = config.kv_limits;
+        let json_body_limit = config.json_body_limit;
+        let snapshot_max_bytes = config.snapshot_max_bytes;
 
         // Open user storage as the two stores openraft asks for
         let (log, sm) = open(storage).await?;
@@ -227,10 +237,15 @@ impl EzKv {
             id
         };
 
+        // The state machine only learns this node's id now: `open` (and so `sm`'s own
+        // construction) ran before it was known. Tracing is the only thing that needs it
+        // (DESIGN.md §8, ech0-media#26's snapshot build/install events).
+        sm.set_node_id(node_id);
+
         // Create network factory. `with_faults` only exists under the `fault-injection`
         // feature; shadowing rather than a `mut` binding keeps a non-feature build from
         // warning about a binding that is never mutated.
-        let network = EzNetworkFactory::new(node_id)?;
+        let network = EzNetworkFactory::new(node_id, snapshot_max_bytes)?;
         #[cfg(feature = "fault-injection")]
         let network = network.with_faults(config.faults.clone());
 
@@ -268,6 +283,8 @@ impl EzKv {
             promotion: Arc::new(Mutex::new(promotion)),
             view_rx,
             kv_limits,
+            json_body_limit,
+            snapshot_max_bytes,
             serve_handle: Arc::new(Mutex::new(None)),
         })
     }
@@ -275,6 +292,16 @@ impl EzKv {
     /// The limits `crate::write` checks a transaction against before proposing it
     pub(crate) fn kv_limits(&self) -> KvLimits {
         self.kv_limits
+    }
+
+    /// `EzConfig::json_body_limit`, for [`crate::server::bind`]
+    pub(crate) fn json_body_limit(&self) -> usize {
+        self.json_body_limit
+    }
+
+    /// `EzConfig::snapshot_max_bytes`, for [`crate::server::bind`]
+    pub(crate) fn snapshot_max_bytes(&self) -> usize {
+        self.snapshot_max_bytes
     }
 
     /// This node's latest published view of the KV

@@ -16,6 +16,7 @@ use actix_web::HttpServer;
 use actix_web::dev::Server;
 use actix_web::web;
 use actix_web::web::Data;
+use actix_web::web::PayloadConfig;
 use actix_web::web::ServiceConfig;
 use openraft::Snapshot;
 use openraft::errors::Infallible;
@@ -25,10 +26,19 @@ use openraft::raft::SnapshotResponse;
 
 use crate::admin::MembershipChange;
 use crate::admin::Redirect;
-use crate::network::SnapshotTransfer;
+use crate::network::decode_snapshot_request;
 use crate::node_role::NodeRole;
 use crate::raft::EzKv;
 use crate::type_config::OpenRaftTypes;
+
+/// Slack over `EzConfig::snapshot_max_bytes` for the length-prefixed header
+/// (`crate::network::encode_snapshot_request`) riding ahead of the snapshot bytes on
+/// `/raft/snapshot`: a handful of small fields (a vote, a log id, a membership), nowhere near
+/// this large even for a sizeable cluster. Keeps the sender's own pre-send size check
+/// (`crate::network::Network::full_snapshot`, which compares only the snapshot bytes) and the
+/// receiver's `PayloadConfig` limit (which bounds the whole framed body) from disagreeing at the
+/// boundary.
+const SNAPSHOT_FRAME_OVERHEAD_ALLOWANCE: usize = 4 * 1024;
 
 /// Type alias for OpenRaft types
 type C = OpenRaftTypes;
@@ -104,21 +114,27 @@ impl EzServer {
     /// Raft install snapshot RPC handler
     ///
     /// A leader falls back to this when a follower lags behind the purged log. The snapshot
-    /// arrives whole in a single request.
+    /// arrives whole in a single request, as a raw `application/octet-stream` body with a small
+    /// length-prefixed JSON preamble carrying the vote and `SnapshotMeta` (ech0-media#26,
+    /// `crate::network::decode_snapshot_request`) - never as JSON itself, which would serialize
+    /// the snapshot bytes as an array of numbers. Malformed framing is a `400` naming what was
+    /// wrong; a body over `EzConfig::snapshot_max_bytes` never reaches this handler at all - the
+    /// `PayloadConfig` on this route (see `bind`) answers it with `413` first.
     async fn handle_snapshot(
-        req: web::Json<SnapshotTransfer>,
+        body: web::Bytes,
         ez: Data<Self>,
     ) -> Result<web::Json<Result<SnapshotResponse<C>, Infallible>>, actix_web::Error> {
-        let SnapshotTransfer { vote, meta, data } = req.into_inner();
+        let (header, data) =
+            decode_snapshot_request(&body).map_err(|e| actix_web::error::ErrorBadRequest(e.to_string()))?;
         let snapshot = Snapshot {
-            meta,
-            snapshot: Cursor::new(data),
+            meta: header.meta,
+            snapshot: Cursor::new(data.to_vec()),
         };
 
         let resp = ez
             .raft
             .inner()
-            .install_full_snapshot(vote, snapshot)
+            .install_full_snapshot(header.vote, snapshot)
             .await
             .map_err(|e| actix_web::error::ErrorInternalServerError(format!("install_snapshot failed: {}", e)))?;
 
@@ -212,19 +228,31 @@ impl EzServer {
 /// itself - the caller ([`EzKv::serve_with`](crate::raft::EzKv::serve_with)) needs the `Server`'s
 /// own `handle()` before the accept loop starts, so [`EzKv::shutdown`](crate::raft::EzKv::shutdown)
 /// can stop it later.
+///
+/// `EzConfig::json_body_limit` sets the app-wide `JsonConfig` limit (every route here but
+/// `/raft/snapshot` is JSON, `configure`'s own routes included); `/raft/snapshot` gets its own
+/// `PayloadConfig`, from `EzConfig::snapshot_max_bytes`, since it is the one route whose body can
+/// legitimately be far larger than any JSON request this node accepts (ech0-media#26).
 pub(crate) fn bind<F>(raft: EzKv, configure: F) -> std::io::Result<Server>
 where F: Fn(&mut ServiceConfig) + Clone + Send + 'static {
     let addr = raft.addr().to_string();
+    let json_body_limit = raft.json_body_limit();
+    let snapshot_payload_limit = raft.snapshot_max_bytes().saturating_add(SNAPSHOT_FRAME_OVERHEAD_ALLOWANCE);
     let server_data = Data::new(EzServer::new(raft));
 
     let server = HttpServer::new(move || {
         let configure = configure.clone();
         App::new()
             .app_data(server_data.clone())
+            .app_data(web::JsonConfig::default().limit(json_body_limit))
             // Raft internal RPC
             .route("/raft/append", web::post().to(EzServer::handle_append))
             .route("/raft/vote", web::post().to(EzServer::handle_vote))
-            .route("/raft/snapshot", web::post().to(EzServer::handle_snapshot))
+            .service(
+                web::resource("/raft/snapshot")
+                    .app_data(PayloadConfig::new(snapshot_payload_limit))
+                    .route(web::post().to(EzServer::handle_snapshot)),
+            )
             .route(
                 "/raft/transfer_leader",
                 web::post().to(EzServer::handle_transfer_leader),
