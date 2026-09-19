@@ -112,6 +112,8 @@ async fn main() -> io::Result<()> {
 `seed_addr`，也不会重新发起提升——一个节点当前是不是投票者，完全由集群的成员配置决定，重启不会改变它。
 
 节点 id 由集群分配、持久化，不是配置出来的：三节点集群的 id 可能是 `0`、`7`、`2` 这样不连续但唯一的数字。
+`EzKv::node_id()` 读出这个节点自己的 id，`EzKv::addr()` 读出它的内部端口地址（就是传给 `create`/`join`
+的 `http_addr`）。
 
 ### 内部端口与集群 token
 
@@ -270,15 +272,15 @@ use ezraft::Txn;
 use ezraft::WriteError;
 
 /// `Indeterminate` 之后如何收尾：用同一个 request_id、同一个 txn 继续问，直到拿到确定结果；
-/// `LocalLag` 当作已经成功、只是本地还没追上来处理。
-async fn write_until_definite(node: &EzKv, id: RequestId, txn: Txn) -> Result<u64, ezraft::Conflict> {
+/// `LocalLag` 当作已经成功、只是本地还没追上来处理。`Conflict` 和 `LimitExceeded` 都是确定结果，
+/// 原样交还给调用方——重试不会改变它们。
+async fn write_until_definite(node: &EzKv, id: RequestId, txn: Txn) -> Result<u64, WriteError> {
     loop {
         match node.write_with_id(id, txn.clone()).await {
             Ok(revision) => return Ok(revision),
             Err(WriteError::LocalLag(LocalLag { revision })) => return Ok(revision),
-            Err(WriteError::Conflict(conflict)) => return Err(conflict),
             Err(WriteError::Indeterminate { .. }) => continue,
-            Err(WriteError::LimitExceeded(_)) => unreachable!("txn was already validated once"),
+            Err(definite @ (WriteError::Conflict(_) | WriteError::LimitExceeded(_))) => return Err(definite),
         }
     }
 }
@@ -345,8 +347,13 @@ fn list_all_participants(node: &EzKv, room: &str) -> Vec<ezraft::KeyValue> {
   追上这个确认位置，返回本地 `View`。
 - 在 follower 或学习者上，同样的确认经内部 RPC 在 leader 上发生，follower 本地再等自己的应用追上，返回
   的是 follower 自己的 `View`——线性读永远返回调用节点自己的视图，不是把 leader 的数据搬过来。
-- 同一个节点上并发的多个线性读会共享同一轮向 leader 确认的 RPC（至多两轮就能服务任意并发量），所以大量
-  并发的线性读不会把 leader 压垮。
+- 同一个 follower 或学习者上并发的多个线性读会共享同一轮向 leader 确认的 RPC（至多两轮就能服务任意
+  并发量），所以一个节点上大量并发的线性读只给 leader 带来常数量级的负担。**leader 自己身上的线性读不做
+  合并**：每次调用各自向多数派确认一轮。需要在 leader 上大量读、又不要求线性一致的路径，用本地视图。
+- 一个已经被移出集群的节点再也收不到任何复制，它自己的成员视图不会更新；它靠这条确认路径得知自己已被
+  移除（`ReadError::NotMember`）：它认识的 leader 联系不上、或者已经不是 leader 时，会转而询问它记得的
+  其他成员，并沿着对方给出的 leader 提示再问一次。只有刚确认过自己是 leader 的节点才会回答
+  `NotMember`——follower 的成员视图可能还没追上「把调用方加进来」的那次变更。
 
 `timeout` 限定确认加本地追赶合起来的总时间。失败时是 `ReadError`：
 
@@ -435,54 +442,71 @@ async fn resume_and_consume(node: &EzKv, prefix: &str, after: u64) {
 ```
 
 节点重启之后，保留窗口是空的，下限就是重启时状态的 revision；随后重放日志尾巴的过程会把这些变更重新
-投递进窗口，一个跨重启续订的订阅可能因此重复看到一部分变更（重放导致的重复投递，不是 bug）。**这些重复
-按每个 key 的 `mod_rev` 去重**——只在新变更的 `mod_rev` 严格大于本地已记录的值时才应用它：
+投递进窗口，一个跨重启续订的订阅可能因此重复看到一部分变更（重放导致的重复投递，不是 bug）。重复总是
+**整组**重复，revision 与第一次投递时完全相同，所以最简单也最可靠的去重单位是组：**只应用 revision 严格
+大于上一次已应用的那一组的 `Changes`**。落到单个 key 上这与「按 `mod_rev` 去重」是同一件事——一个
+`Change::Put` 的 `mod_rev` 就是它所在那一组的 revision；但 `Change::Delete` 自己没有 `mod_rev`（它带的
+`prev.mod_rev` 是*被删掉的那个值*的版本，恰好等于本地已记录的值，拿它来比会把每一次删除都当成重复丢掉），
+删除发生的版本只能从组的 revision 读出。按 key 去重的实现因此还必须为已删除的 key 保留一个「墓碑」版本，
+否则一次重放的旧 `Put` 会让已删除的 key 复活；按组去重不需要这些：
 
 ```rust
 use std::collections::BTreeMap;
 
 use ezraft::Change;
+use ezraft::Changes;
 use ezraft::KeyValue;
+use ezraft::View;
 
-/// 用 `mod_rev` 去重折叠 watch 产出的变更：重放导致的重复投递不会造成重复的业务动作。
+/// 把 watch 产出的变更折叠成一份本地状态，按组的 revision 去重：重放导致的重复投递不会造成重复的
+/// 业务动作，已删除的 key 也不会被一次重放的旧 `Put` 复活。
 #[derive(Default)]
-struct Folded(BTreeMap<String, KeyValue>);
+struct Folded {
+    /// 已应用的最后一组变更的 revision（或者最近一次 `Reset` 的 `view.revision()`）
+    revision: u64,
+    entries: BTreeMap<String, KeyValue>,
+}
 
 impl Folded {
-    fn apply(&mut self, change: Change) {
-        let mod_rev = match &change {
-            Change::Put { mod_rev, .. } => *mod_rev,
-            Change::Delete { prev, .. } => prev.mod_rev,
-        };
-        let key = match &change {
-            Change::Put { key, .. } | Change::Delete { key, .. } => key.clone(),
-        };
+    /// `WatchUpdate::Reset`：丢弃旧状态，从 `view` 在订阅前缀下的内容重新开始。
+    fn reset(&mut self, view: &View, prefix: &str) {
+        self.entries = view.prefix(prefix).map(|kv| (kv.key.clone(), kv)).collect();
+        self.revision = view.revision();
+    }
 
-        if self.0.get(&key).is_some_and(|kv| kv.mod_rev >= mod_rev) {
-            return; // 已经应用过这个或更新的版本
+    /// `WatchUpdate::Changes`：整组应用，或者整组跳过。
+    fn apply(&mut self, changes: Changes) {
+        if changes.revision <= self.revision {
+            return; // 这一组已经应用过：重放造成的重复投递
         }
 
-        match change {
-            Change::Put {
-                key,
-                value,
-                create_rev,
-                mod_rev,
-            } => {
-                self.0.insert(key.clone(), KeyValue {
+        for change in changes.items {
+            match change {
+                Change::Put {
                     key,
                     value,
                     create_rev,
                     mod_rev,
-                });
-            }
-            Change::Delete { key, .. } => {
-                self.0.remove(&key);
+                } => {
+                    self.entries.insert(key.clone(), KeyValue {
+                        key,
+                        value,
+                        create_rev,
+                        mod_rev,
+                    });
+                }
+                Change::Delete { key, .. } => {
+                    self.entries.remove(&key);
+                }
             }
         }
+        self.revision = changes.revision;
     }
 }
 ```
+
+把状态持久化到别处（数据库、下游系统）的消费者同理：把「已应用到的 revision」和状态放在同一次持久化里
+一起提交，恢复后用 `WatchStart::After(那个 revision)` 续订，并按上面的规则跳过不比它新的组。
 
 保留窗口本身是每节点一份的内存环形缓冲，按组数和字节数两个上限截断（`EzConfig::watch_limits` 的
 `max_window_groups`/`max_window_bytes`），不进快照、不跨节点复制；每个订阅者的待投递队列长度上限是
@@ -859,7 +883,13 @@ postcard 是无自描述标签的定长位置编码，不知道版本就没法�
 构建快照时，只在状态机的锁内做 O(1) 的操作：复制持久化 map 的根指针、复制内部状态块、记下
 `last_applied` 与成员配置；真正的 postcard 编码在锁外、在阻塞线程池上进行，既不阻塞 `apply` 也不阻塞
 `view()`。快照按日志条数触发（`EzConfig::snapshot_interval`），什么时候改发整份快照而不是逐条日志由
-`replication_lag_threshold` 决定，详见「启动集群」一节里 `EzConfig` 的说明。
+`replication_lag_threshold` 决定，详见「启动集群」一节里 `EzConfig` 的说明。构建与安装是并发的
+（openraft 把构建放在独立任务里）：如果一次构建还在编码时 leader 发来的更新的快照先装好了，构建完成
+后会发现已有的快照不比自己旧，于是丢弃自己的结果——存储里的快照永远不会倒退到日志已清理的位置之前。
+
+两个运维用的方法：`EzKv::trigger_snapshot()` 不等阈值、立刻安排一次快照（返回时只是「已安排」，用
+`wait_metrics` 等 `snapshot` 到达目标位置）；`EzKv::purge_log(upto_index)` 删除到 `upto_index` 为止、
+且已被快照覆盖的日志条目。正常运行不需要调用它们，快照策略会自己做这两件事。
 
 ### 测试专用的网络故障注入
 
