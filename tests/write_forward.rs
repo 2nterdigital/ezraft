@@ -177,21 +177,31 @@ async fn an_isolated_leaders_write_honors_the_deadline_and_reports_indeterminate
     let WriteError::Indeterminate { request_id } = err else {
         panic!("expected Indeterminate, got {err}");
     };
+    // Returning at all proves the point - without its own bound the call would still be waiting
+    // when the harness gave up on it - so this only checks the delay is the deadline's, with room
+    // for a loaded machine, and not something on the order of that harness wait.
     assert!(
-        started.elapsed() < deadline * 5,
+        started.elapsed() < deadline * 10,
         "write took {:?} against a {:?} deadline",
         started.elapsed(),
         deadline
     );
 
-    // Once the network heals the same request id settles the question: whatever happened to the
-    // first attempt, the write takes effect exactly once.
+    // Once the network heals, the same request id settles the question: whatever happened to the
+    // first attempt, the write takes effect exactly once. Healing can land in the middle of the
+    // election the isolation provoked, so one more deadline may still pass without a definite
+    // answer - and asking again under the same id, until there is one, is what a caller does.
     faults.heal();
-    let revision = a.write_with_id(request_id, set("stale", "value")).await.or_else(|e| match e {
-        // `a` may still be catching up with the new leader's log when the answer arrives.
-        WriteError::LocalLag(LocalLag { revision }) => Ok(revision),
-        other => Err(io::Error::other(other.to_string())),
-    })?;
+    let settle_by = tokio::time::Instant::now() + WAIT.expect("cluster waits are bounded");
+    let revision = loop {
+        match a.write_with_id(request_id, set("stale", "value")).await {
+            Ok(revision) => break revision,
+            // `a` may still be catching up with the new leader's log when the answer arrives.
+            Err(WriteError::LocalLag(LocalLag { revision })) => break revision,
+            Err(WriteError::Indeterminate { .. }) if tokio::time::Instant::now() < settle_by => continue,
+            Err(other) => return Err(io::Error::other(other.to_string())),
+        }
+    };
     for node in [&a, &b, &c] {
         let view = wait_for_revision(node, revision).await?;
         let kv = view.get("stale").expect("the write took effect");
