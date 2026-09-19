@@ -1,23 +1,34 @@
 //! Snapshots and the log they replace: persistence, restart, replay, catching a
-//! lagging node up, and purging what a snapshot covers
+//! lagging node up, purging what a snapshot covers, non-blocking builds, and configuration
 //!
 //! Every test drives `EzKv` through its public API and real HTTP between nodes; a few also
 //! shut a node down and read its redb file directly through `RedbStorage`'s own public
-//! `load`/`read_logs` to confirm what actually reached disk, never through a private field.
-//! None of them decode a snapshot's own bytes: the interim encoding (ech0-media#27b) is
-//! crate-internal on purpose (ech0-media#28 replaces it), so these assert only what a restart
-//! or a lagging joiner observably recovers.
+//! `load`/`persist` to confirm what actually reached disk, or to patch a stored snapshot's bytes
+//! at the codec's documented header offset - never through a private field. None of them decode a
+//! snapshot's *body*: the postcard codec's own round-trip, error and version tests live at its
+//! unit-test seam (`src/kv/snapshot_codec.rs`), so these assert only what a restart or a lagging
+//! joiner observably recovers, and what an unreadable stored snapshot observably does to startup.
 
 mod common;
 
 use std::collections::BTreeSet;
 use std::io;
+use std::io::Cursor;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use common::*;
 use ezraft::EzConfig;
 use ezraft::EzKv;
+use ezraft::EzSnapshot;
 use ezraft::EzStorage;
+use ezraft::KvLimits;
+use ezraft::Persist;
 use ezraft::ReadPolicy;
+use ezraft::Txn;
 
 /// A snapshot must land on disk when built, and a restarted node must rebuild
 /// the full state from that snapshot plus the log entries after it - values and revision alike.
@@ -193,9 +204,128 @@ async fn lagging_joiner_catches_up_from_snapshot() -> io::Result<()> {
     Ok(())
 }
 
-/// A demo-sized write load must drive the whole persist lifecycle on its own:
-/// with `snapshot_interval` configured, a snapshot reaches storage and the log
-/// entries it covers are deleted, all without a manual trigger.
+/// Building a snapshot large enough that encoding is not instantaneous must never block `apply`
+/// or `view()`: writes proposed right after `trigger_snapshot()` keep being acknowledged, and
+/// `view()` keeps answering, for as long as the build is still in flight.
+///
+/// The assertion is made robust rather than timing-lucky by *comparing measured throughput*, not
+/// by racing against a fixed count or a fixed sleep - the machine running this suite may be doing
+/// anything from sitting idle to compiling several other test binaries in parallel, so no absolute
+/// number of writes-per-millisecond is safe to assume ahead of time. Instead: a background loop
+/// counts how many writes it can get acknowledged for as long as the build is in flight (`during`,
+/// over `elapsed`, whatever that turns out to be on this run), then the *same* loop runs again for
+/// exactly `elapsed` more with no build in flight (`after`) - a self-calibrated baseline of this
+/// machine's current write throughput, measured in the same test run instead of assumed. If
+/// `build_snapshot` held the state machine's lock across encoding (the bug the non-blocking build
+/// requirement exists to prevent), every write proposed after the first would queue behind that
+/// same lock and none of them could complete until the build itself finished: `during` would come
+/// back near zero regardless of how fast or slow this machine otherwise is, while `after` - the
+/// same loop, same machine, moments later - would not.
+///
+/// The state is reached through *one* transaction with many small `Put`s (raised
+/// `kv_limits.max_txn_ops`/`max_txn_bytes` admit it) rather than many small round trips or a few
+/// huge values: collecting 600,000 keys into a `Vec<KeyValue>` and postcard-encoding them is
+/// genuinely slow (tens to hundreds of milliseconds of allocation-bound CPU work - a far more
+/// robust source of a measurable encode than trying to make a `memcpy`-bound large-value payload
+/// slow) while setup itself stays a single write.
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_build_does_not_block_writes_or_views() -> io::Result<()> {
+    const ENTRIES: usize = 600_000;
+
+    let big_state_config = EzConfig {
+        kv_limits: KvLimits {
+            max_txn_ops: ENTRIES + 10,
+            max_txn_bytes: 32 * 1024 * 1024,
+            ..KvLimits::default()
+        },
+        json_body_limit: 128 * 1024 * 1024,
+        ..config()
+    };
+    let (_addr, a, _data) = founding_node_with(big_state_config).await?;
+
+    let mut bulk = Txn::new();
+    for i in 0..ENTRIES {
+        bulk = bulk.put(format!("bulk{i:010}"), "0123456789");
+    }
+    a.write(bulk).await.map_err(|e| io::Error::other(e.to_string()))?;
+    let revision_before_snapshot = a.view().revision();
+
+    a.trigger_snapshot().await?;
+
+    let build_start = Instant::now();
+    let (during_count, wait_result) = writes_while(
+        &a,
+        "during",
+        a.wait_metrics(WAIT, |m| m.snapshot.is_some(), "snapshot built"),
+    )
+    .await;
+    wait_result?;
+    let build_elapsed = build_start.elapsed();
+
+    // The self-calibrated baseline: the very same kind of loop, run for exactly as long as the
+    // build just took, but now that it has finished.
+    let (after_count, ()) = writes_while(&a, "after", tokio::time::sleep(build_elapsed)).await;
+
+    assert!(
+        during_count > 0,
+        "no write was acknowledged in {build_elapsed:?} while the snapshot was being built - \
+         build_snapshot must be holding the state machine's lock across encoding"
+    );
+    assert!(
+        during_count.saturating_mul(4) >= after_count,
+        "only {during_count} write(s) landed during the {build_elapsed:?} build, versus \
+         {after_count} in the same span immediately afterwards with no build in flight - \
+         build_snapshot must be holding the state machine's lock across encoding instead of \
+         releasing it before that CPU-bound work runs"
+    );
+    assert!(
+        a.view().revision() > revision_before_snapshot,
+        "view() must reflect the writes that landed during the build, proving it kept answering \
+         and kept advancing rather than being stuck on a stale value"
+    );
+
+    Ok(())
+}
+
+/// Run a background loop that writes distinct small keys (named `{prefix}{i}`) and reads
+/// `view()` as fast as it can until `until` resolves, then return how many writes it got
+/// acknowledged together with `until`'s own result.
+///
+/// `view()` never awaits and never touches the state machine's lock, so calling it on every
+/// iteration proves it keeps answering for the same window the write count proves it for writes.
+async fn writes_while<F, T>(node: &EzKv, prefix: &str, until: F) -> (usize, T)
+where F: std::future::Future<Output = T> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let acked = Arc::new(AtomicUsize::new(0));
+    let writer = {
+        let node = node.clone();
+        let stop = stop.clone();
+        let acked = acked.clone();
+        let prefix = prefix.to_string();
+        tokio::spawn(async move {
+            let mut i = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let _ = node.view();
+                if node.write(set(&format!("{prefix}{i}"), "v")).await.is_ok() {
+                    acked.fetch_add(1, Ordering::Relaxed);
+                }
+                i += 1;
+            }
+        })
+    };
+
+    let result = until.await;
+    stop.store(true, Ordering::Relaxed);
+    writer.await.expect("the writer loop task must not panic");
+
+    (acked.load(Ordering::Relaxed), result)
+}
+
+/// A demo-sized write load must drive the whole persist lifecycle on its own: with
+/// `snapshot_interval`, `snapshot_log_to_keep` and `replication_lag_threshold` configured
+/// together, a snapshot reaches storage and the log entries it covers are deleted, all without a
+/// manual trigger - proving the three parameters take effect rather than being silently ignored
+/// or re-derived from the interval alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn automatic_snapshot_purges_old_logs() -> io::Result<()> {
     let addr = free_addr();
@@ -203,6 +333,8 @@ async fn automatic_snapshot_purges_old_logs() -> io::Result<()> {
 
     let node_config = EzConfig {
         snapshot_interval: 5,
+        snapshot_log_to_keep: Some(1),
+        replication_lag_threshold: Some(5),
         ..config()
     };
     let a = EzKv::create(&addr, data.open().await?, node_config).await?;
@@ -313,6 +445,78 @@ async fn restart_after_a_snapshot_with_no_log_after_it() -> io::Result<()> {
     // both positions back and refuses an inverted pair. A fresh address because
     // this node is only constructed, never served.
     EzKv::join_as_learner(&free_addr(), &addr_a, data_c.open().await?, config()).await?;
+
+    Ok(())
+}
+
+/// An inconsistent snapshot parameter combination refuses to start a node outright: openraft's
+/// own docs warn that a `replication_lag_threshold` below the snapshot policy's threshold may
+/// leave a snapshot unable to catch a lagging follower up, so this must fail at `EzKv::create`
+/// with a message naming the problem, never silently accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inconsistent_replication_lag_threshold_refuses_to_start_the_node() -> io::Result<()> {
+    let addr = free_addr();
+    let data = NodeData::new();
+
+    let bad_config = EzConfig {
+        snapshot_interval: 500,
+        replication_lag_threshold: Some(10),
+        ..config()
+    };
+
+    let err = EzKv::create(&addr, data.open().await?, bad_config)
+        .await
+        .map(|_| ())
+        .expect_err("an inconsistent replication_lag_threshold must be refused");
+    assert!(
+        err.to_string().contains("replication_lag_threshold") && err.to_string().contains("snapshot_interval"),
+        "unexpected error: {err}"
+    );
+
+    Ok(())
+}
+
+/// A stored snapshot whose header names a format version this build does not understand makes
+/// the node fail to start with an explicit error, instead of silently misparsing it. Bytes are
+/// patched at the codec's documented header offset - a 4-byte magic, then a little-endian `u16`
+/// version at bytes `4..6` - never by reaching into a private field of storage: this is the same
+/// technique `src/kv/snapshot_codec.rs`'s own unit tests use, exercised here through the public
+/// `RedbStorage`/`EzStorage` seam instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_snapshot_with_an_unknown_version_refuses_to_start_the_node() -> io::Result<()> {
+    let addr = free_addr();
+    let data = NodeData::new();
+
+    let a = EzKv::create(&addr, data.open().await?, config()).await?;
+    a.wait_metrics(WAIT, |m| m.current_leader == Some(0), "single node leads").await?;
+    a.write(set("a", "1")).await.map_err(|e| io::Error::other(e.to_string()))?;
+    a.trigger_snapshot().await?;
+    a.wait_metrics(WAIT, |m| m.snapshot.is_some(), "snapshot built").await?;
+    a.shutdown().await?;
+    drop(a);
+
+    // Read the real, valid snapshot bytes back, patch just the version field, and persist the
+    // result - through `RedbStorage`'s own public `load`/`persist`, the same seam a restart uses.
+    let mut probe = data.open().await?;
+    let stored = probe.load().await?.snapshot.expect("snapshot persisted to storage");
+    let mut bytes = stored.snapshot.into_inner();
+    bytes[4..6].copy_from_slice(&9999u16.to_le_bytes());
+    probe
+        .persist(Persist::Snapshot(EzSnapshot {
+            meta: stored.meta,
+            snapshot: Cursor::new(bytes),
+        }))
+        .await?;
+    drop(probe);
+
+    let err = EzKv::create(&addr, data.open().await?, config())
+        .await
+        .map(|_| ())
+        .expect_err("a stored snapshot with an unknown version must refuse to start the node");
+    assert!(
+        err.to_string().contains("version"),
+        "error must name the version problem explicitly, got: {err}"
+    );
 
     Ok(())
 }

@@ -26,15 +26,14 @@ use openraft::alias::LogIdOf;
 use openraft::alias::StoredMembershipOf;
 use openraft::storage::EntryResponder;
 use openraft::storage::RaftStateMachine;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::command::Command;
-use crate::kv::KeyValue;
 use crate::kv::KvState;
 use crate::kv::Publisher;
 use crate::kv::ViewReceiver;
+use crate::kv::decode_snapshot;
+use crate::kv::encode_snapshot;
 use crate::snapshot::EzSnapshot;
 use crate::snapshot::EzSnapshotData;
 use crate::snapshot::EzSnapshotMeta;
@@ -95,18 +94,6 @@ impl Clone for StateMachineStore {
     }
 }
 
-/// The adapter's own tiny snapshot envelope: every entry plus the revision counter
-///
-/// The smallest encoding that lets a restart or a lagging joiner reconstruct identical KV state,
-/// `revision`, `create_rev` and `mod_rev` included. ech0-media#28 replaces this with the
-/// postcard v1 format (a magic, a version header, a lock-free build); this stays JSON like every
-/// other Raft-adjacent type in this crate until then.
-#[derive(Serialize, Deserialize)]
-struct KvExport {
-    revision: u64,
-    entries: Vec<KeyValue>,
-}
-
 impl StateMachineStore {
     /// Restore the state machine from the snapshot the storage loaded, if there is one
     ///
@@ -115,14 +102,29 @@ impl StateMachineStore {
     /// snapshot itself. The publisher this constructs already holds that restored view - the
     /// "publish after startup recovery" the read path needs (ech0-media#16) falls out of the log
     /// tail's own applies, or, if there is no tail, out of this initial value.
+    ///
+    /// An unknown format version - or any other way the stored bytes fail to decode - is
+    /// reported here as a plain `Err`, which is exactly how `crate::raft::EzKv::new` (via
+    /// `crate::storage::adapter::open`) already propagates every other startup failure: it makes
+    /// `create`/`join` fail outright rather than starting a node on a snapshot it cannot read.
     pub(super) fn new(storage: SharedStorage, snapshot: Option<EzSnapshot>) -> Result<Self, std::io::Error> {
         let (last_applied, membership, kv) = match &snapshot {
             Some(snap) => {
-                let export: KvExport = serde_json::from_slice(snap.snapshot.get_ref())?;
+                let decoded = decode_snapshot(snap.snapshot.get_ref())
+                    .inspect_err(|e| {
+                        tracing::error!(
+                            last_log_id = ?snap.meta.last_log_id,
+                            size_bytes = snap.snapshot.get_ref().len(),
+                            error = %e,
+                            outcome = "failed",
+                            "failed to load the stored snapshot at startup: invalid or unsupported snapshot data",
+                        );
+                    })
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                 (
                     snap.meta.last_log_id,
                     snap.meta.last_membership.clone(),
-                    KvState::restore(export.revision, export.entries),
+                    KvState::restore(decoded.revision, decoded.entries, decoded.internal),
                 )
             }
             None => (None, StoredMembership::new(None, Membership::default()), KvState::new()),
@@ -240,22 +242,28 @@ impl RaftStateMachine<OpenRaftTypes> for StateMachineStore {
         cursor.read_to_end(&mut data)?;
         let size_bytes = data.len();
 
-        // Deserialized before anything keeps it. Bytes that do not parse - a corrupt transfer, a
-        // peer of an incompatible version - are this transfer's problem, and persisting them would
-        // make them every later start's problem too: [`Self::new`] reads the stored snapshot and
-        // would fail on the same bytes, with the state they replaced already gone.
-        let export: KvExport = serde_json::from_slice(&data).inspect_err(|e| {
-            tracing::warn!(
-                node_id = ?self.node_id(),
-                last_log_id = ?snapshot_meta.last_log_id,
-                size_bytes,
-                elapsed_ms = start.elapsed().as_millis(),
-                error = %e,
-                outcome = "failed",
-                "failed to install a snapshot: invalid snapshot data",
-            );
-        })?;
-        let kv = KvState::restore(export.revision, export.entries);
+        // Decoded and validated - magic, format version, then the body - before anything keeps
+        // it. Bytes that do not decode - a corrupt transfer, an unknown format version from a
+        // peer running an incompatible build - are this transfer's problem, and persisting them
+        // would make them every later start's problem too: [`Self::new`] reads the stored
+        // snapshot back and would fail on the same bytes, with the state they replaced already
+        // gone. openraft treats an `Err` from `install_snapshot` as fatal to this node, which is
+        // exactly the "stop" an unknown version calls for - logged at `error` before it
+        // propagates, not merely `warn`.
+        let decoded = decode_snapshot(&data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            .inspect_err(|e| {
+                tracing::error!(
+                    node_id = ?self.node_id(),
+                    last_log_id = ?snapshot_meta.last_log_id,
+                    size_bytes,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    error = %e,
+                    outcome = "failed",
+                    "failed to install a snapshot: invalid or unsupported snapshot data",
+                );
+            })?;
+        let kv = KvState::restore(decoded.revision, decoded.entries, decoded.internal);
 
         // Update storage state
         {
@@ -306,13 +314,25 @@ impl RaftSnapshotBuilder<OpenRaftTypes> for StateMachineStore {
     async fn build_snapshot(&mut self) -> Result<EzSnapshot, std::io::Error> {
         let start = Instant::now();
 
-        // Get current state machine state and build snapshot data
-        let (last_applied, last_membership, snapshot_data) = {
+        // Hold the lock only long enough to clone O(1) state: the persistent map's root
+        // (`KvState::view`), the (today empty) internal state block, `last_applied` and the
+        // membership. Encoding - O(n) over every key, and CPU work once the state is large -
+        // happens after the lock is released, off this async worker thread: `apply` and `view()`
+        // proceed at full speed while a snapshot is being encoded.
+        let (view, internal, last_applied, last_membership) = {
             let sm = self.sm_state.lock().await;
-            let (revision, entries) = sm.kv.export();
-            let data = serde_json::to_vec(&KvExport { revision, entries })?;
-            (sm.last_applied, sm.membership.clone(), data)
+            (
+                sm.kv.view(),
+                sm.kv.internal_state(),
+                sm.last_applied,
+                sm.membership.clone(),
+            )
         };
+
+        let snapshot_data = tokio::task::spawn_blocking(move || encode_snapshot(&view, &internal))
+            .await
+            .map_err(|e| std::io::Error::other(format!("snapshot encoding task panicked: {e}")))?
+            .map_err(std::io::Error::other)?;
 
         let snapshot_meta = SnapshotMeta {
             last_log_id: last_applied,
@@ -358,6 +378,7 @@ mod tests {
     use openraft::Membership;
 
     use super::*;
+    use crate::kv::KeyValue;
     use crate::kv::Txn;
     use crate::storage::EzStorage;
     use crate::storage::Loaded;
@@ -366,7 +387,9 @@ mod tests {
     /// A snapshot as it sits in storage: its metadata, and the bytes of the state
     type StoredSnapshot = Option<(EzSnapshotMeta, Vec<u8>)>;
 
-    /// Storage that keeps the snapshot it was last asked to persist
+    /// Storage that keeps the snapshot it was last asked to persist, and hands it back from
+    /// `load()` - so a test can drive either `install_snapshot` directly or a fresh `open()` that
+    /// restores from what was persisted, the same as a real restart would.
     #[derive(Clone, Default)]
     struct SnapshotStore {
         snapshot: Arc<StdMutex<StoredSnapshot>>,
@@ -375,9 +398,10 @@ mod tests {
     #[async_trait::async_trait]
     impl EzStorage for SnapshotStore {
         async fn load(&mut self) -> Result<Loaded, std::io::Error> {
+            let snapshot = self.snapshot.lock().unwrap().clone().map(|(meta, data)| new_snapshot(&meta, &data));
             Ok(Loaded {
                 meta: crate::meta::EzMeta::default(),
-                snapshot: None,
+                snapshot,
             })
         }
 
@@ -402,7 +426,10 @@ mod tests {
         }
     }
 
-    fn kv_export_bytes(revision: u64, entries: &[(&str, &[u8], u64, u64)]) -> Vec<u8> {
+    /// A valid v1 snapshot's bytes for `entries` at `revision`, built through the real
+    /// [`encode_snapshot`] - the same function [`RaftSnapshotBuilder::build_snapshot`] calls -
+    /// never hand-assembled, so these tests exercise the actual wire format.
+    fn valid_snapshot_bytes(revision: u64, entries: &[(&str, &[u8], u64, u64)]) -> Vec<u8> {
         let entries = entries
             .iter()
             .map(|(key, value, create_rev, mod_rev)| KeyValue {
@@ -412,22 +439,34 @@ mod tests {
                 mod_rev: *mod_rev,
             })
             .collect();
-        serde_json::to_vec(&KvExport { revision, entries }).unwrap()
+        let state = KvState::restore(revision, entries, Default::default());
+        encode_snapshot(&state.view(), &state.internal_state()).unwrap()
     }
 
-    /// A snapshot whose bytes do not deserialize must be refused whole. Keeping it would outlive
-    /// the failed transfer: startup restores from the stored snapshot, so the next start would
-    /// fail on the same bytes - with the state they replaced already gone.
+    /// Patch a valid snapshot's header to name a version this build does not understand -
+    /// exactly the header layout `crate::kv::snapshot_codec` documents (4-byte magic, then this
+    /// 2-byte little-endian version), never a private field of storage.
+    fn with_unsupported_version(mut bytes: Vec<u8>) -> Vec<u8> {
+        bytes[4..6].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        bytes
+    }
+
+    /// A snapshot whose bytes do not decode must be refused whole. Keeping it would outlive the
+    /// failed transfer: startup restores from the stored snapshot, so the next start would fail
+    /// on the same bytes - with the state they replaced already gone.
     #[tokio::test]
     async fn an_invalid_snapshot_leaves_the_last_valid_one_in_place() {
         let store = SnapshotStore::default();
         let persisted = store.snapshot.clone();
         let (_log, mut sm) = open(store).await.unwrap();
 
-        let valid = kv_export_bytes(1, &[("a", b"1", 1, 1)]);
+        let valid = valid_snapshot_bytes(1, &[("a", b"1", 1, 1)]);
         sm.install_snapshot(&snapshot_meta(10), Cursor::new(valid.clone())).await.unwrap();
 
-        let err = sm.install_snapshot(&snapshot_meta(20), Cursor::new(b"not json".to_vec())).await.unwrap_err();
+        let err = sm
+            .install_snapshot(&snapshot_meta(20), Cursor::new(b"not a valid ezraft snapshot".to_vec()))
+            .await
+            .unwrap_err();
         assert_eq!(std::io::ErrorKind::InvalidData, err.kind(), "unexpected error: {}", err);
 
         // Nothing of it is kept: not in storage, not in the cache that serves lagging followers,
@@ -440,6 +479,55 @@ mod tests {
         assert_eq!(
             Some("1".as_bytes().to_vec()),
             sm.subscribe_view().current().get("a").map(|kv| kv.value.to_vec())
+        );
+    }
+
+    /// An installed snapshot whose header names a version this build does not understand is
+    /// rejected outright - the same invariant
+    /// `an_invalid_snapshot_leaves_the_last_valid_one_in_place` proves for corrupt bytes, now
+    /// for an explicitly unsupported version: the last good state stays in place, and the error
+    /// names the version problem rather than misreporting it as generic corruption.
+    #[tokio::test]
+    async fn an_unknown_version_at_install_time_leaves_the_last_valid_one_in_place() {
+        let store = SnapshotStore::default();
+        let persisted = store.snapshot.clone();
+        let (_log, mut sm) = open(store).await.unwrap();
+
+        let valid = valid_snapshot_bytes(1, &[("a", b"1", 1, 1)]);
+        sm.install_snapshot(&snapshot_meta(10), Cursor::new(valid.clone())).await.unwrap();
+
+        let future_version = with_unsupported_version(valid_snapshot_bytes(2, &[("a", b"2", 1, 2)]));
+        let err = sm.install_snapshot(&snapshot_meta(20), Cursor::new(future_version)).await.unwrap_err();
+        assert_eq!(std::io::ErrorKind::InvalidData, err.kind(), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("version"),
+            "error must name the version problem explicitly, got: {err}"
+        );
+
+        assert_eq!(Some((snapshot_meta(10), valid.clone())), *persisted.lock().unwrap());
+        let cached = sm.get_current_snapshot().await.unwrap().map(|snap| (snap.meta, snap.snapshot.into_inner()));
+        assert_eq!(Some((snapshot_meta(10), valid)), cached);
+        assert_eq!(
+            Some("1".as_bytes().to_vec()),
+            sm.subscribe_view().current().get("a").map(|kv| kv.value.to_vec())
+        );
+    }
+
+    /// A node whose *stored* snapshot names a version this build does not understand must fail
+    /// to start rather than silently misparse it - `open` is exactly the function
+    /// `crate::raft::EzKv::new` calls before a node does anything else, so failing here is what
+    /// makes `create`/`join` fail outright.
+    #[tokio::test]
+    async fn opening_storage_with_an_unknown_snapshot_version_fails_to_start() {
+        let mut store = SnapshotStore::default();
+        let future_version = with_unsupported_version(valid_snapshot_bytes(1, &[("a", b"1", 1, 1)]));
+        store.persist(Persist::Snapshot(new_snapshot(&snapshot_meta(10), &future_version))).await.unwrap();
+
+        let err = open(store).await.map(|_| ()).expect_err("an unknown snapshot version must refuse to open");
+        assert_eq!(std::io::ErrorKind::InvalidData, err.kind(), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("version"),
+            "error must name the version problem explicitly, got: {err}"
         );
     }
 

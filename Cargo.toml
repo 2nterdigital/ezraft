@@ -48,6 +48,11 @@ futures     = { version = "0.3" }
 # The KV state machine is an immutable persistent ordered map: taking a view clones the root,
 # O(1), and readers never block `apply`.
 imbl        = { version = "7.0.2" }
+# The snapshot codec (ech0-media#28): a compact positional binary format with no
+# `deserialize_any`, so every KV vocabulary type round-trips through it unmodified (see
+# `src/kv/bytes_codec.rs`). `alloc` is all `to_allocvec`/`from_bytes` need; no `derive` feature,
+# since every encoded type already derives `Serialize`/`Deserialize` through plain `serde`.
+postcard    = { version = "1.1.3", default-features = false, features = ["alloc"] }
 # The production `EzStorage`: one database, three tables (log, meta, snapshot), one
 # `Durability::Immediate` write transaction per `persist`. 4.3.0 or newer, per the storage decision
 # recorded in FORK.md; only the default `std` feature is needed.
@@ -76,9 +81,6 @@ fault-injection = []
 [dev-dependencies]
 clap               = { version = "4.1.11", features = ["derive", "env"] }
 ezraft             = { path = ".", features = ["fault-injection"] }
-# Proves the KV vocabulary round-trips through a positional format; becomes a normal dependency
-# with the snapshot codec (ech0-media#28). `alloc` is all `to_allocvec`/`from_bytes` need.
-postcard           = { version = "1.1.3", default-features = false, features = ["alloc"] }
 # One redb file per node under its own temp directory, for the in-process cluster tests
 # (`tests/common/`) and `RedbStorage`'s own unit tests.
 tempfile           = { version = "3" }
