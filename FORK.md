@@ -210,6 +210,18 @@
   无关。`EzConfig` 新增 `liveness_threshold` / `liveness_grace` / `liveness_check_interval`（5 s / 5 s /
   1 s，待 #36 实测）。对转发命令收到形状不符的应答时记录错误并按"无应答"处理，不再 panic（该应答来自对端）。
   原版 `timestamp_oracle` 示例已于 #27 删除（确认）。新增 `tests/leader_task.rs`、`tests/liveness.rs`。
+- [#37 底座使用指南](https://github.com/2nterdigital/ech0-media/issues/37)：
+  用新 API 重写 `docs/guide.md`（中文），**替换**原版英文指南，并同步重写 `README.md`。覆盖全部公开 API
+  及其错误语义：启动集群（create / join / join_as_learner、内部端口与集群 token、`RedbStorage`、
+  `EzConfig` 每一项）、条件事务与 revision（冲突后重读重试、上限）、任意节点写入（转发、`Indeterminate`
+  与 `write_with_id`、`LocalLag` 与 `wait_revision`）、本地视图与线性读、watch（三种 Reset 原因、
+  Progress、按 `mod_rev` 去重、游标续订）、节点间 RPC、集群观测与节点注册表、leader 专属任务与存活判定
+  （围栏为何精确、`LeaderWriteError` 每个变体该怎么办）、成员变更与管理协议、存储契约与快照、可观测性，
+  以及一张错误参考表。末尾是**给上游的使用约定**一节：热路径读本地视图并以 CAS 兜底、RoomService 读与
+  否定判断用线性读、索引在事务里自写、webhook 用 watch + leader 专属任务 + KV 游标自建、软状态由上游
+  内存缓存层经 RPC 同步、媒体面致命错误时进程退出。**指南里的每个 Rust 代码块都是 doctest**：`src/lib.rs`
+  以 `#[cfg(doctest)]` 模块 `include_str!` 整份指南，`cargo test`（或 `cargo test --doc`）会编译它们，
+  API 变了而指南没跟上会直接让测试失败；该模块只在 rustdoc 收集 doctest 时存在，不进入任何构建产物。
 
 ## 验证命令
 

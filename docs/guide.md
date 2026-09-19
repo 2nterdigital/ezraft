@@ -562,6 +562,11 @@ async fn call_handler(node: &EzKv, target: u64) -> Result<String, RpcError> {
 底座在接受 append 请求的路由里自己记录。上游可以据此实现「节点长时间联系不上 leader 时拒绝新的接入」
 一类的策略。
 
+`EzKv::is_leader()` 是同一件事的一次性同步版本：只回答「这个节点此刻自认为是不是 leader」。它报告的是
+本节点自己的状态，不是保证——一个已经被取代的 leader 要等收到新 leader 的消息才会知道。所以它只适合做
+观测和提示（日志、指标、「要不要顺手做点只有 leader 才值得做的事」），不能当作正确性的依据：需要「只在
+leader 上执行」的逻辑用 leader 专属任务（见下一节），需要「读到的一定是最新的」用线性读。
+
 ### 节点注册表
 
 `EzKv::registry()` 本地读取整份节点注册表（`Registry`），不经共识、不阻塞、不会失败，和 `view()` 一样
@@ -765,7 +770,10 @@ async fn hand_over_leadership(leader: &EzKv, target: u64) -> std::io::Result<()>
 对「集群刚启动、还没有 leader」这类瞬时状态重试，`EzKv` 自身的 Rust 方法不会。想在 Rust 之外（或者不通过
 `EzKv` 句柄）驱动成员变更时，可以直接说这套 HTTP 协议：`POST /api/node_id` 领一个新 id，
 `POST /api/membership`（body 是打了 `op` 标签的 `MembershipChange`）做加入/改角色/移除，
-`GET /api/metrics` 读某个节点自己的视角。
+`GET /api/metrics` 读某个节点自己的视角。协议里的角色用 `ezraft::NodeRole` 表示，只有两个取值：
+`Learner`（复制日志、可以应答读，但不投票、不计入多数派）和 `Voter`（计入多数派）；`SetRole` 把一个
+已有节点改成其中之一，对应 Rust 侧的 `demote` / `promote`。节点总是先以 `Learner` 身份进入集群，
+`join` 只是在追上进度之后多做一步提升。
 
 进阶用法可以通过 `EzKv::inner()` 直接拿到底层 openraft 的 `Raft` 句柄，类型参数固定为
 `ezraft::OpenRaftTypes`；`ezraft::RaftMetrics`、`ezraft::RaftTypeConfig`、`ezraft::ServerState`、
@@ -790,6 +798,11 @@ meta 与最近一次快照）、`persist`（写入一次 `Persist` 操作）、`
 `Snapshot(EzSnapshot)`（整份快照，替换上一份）、`DeleteLogs { from, to }`（删除 `[from, to)` 范围内的
 日志条目——既用于删除与 leader 冲突的尾部，也用于回收已经被快照覆盖的头部）。`Loaded { meta, snapshot }`
 是 `load` 的返回值，首次运行时 `meta` 是 `EzMeta::default()`。
+
+实现者会碰到的两个位置类型：`EzLogId` 是 `(term, index)` 二元组，即 `EzEntry::log_id` 的类型——
+`read_logs` 与 `DeleteLogs` 的范围都按其中的 `index` 计；`EzSnapshotMeta` 是 `EzSnapshot::meta` 的类型
+（openraft 的 `SnapshotMeta`：快照覆盖到的最后一条日志、当时的成员配置、快照 id），存储只需把它和快照
+数据作为一个整体原样写入、原样读回，不需要解释其中任何字段。
 
 ```rust
 use async_trait::async_trait;
