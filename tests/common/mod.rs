@@ -287,3 +287,9 @@ mod faults;
 // `allow(dead_code)` above) - but a glob re-export warns per binary rather than per item.
 #[allow(unused_imports)]
 pub use faults::*;
+
+/// The crash-injecting `EzStorage` wrapper for storage power-loss tests: see
+/// `tests/common/crash.rs`.
+mod crash;
+#[allow(unused_imports)]
+pub use crash::*;
