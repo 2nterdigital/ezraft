@@ -18,10 +18,10 @@ use crate::kv::bytes_codec;
 
 /// Whether the foundation currently believes a node is reachable
 ///
-/// Stored and exposed here; nothing in this milestone ever sets it to [`Self::Down`] - a future
-/// leader-only liveness task (ech0-media#34) is what will, based on heartbeat acknowledgement.
-/// Every entry starts, and every re-registration resets it to, [`Self::Up`]: a node registering or
-/// updating its own entry is, by definition, up right now.
+/// Stored and exposed here, decided elsewhere: the leader's built-in liveness task
+/// (`crate::liveness`, ech0-media#34) sets it from heartbeat acknowledgements, writing only when it
+/// changes. Every entry starts, and every re-registration resets it to, [`Self::Up`]: a node
+/// registering or updating its own entry is, by definition, up right now.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeStatus {
     /// The foundation has no reason to believe this node is unreachable

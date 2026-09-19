@@ -93,9 +93,9 @@ pub struct LocalLag {
 /// Why [`crate::leader_task::LeaderCtx::write`] (or the built-in liveness task's own internal
 /// commands) did not produce a result (ech0-media#34)
 ///
-/// No `Indeterminate` and nothing about forwarding: the leader-only propose path never sends
-/// `body` anywhere but to `node` itself, so the only way it can fail to produce a definite outcome
-/// is [`Self::NotLeader`].
+/// Nothing here is about forwarding: the leader-only propose path never sends `body` anywhere but
+/// to `node` itself. [`Self::NotLeader`] is final - the context is dead - while
+/// [`Self::Indeterminate`] is not, and the difference matters to a task deciding whether to go on.
 #[derive(Debug, thiserror::Error)]
 pub enum LeaderWriteError {
     /// `txn` exceeded a configured limit (a transaction-only concern)
