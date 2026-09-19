@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 
 use crate::storage::EzStorage;
 use crate::storage::Loaded;
+use crate::watch::WatchLimits;
 
 /// The user's storage, reached by both stores
 ///
@@ -33,8 +34,12 @@ type SharedStorage = Arc<Mutex<Box<dyn EzStorage>>>;
 /// Open the user's storage as the two stores openraft asks for
 ///
 /// One [`EzStorage::load`], because there is one storage behind both: the metadata it returns
-/// belongs to the log, the snapshot to the state machine.
-pub async fn open(mut user_storage: impl EzStorage) -> Result<(LogStore, StateMachineStore), std::io::Error> {
+/// belongs to the log, the snapshot to the state machine. `watch_limits` is for the state
+/// machine's publisher, which exists from here on (`EzConfig::watch_limits`).
+pub async fn open(
+    mut user_storage: impl EzStorage,
+    watch_limits: WatchLimits,
+) -> Result<(LogStore, StateMachineStore), std::io::Error> {
     // Load initial metadata and snapshot
     let Loaded { meta, snapshot } = user_storage.load().await?;
 
@@ -42,7 +47,7 @@ pub async fn open(mut user_storage: impl EzStorage) -> Result<(LogStore, StateMa
     let storage: SharedStorage = Arc::new(Mutex::new(storage));
 
     let log = LogStore::new(storage.clone(), meta);
-    let sm = StateMachineStore::new(storage, snapshot)?;
+    let sm = StateMachineStore::new(storage, snapshot, watch_limits)?;
 
     Ok((log, sm))
 }

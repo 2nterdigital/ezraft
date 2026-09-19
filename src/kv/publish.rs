@@ -72,11 +72,14 @@ impl Publisher {
     /// after replaying the log tail past one) is what the first [`ViewReceiver::current`] call, and
     /// the first read of the registry watch channel, see.
     ///
-    /// The watch hub starts with [`WatchLimits::default`]; `crate::raft::EzKv::new` narrows or
-    /// widens it to the node's real `EzConfig::watch_limits` via [`Self::configure_watch`] before
-    /// starting the Raft engine, since this constructor runs before that configuration reaches it.
-    pub(crate) fn new(view: View, registry: Registry) -> (Self, ViewReceiver, watch::Receiver<Registry>) {
-        let hub = Hub::new(view.clone(), WatchLimits::default());
+    /// `watch_limits` bounds the watch hub's retained window and each subscriber's queue
+    /// (`EzConfig::watch_limits`).
+    pub(crate) fn new(
+        view: View,
+        registry: Registry,
+        watch_limits: WatchLimits,
+    ) -> (Self, ViewReceiver, watch::Receiver<Registry>) {
+        let hub = Hub::new(view.clone(), watch_limits);
         let (tx, rx) = watch::channel(view);
         let (registry_tx, registry_rx) = watch::channel(registry);
         (Self { tx, hub, registry_tx }, ViewReceiver(rx), registry_rx)
@@ -117,13 +120,6 @@ impl Publisher {
         });
     }
 
-    /// Replace the watch hub's retention and delivery limits with the node's configured ones
-    ///
-    /// See [`Self::new`] for why this is a separate step rather than a constructor argument.
-    pub(crate) fn configure_watch(&self, limits: WatchLimits) {
-        self.hub.configure(limits);
-    }
-
     /// End every watch stream: the node has shut down and nothing further will be published
     pub(crate) fn close_watch(&self) {
         self.hub.close();
@@ -147,7 +143,8 @@ mod tests {
         let mut state = KvState::new();
         state.apply(&crate::kv::Txn::new().put("a", Bytes::from_static(b"1"))).unwrap();
 
-        let (_publisher, view_rx, _registry_rx) = Publisher::new(state.view(), state.registry());
+        let (_publisher, view_rx, _registry_rx) =
+            Publisher::new(state.view(), state.registry(), WatchLimits::default());
 
         assert_eq!(1, view_rx.current().revision());
         assert_eq!(Bytes::from_static(b"1"), view_rx.current().get("a").unwrap().value);
@@ -155,7 +152,8 @@ mod tests {
 
     #[test]
     fn publish_updates_every_clone_of_the_receiver() {
-        let (publisher, view_rx, _registry_rx) = Publisher::new(KvState::new().view(), Registry::default());
+        let (publisher, view_rx, _registry_rx) =
+            Publisher::new(KvState::new().view(), Registry::default(), WatchLimits::default());
         let clone = view_rx.clone();
 
         let mut state = KvState::new();
@@ -174,7 +172,7 @@ mod tests {
     fn reset_replaces_the_view_with_no_changes_argument() {
         let mut state = KvState::new();
         state.apply(&crate::kv::Txn::new().put("a", Bytes::from_static(b"1"))).unwrap();
-        let (publisher, view_rx, _registry_rx) = Publisher::new(state.view(), state.registry());
+        let (publisher, view_rx, _registry_rx) = Publisher::new(state.view(), state.registry(), WatchLimits::default());
 
         let mut restored = KvState::new();
         restored.apply(&crate::kv::Txn::new().put("b", Bytes::from_static(b"2"))).unwrap();
@@ -195,14 +193,16 @@ mod tests {
             });
         });
 
-        let (_publisher, _view_rx, registry_rx) = Publisher::new(state.view(), state.registry());
+        let (_publisher, _view_rx, registry_rx) =
+            Publisher::new(state.view(), state.registry(), WatchLimits::default());
 
         assert_eq!("127.0.0.1:9001", registry_rx.borrow().get(1).unwrap().external_addr);
     }
 
     #[test]
     fn publish_registry_updates_every_clone_and_is_a_no_op_when_unchanged() {
-        let (publisher, _view_rx, registry_rx) = Publisher::new(KvState::new().view(), Registry::default());
+        let (publisher, _view_rx, registry_rx) =
+            Publisher::new(KvState::new().view(), Registry::default(), WatchLimits::default());
         let mut clone = registry_rx.clone();
 
         let mut registry = Registry::default();

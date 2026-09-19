@@ -43,17 +43,6 @@ impl Window {
         }
     }
 
-    /// Change the retention limits in place, keeping whatever is currently retained
-    ///
-    /// Only ever called once, before this node's first publish or subscription
-    /// (`crate::raft::EzKv::new` finishes configuring the watch hub before starting the Raft
-    /// engine), so there is never anything to evict here - unlike [`Self::push`], which is the
-    /// only place limits are actually enforced.
-    pub(super) fn reconfigure(&mut self, max_groups: usize, max_bytes: usize) {
-        self.max_groups = max_groups;
-        self.max_bytes = max_bytes;
-    }
-
     /// Discard everything retained and start a fresh, empty window at `lower_bound`
     ///
     /// Used when this node installs a snapshot: the state it retained groups against no longer
@@ -189,8 +178,9 @@ mod tests {
         );
         assert_eq!(0, window.snapshot().len());
 
-        // The window keeps working afterwards, once a group actually fits its limits.
-        window.reconfigure(100, 1024);
+        // The window keeps working afterwards: a group that does fit its limits is retained.
+        let mut window = Window::new(0, 100, 3);
+        window.push(put_group(1, "a", "0123456789"));
         window.push(put_group(2, "b", "2"));
         assert_eq!(1, window.lower_bound());
         assert_eq!(
@@ -209,24 +199,5 @@ mod tests {
 
         assert_eq!(10, window.lower_bound());
         assert_eq!(0, window.snapshot().len());
-    }
-
-    #[test]
-    fn reconfigure_changes_limits_without_touching_what_is_already_retained() {
-        let mut window = Window::new(0, 10, 1024);
-        window.push(put_group(1, "a", "1"));
-        window.push(put_group(2, "b", "2"));
-
-        window.reconfigure(1, 1024);
-        // Nothing is evicted by reconfiguring alone - only a later `push` enforces the new limit.
-        assert_eq!(0, window.lower_bound());
-        assert_eq!(2, window.snapshot().len());
-
-        window.push(put_group(3, "c", "3"));
-        assert_eq!(2, window.lower_bound());
-        assert_eq!(
-            vec![3],
-            window.snapshot().iter().map(|g| g.revision).collect::<Vec<_>>()
-        );
     }
 }

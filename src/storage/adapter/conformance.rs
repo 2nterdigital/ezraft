@@ -32,7 +32,7 @@ impl StoreBuilder<C, LogStore, StateMachineStore, TempDir> for Builder {
     async fn build(&self) -> Result<(TempDir, LogStore, StateMachineStore), StorageError<C>> {
         let dir = TempDir::new().map_err(to_storage_error)?;
         let storage = RedbStorage::open(dir.path().join("node.redb")).await.map_err(to_storage_error)?;
-        let (log, sm) = open(storage).await.map_err(to_storage_error)?;
+        let (log, sm) = open(storage, crate::watch::WatchLimits::default()).await.map_err(to_storage_error)?;
         Ok((dir, log, sm))
     }
 }

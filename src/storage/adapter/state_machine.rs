@@ -42,6 +42,7 @@ use crate::snapshot::EzSnapshotMeta;
 use crate::storage::Persist;
 use crate::storage::adapter::SharedStorage;
 use crate::type_config::OpenRaftTypes;
+use crate::watch::WatchLimits;
 
 /// Internal state machine wrapper that tracks Raft metadata alongside the KV
 struct StateMachineState {
@@ -114,7 +115,11 @@ impl StateMachineStore {
     /// reported here as a plain `Err`, which is exactly how `crate::raft::EzKv::new` (via
     /// `crate::storage::adapter::open`) already propagates every other startup failure: it makes
     /// `create`/`join` fail outright rather than starting a node on a snapshot it cannot read.
-    pub(super) fn new(storage: SharedStorage, snapshot: Option<EzSnapshot>) -> Result<Self, std::io::Error> {
+    pub(super) fn new(
+        storage: SharedStorage,
+        snapshot: Option<EzSnapshot>,
+        watch_limits: WatchLimits,
+    ) -> Result<Self, std::io::Error> {
         let (last_applied, membership, kv) = match &snapshot {
             Some(snap) => {
                 let decoded = decode_snapshot(snap.snapshot.get_ref())
@@ -137,7 +142,7 @@ impl StateMachineStore {
             None => (None, StoredMembership::new(None, Membership::default()), KvState::new()),
         };
 
-        let (publisher, view_rx, registry_rx) = Publisher::new(kv.view(), kv.registry());
+        let (publisher, view_rx, registry_rx) = Publisher::new(kv.view(), kv.registry(), watch_limits);
 
         let sm_state = StateMachineState {
             kv,
@@ -529,7 +534,7 @@ mod tests {
     async fn a_snapshot_built_from_older_state_never_replaces_a_newer_installed_one() {
         let store = SnapshotStore::default();
         let persisted = store.snapshot.clone();
-        let (_log, mut sm) = open(store).await.unwrap();
+        let (_log, mut sm) = open(store, WatchLimits::default()).await.unwrap();
         sm.install_snapshot(
             &snapshot_meta(10),
             Cursor::new(valid_snapshot_bytes(1, &[("a", b"1", 1, 1)])),
@@ -573,7 +578,7 @@ mod tests {
     async fn a_snapshot_built_from_newer_state_replaces_the_one_in_place() {
         let store = SnapshotStore::default();
         let persisted = store.snapshot.clone();
-        let (_log, mut sm) = open(store).await.unwrap();
+        let (_log, mut sm) = open(store, WatchLimits::default()).await.unwrap();
         sm.install_snapshot(
             &snapshot_meta(10),
             Cursor::new(valid_snapshot_bytes(1, &[("a", b"1", 1, 1)])),
@@ -595,7 +600,7 @@ mod tests {
     async fn an_invalid_snapshot_leaves_the_last_valid_one_in_place() {
         let store = SnapshotStore::default();
         let persisted = store.snapshot.clone();
-        let (_log, mut sm) = open(store).await.unwrap();
+        let (_log, mut sm) = open(store, WatchLimits::default()).await.unwrap();
 
         let valid = valid_snapshot_bytes(1, &[("a", b"1", 1, 1)]);
         sm.install_snapshot(&snapshot_meta(10), Cursor::new(valid.clone())).await.unwrap();
@@ -628,7 +633,7 @@ mod tests {
     async fn an_unknown_version_at_install_time_leaves_the_last_valid_one_in_place() {
         let store = SnapshotStore::default();
         let persisted = store.snapshot.clone();
-        let (_log, mut sm) = open(store).await.unwrap();
+        let (_log, mut sm) = open(store, WatchLimits::default()).await.unwrap();
 
         let valid = valid_snapshot_bytes(1, &[("a", b"1", 1, 1)]);
         sm.install_snapshot(&snapshot_meta(10), Cursor::new(valid.clone())).await.unwrap();
@@ -660,7 +665,10 @@ mod tests {
         let future_version = with_unsupported_version(valid_snapshot_bytes(1, &[("a", b"1", 1, 1)]));
         store.persist(Persist::Snapshot(new_snapshot(&snapshot_meta(10), &future_version))).await.unwrap();
 
-        let err = open(store).await.map(|_| ()).expect_err("an unknown snapshot version must refuse to open");
+        let err = open(store, WatchLimits::default())
+            .await
+            .map(|_| ())
+            .expect_err("an unknown snapshot version must refuse to open");
         assert_eq!(std::io::ErrorKind::InvalidData, err.kind(), "unexpected error: {}", err);
         assert!(
             err.to_string().contains("version"),
@@ -677,7 +685,7 @@ mod tests {
     #[tokio::test]
     async fn a_command_fenced_to_another_term_changes_nothing() {
         let store = SnapshotStore::default();
-        let (_log, mut sm) = open(store).await.unwrap();
+        let (_log, mut sm) = open(store, WatchLimits::default()).await.unwrap();
 
         let fenced = |entry_term: u64, index: u64, required_term: u64, key: &str| crate::entry::EzEntry {
             log_id: (entry_term, index),
@@ -713,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn build_snapshot_then_install_it_reproduces_the_same_view() {
         let store = SnapshotStore::default();
-        let (_log, mut sm) = open(store).await.unwrap();
+        let (_log, mut sm) = open(store, WatchLimits::default()).await.unwrap();
 
         {
             let mut state = sm.sm_state.lock().await;

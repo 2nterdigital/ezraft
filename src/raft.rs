@@ -331,16 +331,10 @@ impl EzKv {
         let node_meta = config.node_meta.clone();
 
         // Open user storage as the two stores openraft asks for
-        let (log, sm) = open(storage).await?;
+        let (log, sm) = open(storage, watch_limits).await?;
         let view_rx = sm.subscribe_view();
         let registry_rx = sm.subscribe_registry();
         let watch = sm.publisher();
-        // The watch hub is built with default limits (it exists before `EzConfig` reaches it -
-        // see `crate::kv::publish::Publisher::new`'s own doc comment); this is the one place that
-        // narrows or widens it to the node's real configuration. Safe to do here, before anything
-        // below starts this node's Raft engine: no transaction can be applied yet and no caller
-        // holds this handle yet to have registered a subscription against the old limits.
-        watch.configure_watch(watch_limits);
 
         // Determine node_id, and whether a promotion has to follow. A node that already has an id
         // has joined before, so neither the seed nor the promotion applies to it again: what it
