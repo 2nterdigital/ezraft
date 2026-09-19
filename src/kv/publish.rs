@@ -17,6 +17,7 @@
 use tokio::sync::watch;
 
 use crate::kv::change::Changes;
+use crate::kv::registry::Registry;
 use crate::kv::view::View;
 use crate::watch::Hub;
 use crate::watch::WatchLimits;
@@ -54,23 +55,31 @@ impl ViewReceiver {
 
 /// The one place a new [`View`] becomes visible to every [`ViewReceiver`], and the watch side
 /// (`crate::watch::Hub`) that shares it
+///
+/// Also the one place a new [`Registry`] becomes visible (ech0-media#33): a plain
+/// `tokio::sync::watch<Registry>`, not the windowed hub above - the registry is small (one entry
+/// per node), so every subscriber is simply handed the whole current value, the same way
+/// [`ViewReceiver`] itself works, rather than a ring buffer of changes to replay.
 pub(crate) struct Publisher {
     tx: watch::Sender<View>,
     hub: std::sync::Arc<Hub>,
+    registry_tx: watch::Sender<Registry>,
 }
 
 impl Publisher {
-    /// A publisher already holding `view` - the "publish after startup recovery" case falls out
-    /// of this for free: whatever view construction restored (fresh, from a snapshot, or after
-    /// replaying the log tail past one) is what the first [`ViewReceiver::current`] call sees.
+    /// A publisher already holding `view` and `registry` - the "publish after startup recovery"
+    /// case falls out of this for free: whatever construction restored (fresh, from a snapshot, or
+    /// after replaying the log tail past one) is what the first [`ViewReceiver::current`] call, and
+    /// the first read of the registry watch channel, see.
     ///
     /// The watch hub starts with [`WatchLimits::default`]; `crate::raft::EzKv::new` narrows or
     /// widens it to the node's real `EzConfig::watch_limits` via [`Self::configure_watch`] before
     /// starting the Raft engine, since this constructor runs before that configuration reaches it.
-    pub(crate) fn new(view: View) -> (Self, ViewReceiver) {
+    pub(crate) fn new(view: View, registry: Registry) -> (Self, ViewReceiver, watch::Receiver<Registry>) {
         let hub = Hub::new(view.clone(), WatchLimits::default());
         let (tx, rx) = watch::channel(view);
-        (Self { tx, hub }, ViewReceiver(rx))
+        let (registry_tx, registry_rx) = watch::channel(registry);
+        (Self { tx, hub, registry_tx }, ViewReceiver(rx), registry_rx)
     }
 
     /// Publish the view one applied transaction produced, together with the changes it made
@@ -90,6 +99,22 @@ impl Publisher {
     /// earlier items and start over from here instead of trying to reconcile a gap.
     pub(crate) fn reset(&self, view: View) {
         self.hub.reset_all(view, &self.tx);
+    }
+
+    /// Publish the registry after a registry command applied, or after installing a snapshot
+    ///
+    /// A no-op notification-wise when `registry` is unchanged from what is already published
+    /// (`send_if_modified`): the registry is small enough that a caller can simply hand this the
+    /// whole current value every time, without tracking for itself whether anything actually
+    /// changed.
+    pub(crate) fn publish_registry(&self, registry: Registry) {
+        self.registry_tx.send_if_modified(|current| {
+            let changed = *current != registry;
+            if changed {
+                *current = registry;
+            }
+            changed
+        });
     }
 
     /// Replace the watch hub's retention and delivery limits with the node's configured ones
@@ -122,7 +147,7 @@ mod tests {
         let mut state = KvState::new();
         state.apply(&crate::kv::Txn::new().put("a", Bytes::from_static(b"1"))).unwrap();
 
-        let (_publisher, view_rx) = Publisher::new(state.view());
+        let (_publisher, view_rx, _registry_rx) = Publisher::new(state.view(), state.registry());
 
         assert_eq!(1, view_rx.current().revision());
         assert_eq!(Bytes::from_static(b"1"), view_rx.current().get("a").unwrap().value);
@@ -130,7 +155,7 @@ mod tests {
 
     #[test]
     fn publish_updates_every_clone_of_the_receiver() {
-        let (publisher, view_rx) = Publisher::new(KvState::new().view());
+        let (publisher, view_rx, _registry_rx) = Publisher::new(KvState::new().view(), Registry::default());
         let clone = view_rx.clone();
 
         let mut state = KvState::new();
@@ -149,7 +174,7 @@ mod tests {
     fn reset_replaces_the_view_with_no_changes_argument() {
         let mut state = KvState::new();
         state.apply(&crate::kv::Txn::new().put("a", Bytes::from_static(b"1"))).unwrap();
-        let (publisher, view_rx) = Publisher::new(state.view());
+        let (publisher, view_rx, _registry_rx) = Publisher::new(state.view(), state.registry());
 
         let mut restored = KvState::new();
         restored.apply(&crate::kv::Txn::new().put("b", Bytes::from_static(b"2"))).unwrap();
@@ -157,5 +182,49 @@ mod tests {
 
         assert_eq!(None, view_rx.current().get("a"), "reset replaces the view wholesale");
         assert_eq!(Bytes::from_static(b"2"), view_rx.current().get("b").unwrap().value);
+    }
+
+    #[test]
+    fn a_registry_receiver_starts_with_the_publisher_s_initial_registry() {
+        let mut state = KvState::new();
+        state.apply_registry_command(crate::kv::RequestId::new(), 100, |registry| {
+            registry.set(1, crate::kv::NodeInfo {
+                external_addr: "127.0.0.1:9001".to_string(),
+                meta: Bytes::from_static(b"m"),
+                status: crate::kv::NodeStatus::Up,
+            });
+        });
+
+        let (_publisher, _view_rx, registry_rx) = Publisher::new(state.view(), state.registry());
+
+        assert_eq!("127.0.0.1:9001", registry_rx.borrow().get(1).unwrap().external_addr);
+    }
+
+    #[test]
+    fn publish_registry_updates_every_clone_and_is_a_no_op_when_unchanged() {
+        let (publisher, _view_rx, registry_rx) = Publisher::new(KvState::new().view(), Registry::default());
+        let mut clone = registry_rx.clone();
+
+        let mut registry = Registry::default();
+        registry.set(1, crate::kv::NodeInfo {
+            external_addr: "127.0.0.1:9001".to_string(),
+            meta: Bytes::from_static(b"m"),
+            status: crate::kv::NodeStatus::Up,
+        });
+        publisher.publish_registry(registry.clone());
+
+        assert!(clone.has_changed().unwrap(), "a real change notifies subscribers");
+        assert_eq!(
+            "127.0.0.1:9001",
+            clone.borrow_and_update().get(1).unwrap().external_addr
+        );
+
+        // Publishing the exact same registry again must not raise a further change - a caller
+        // that always publishes "the whole current value" should never spuriously wake anyone.
+        publisher.publish_registry(registry);
+        assert!(
+            !clone.has_changed().unwrap(),
+            "an unchanged registry must not notify again"
+        );
     }
 }

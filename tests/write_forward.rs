@@ -113,6 +113,17 @@ async fn a_followers_write_reports_local_lag_when_replication_to_it_is_cut() -> 
     .await?;
     assert!(a.is_leader());
 
+    // Every node's own startup self-registration (ech0-media#33) must be done before the tight
+    // 500ms deadline below is measured: it forwards over this same any-node command path too, and
+    // a still-retrying attempt sharing the RPC connection pool could otherwise eat into this
+    // test's own tiny margin.
+    wait_for_registry(
+        &a,
+        |r| r.get(0).is_some() && r.get(b.node_id()).is_some() && r.get(c.node_id()).is_some(),
+        "every node finishes registering",
+    )
+    .await?;
+
     // Cut only the leader's outbound replication to `b`. `b`'s own outbound RPC to the leader
     // (its forwarded write) is untouched, and `c` keeps replicating normally.
     faults.set(a.node_id(), b.node_id(), Fault::Drop);
@@ -167,6 +178,16 @@ async fn an_isolated_leaders_write_honors_the_deadline_and_reports_indeterminate
     .await?;
     assert!(a.is_leader());
 
+    // See the identical wait in `a_followers_write_reports_local_lag_when_replication_to_it_is_cut`:
+    // every node's own startup self-registration (ech0-media#33) should be done before this
+    // test's own tight deadline is measured.
+    wait_for_registry(
+        &a,
+        |r| r.get(0).is_some() && r.get(b.node_id()).is_some() && r.get(c.node_id()).is_some(),
+        "every node finishes registering",
+    )
+    .await?;
+
     faults.isolate(a.node_id(), &[b.node_id(), c.node_id()]);
 
     let started = std::time::Instant::now();
@@ -220,6 +241,17 @@ async fn limits_are_enforced_on_the_calling_node_before_anything_is_sent() -> io
     wait_for_voters(&a, BTreeSet::from([0, b.node_id()]), "the joining voter is promoted").await?;
     assert!(!b.is_leader());
 
+    // Both nodes' own startup self-registration (ech0-media#33) forwards over this exact same
+    // `ez.write` RPC when it runs on a non-leader like `b` - settled here, before the baseline
+    // below, so it cannot be mistaken for a request this test's own oversized write made.
+    wait_for_registry(
+        &a,
+        |r| r.get(0).is_some() && r.get(b.node_id()).is_some(),
+        "both nodes finish registering",
+    )
+    .await?;
+    let baseline = faults.request_count(b.node_id(), a.node_id(), "rpc/ez.write");
+
     let err = b.write(set("way-too-long-a-key", "v")).await.expect_err("the key exceeds this node's own limit");
     assert!(
         matches!(err, WriteError::LimitExceeded(LimitError::KeyTooLarge { .. })),
@@ -227,7 +259,7 @@ async fn limits_are_enforced_on_the_calling_node_before_anything_is_sent() -> io
     );
 
     assert_eq!(
-        0,
+        baseline,
         faults.request_count(b.node_id(), a.node_id(), "rpc/ez.write"),
         "an oversized transaction must never be forwarded"
     );

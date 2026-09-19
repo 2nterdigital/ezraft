@@ -34,9 +34,12 @@
 //! space above. Its first tenant is the idempotency ledger (ech0-media#30): [`RequestId`] -> the
 //! first real outcome recorded for it, consulted by `KvState::apply_idempotent` before a command
 //! ever reaches `KvState::apply`, evicted first-in-first-out by entry count as a pure function of
-//! the log (see `ledger`'s own module docs). The node registry (ech0-media#33) adds a
-//! further sibling field the same way. Both are folded into the same snapshot without a
-//! format-version bump.
+//! the log (see `ledger`'s own module docs). The node registry (ech0-media#33,
+//! [`NodeInfo`]/[`Registry`]) is the second: `node_id` -> how to reach that node and what the
+//! application says about it, mutated only by internal commands (`crate::registry`,
+//! `crate::command::CommandBody::RegisterNode`/`RemoveNode`) that reuse the very same forwarding,
+//! retry and ledger machinery ech0-media#30 built for transactions - see `registry`'s own module
+//! docs. Both sibling fields are folded into the same snapshot without a format-version bump.
 //!
 //! # Snapshots
 //!
@@ -58,6 +61,7 @@ mod bytes_codec;
 mod change;
 mod ledger;
 mod publish;
+mod registry;
 mod snapshot_codec;
 mod state;
 mod txn;
@@ -68,6 +72,11 @@ pub use change::Changes;
 pub use ledger::RequestId;
 pub(crate) use publish::Publisher;
 pub(crate) use publish::ViewReceiver;
+pub use registry::NodeInfo;
+pub use registry::NodeStatus;
+pub(crate) use registry::RegisterNode;
+pub use registry::Registry;
+pub(crate) use registry::RemoveNode;
 pub(crate) use snapshot_codec::decode_snapshot;
 pub(crate) use snapshot_codec::encode_snapshot;
 pub(crate) use state::KvState;

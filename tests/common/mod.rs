@@ -325,6 +325,12 @@ pub async fn wait_until_serving(addr: &str) -> io::Result<()> {
     }
 }
 
+/// Helpers for driving and asserting on `cluster()`/`watch_registry()` streams: see
+/// `tests/common/cluster.rs`.
+mod cluster;
+#[allow(unused_imports)]
+pub use cluster::*;
+
 /// Cluster helpers for the `fault-injection` hook: see `tests/common/faults.rs`.
 mod faults;
 // Not every test binary under `tests/` uses these, same as the rest of this file (see the

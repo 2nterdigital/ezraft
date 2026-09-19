@@ -62,6 +62,12 @@ impl EzServer {
     ///
     /// The body is the `Result` the peer's [`crate::network::Network`] expects; only a
     /// [`Fatal`](openraft::errors::Fatal) error becomes an HTTP error status.
+    ///
+    /// This is also where [`crate::EzKv::last_leader_contact`] is recorded (ech0-media#33):
+    /// whenever the response is anything but [`raft::AppendEntriesResponse::HigherVote`], openraft
+    /// accepted the request's vote, which means it recognizes whoever sent it - a legitimate
+    /// current leader, not a stale term - as this node's leader right now. A heartbeat is an empty
+    /// append, so this one route covers both.
     async fn handle_append(
         req: web::Json<raft::AppendEntriesRequest<C>>,
         ez: Data<Self>,
@@ -73,6 +79,12 @@ impl EzServer {
             .await
             .decompose()
             .map_err(|e| actix_web::error::ErrorInternalServerError(format!("append_entries failed: {}", e)))?;
+
+        if let Ok(accepted) = &resp
+            && !matches!(accepted, raft::AppendEntriesResponse::HigherVote(_))
+        {
+            ez.raft.record_leader_contact();
+        }
 
         Ok(web::Json(resp))
     }

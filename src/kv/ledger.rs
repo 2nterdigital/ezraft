@@ -78,11 +78,29 @@ impl fmt::Debug for RequestId {
 /// running again.
 pub(crate) type TxnOutcome = Result<u64, Conflict>;
 
+/// What any command this ledger tracks produced - one variant per kind of command the Raft log
+/// carries (ech0-media#30's transactions, ech0-media#33's registry commands), so a single ledger,
+/// keyed by [`RequestId`] regardless of which kind of command minted it, can dedupe every retry
+/// the same way.
+///
+/// [`KvState::apply_idempotent`] and [`KvState::apply_registry_command`]
+/// (`crate::kv::state`/`crate::kv::registry`) each only ever record and look up their own variant:
+/// a [`RequestId`] is generated fresh per call (a random ULID) by whichever public API mints it, so
+/// the same id recorded under one variant and looked up as the other never legitimately happens.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum LedgerOutcome {
+    /// A transaction's own outcome
+    Txn(TxnOutcome),
+    /// A registry command's outcome - registering, updating, or removing an entry cannot itself
+    /// fail once accepted, so there is nothing to carry beyond "this ran."
+    Registry,
+}
+
 /// One ledger entry: the recorded outcome, plus the insertion order it was recorded in
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Entry {
     seq: u64,
-    outcome: TxnOutcome,
+    outcome: LedgerOutcome,
 }
 
 /// Request id -> first real outcome, evicted first-in-first-out by entry count
@@ -93,6 +111,11 @@ struct Entry {
 /// - `by_id` answers "have I recorded this request id" in O(log n), keyed the way callers ask.
 /// - `by_seq` answers "which request ids are oldest" in O(log n), which `by_id` alone cannot: see
 ///   this module's own doc comment for why eviction cannot use [`RequestId`]'s own order instead.
+///
+/// One ledger, shared by every kind of command the log carries (ech0-media#33's registry commands
+/// included): eviction is a single FIFO sequence over the whole log, not one per command kind, so
+/// every replica agrees on exactly which entries are still remembered regardless of what mix of
+/// commands produced them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Ledger {
     by_id: OrdMap<RequestId, Entry>,
@@ -103,19 +126,19 @@ pub(crate) struct Ledger {
 impl Ledger {
     /// The outcome recorded for `id`, if [`Self::record`] has ever recorded one still within the
     /// eviction window
-    pub(crate) fn get(&self, id: RequestId) -> Option<TxnOutcome> {
+    pub(crate) fn get(&self, id: RequestId) -> Option<LedgerOutcome> {
         self.by_id.get(&id).map(|entry| entry.outcome.clone())
     }
 
     /// Record `id`'s first real outcome, then evict the oldest entries until at most `capacity`
     /// remain
     ///
-    /// A no-op if `id` is already recorded: [`KvState::apply_idempotent`] only calls this once
-    /// [`Self::get`] has already reported nothing for `id`, and a second insert for the same id
-    /// would itself be nondeterministic - which of two outcomes "wins" would depend on which
-    /// replica happened to race which. See this module's own doc comment for why `capacity` comes
-    /// from the caller (the command being applied) rather than this node's own configuration.
-    pub(crate) fn record(&mut self, id: RequestId, outcome: TxnOutcome, capacity: usize) {
+    /// A no-op if `id` is already recorded: every caller only calls this once [`Self::get`] has
+    /// already reported nothing for `id`, and a second insert for the same id would itself be
+    /// nondeterministic - which of two outcomes "wins" would depend on which replica happened to
+    /// race which. See this module's own doc comment for why `capacity` comes from the caller (the
+    /// command being applied) rather than this node's own configuration.
+    pub(crate) fn record(&mut self, id: RequestId, outcome: LedgerOutcome, capacity: usize) {
         if self.by_id.contains_key(&id) {
             return;
         }
@@ -155,6 +178,10 @@ mod tests {
         }
     }
 
+    fn txn_ok(revision: u64) -> LedgerOutcome {
+        LedgerOutcome::Txn(Ok(revision))
+    }
+
     #[test]
     fn an_unrecorded_id_reports_nothing() {
         let ledger = Ledger::default();
@@ -165,25 +192,33 @@ mod tests {
     fn a_recorded_success_is_returned_by_get() {
         let mut ledger = Ledger::default();
         let id = RequestId::new();
-        ledger.record(id, Ok(7), 100);
-        assert_eq!(Some(Ok(7)), ledger.get(id));
+        ledger.record(id, txn_ok(7), 100);
+        assert_eq!(Some(txn_ok(7)), ledger.get(id));
     }
 
     #[test]
     fn a_recorded_conflict_is_returned_by_get() {
         let mut ledger = Ledger::default();
         let id = RequestId::new();
-        ledger.record(id, Err(conflict(3)), 100);
-        assert_eq!(Some(Err(conflict(3))), ledger.get(id));
+        ledger.record(id, LedgerOutcome::Txn(Err(conflict(3))), 100);
+        assert_eq!(Some(LedgerOutcome::Txn(Err(conflict(3)))), ledger.get(id));
+    }
+
+    #[test]
+    fn a_recorded_registry_outcome_is_returned_by_get() {
+        let mut ledger = Ledger::default();
+        let id = RequestId::new();
+        ledger.record(id, LedgerOutcome::Registry, 100);
+        assert_eq!(Some(LedgerOutcome::Registry), ledger.get(id));
     }
 
     #[test]
     fn recording_the_same_id_twice_keeps_the_first_outcome() {
         let mut ledger = Ledger::default();
         let id = RequestId::new();
-        ledger.record(id, Ok(1), 100);
-        ledger.record(id, Ok(999), 100);
-        assert_eq!(Some(Ok(1)), ledger.get(id));
+        ledger.record(id, txn_ok(1), 100);
+        ledger.record(id, txn_ok(999), 100);
+        assert_eq!(Some(txn_ok(1)), ledger.get(id));
         assert_eq!(1, ledger.len());
     }
 
@@ -192,11 +227,11 @@ mod tests {
         let mut ledger = Ledger::default();
         let ids: Vec<RequestId> = (0..5).map(|_| RequestId::new()).collect();
         for (i, id) in ids.iter().enumerate() {
-            ledger.record(*id, Ok(i as u64), 5);
+            ledger.record(*id, txn_ok(i as u64), 5);
         }
         assert_eq!(5, ledger.len());
         for (i, id) in ids.iter().enumerate() {
-            assert_eq!(Some(Ok(i as u64)), ledger.get(*id));
+            assert_eq!(Some(txn_ok(i as u64)), ledger.get(*id));
         }
     }
 
@@ -205,15 +240,31 @@ mod tests {
         let mut ledger = Ledger::default();
         let ids: Vec<RequestId> = (0..5).map(|_| RequestId::new()).collect();
         for (i, id) in ids.iter().enumerate() {
-            ledger.record(*id, Ok(i as u64), 3);
+            ledger.record(*id, txn_ok(i as u64), 3);
         }
 
         assert_eq!(3, ledger.len());
         assert_eq!(None, ledger.get(ids[0]), "oldest evicted first");
         assert_eq!(None, ledger.get(ids[1]), "second-oldest evicted next");
-        assert_eq!(Some(Ok(2)), ledger.get(ids[2]));
-        assert_eq!(Some(Ok(3)), ledger.get(ids[3]));
-        assert_eq!(Some(Ok(4)), ledger.get(ids[4]));
+        assert_eq!(Some(txn_ok(2)), ledger.get(ids[2]));
+        assert_eq!(Some(txn_ok(3)), ledger.get(ids[3]));
+        assert_eq!(Some(txn_ok(4)), ledger.get(ids[4]));
+    }
+
+    #[test]
+    fn eviction_is_one_fifo_sequence_across_every_outcome_kind() {
+        // ech0-media#33: registry commands share this same ledger and the same eviction
+        // sequence, not a sequence of their own - a mix of kinds must still evict oldest-first.
+        let mut ledger = Ledger::default();
+        let ids: Vec<RequestId> = (0..3).map(|_| RequestId::new()).collect();
+        ledger.record(ids[0], txn_ok(0), 2);
+        ledger.record(ids[1], LedgerOutcome::Registry, 2);
+        ledger.record(ids[2], txn_ok(2), 2);
+
+        assert_eq!(2, ledger.len());
+        assert_eq!(None, ledger.get(ids[0]), "oldest evicted first, regardless of its kind");
+        assert_eq!(Some(LedgerOutcome::Registry), ledger.get(ids[1]));
+        assert_eq!(Some(txn_ok(2)), ledger.get(ids[2]));
     }
 
     #[test]
@@ -226,18 +277,18 @@ mod tests {
         let high = RequestId(Ulid::from_parts(u64::MAX, u128::MAX));
 
         // Recorded in this order: `high` first, `low` second.
-        ledger.record(high, Ok(1), 1);
-        ledger.record(low, Ok(2), 1);
+        ledger.record(high, txn_ok(1), 1);
+        ledger.record(low, txn_ok(2), 1);
 
         assert_eq!(None, ledger.get(high), "recorded first, evicted first");
-        assert_eq!(Some(Ok(2)), ledger.get(low), "recorded second, survives");
+        assert_eq!(Some(txn_ok(2)), ledger.get(low), "recorded second, survives");
     }
 
     #[test]
     fn a_capacity_of_zero_never_deduplicates_anything() {
         let mut ledger = Ledger::default();
         let id = RequestId::new();
-        ledger.record(id, Ok(1), 0);
+        ledger.record(id, txn_ok(1), 0);
         assert_eq!(0, ledger.len());
         assert_eq!(None, ledger.get(id));
     }
@@ -262,8 +313,9 @@ mod tests {
     #[test]
     fn ledger_serde_round_trips_in_postcard_with_entries() {
         let mut ledger = Ledger::default();
-        ledger.record(RequestId::new(), Ok(1), 100);
-        ledger.record(RequestId::new(), Err(conflict(5)), 100);
+        ledger.record(RequestId::new(), txn_ok(1), 100);
+        ledger.record(RequestId::new(), LedgerOutcome::Txn(Err(conflict(5))), 100);
+        ledger.record(RequestId::new(), LedgerOutcome::Registry, 100);
 
         let packed = postcard::to_allocvec(&ledger).unwrap();
         let decoded: Ledger = postcard::from_bytes(&packed).unwrap();

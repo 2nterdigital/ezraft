@@ -3,10 +3,11 @@
 //! One state machine (the KV) means one command shape, but not only one *kind* of command:
 //! [`Command`] wraps whatever the log entry actually does (`body`) together with the two fields
 //! every command needs for idempotency, regardless of `body` - a [`RequestId`] and the ledger
-//! capacity its proposer was configured with (ech0-media#30). [`CommandBody::Txn`] is the first
-//! and, this milestone, only variant; the registry commands of ech0-media#33 add further variants
-//! to `CommandBody` and reuse `Command`'s two idempotency fields as-is, rather than growing a
-//! second forwarding-and-ledger path.
+//! capacity its proposer was configured with (ech0-media#30). [`CommandBody::Txn`] is a user
+//! transaction; [`CommandBody::RegisterNode`] and [`CommandBody::RemoveNode`] (ech0-media#33) are
+//! foundation-internal node-registry commands. All three reuse `Command`'s two idempotency fields
+//! and the any-node command path (`crate::write`) as-is - forwarding, same-request-id retry, and
+//! the ledger - rather than growing a second path per kind.
 //!
 //! `command` is a private module: [`Command`], [`CommandBody`] and [`CommandOutcome`] are `pub`
 //! only so [`crate::entry::EzEntry`] - which must stay public, since [`crate::EzStorage`] hands it
@@ -19,6 +20,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::kv::Conflict;
+use crate::kv::RegisterNode;
+use crate::kv::RemoveNode;
 use crate::kv::RequestId;
 use crate::kv::Txn;
 
@@ -46,24 +49,49 @@ pub struct Command {
 pub enum CommandBody {
     /// A conditional, all-or-nothing KV transaction
     Txn(Txn),
+    /// Register or update a node's registry entry (ech0-media#33) - proposed by that node itself,
+    /// at startup (retried until it succeeds) and on every `EzKv::update_node_meta` call
+    RegisterNode(RegisterNode),
+    /// Remove a node's registry entry (ech0-media#33) - proposed by the leader, once the matching
+    /// membership change has committed
+    RemoveNode(RemoveNode),
 }
 
 impl fmt::Display for Command {
-    /// A short summary that never prints a key or a value - openraft logs every request it
-    /// processes, and [`Txn`]'s ops carry arbitrary caller-controlled bytes. Delegates to
-    /// `Txn`'s own `Display`, which already keeps that promise.
+    /// A short summary that never prints a key, a value, or application-defined `meta` bytes -
+    /// openraft logs every request it processes, and both a [`Txn`]'s ops and a
+    /// [`CommandBody::RegisterNode`]'s `meta` carry arbitrary caller-controlled bytes. Delegates
+    /// to `Txn`'s own `Display`, which already keeps that promise.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.body {
             CommandBody::Txn(txn) => write!(f, "{} (request {})", txn, self.request_id),
+            CommandBody::RegisterNode(cmd) => {
+                write!(f, "register node {} (request {})", cmd.node_id, self.request_id)
+            }
+            CommandBody::RemoveNode(cmd) => {
+                write!(
+                    f,
+                    "remove node {} from the registry (request {})",
+                    cmd.node_id, self.request_id
+                )
+            }
         }
     }
 }
 
-/// What applying one [`CommandBody::Txn`] produced, as the writer hears it
+/// What applying one [`Command`] produced, as the writer hears it - one variant per kind of
+/// [`CommandBody`], since a transaction and a registry command have nothing in common to report
 ///
-/// Today this is always the transaction's own result: the failing condition, or the revision the
-/// transaction committed at. The change group itself goes to the publisher, not back to the
-/// writer - a writer knows what it wrote, and this is also what a forwarded write's answer carries
-/// over the network (ech0-media#30). It doubles as the idempotency ledger's own recorded value
-/// (`crate::kv::ledger::TxnOutcome`): the two are the exact same shape by construction.
-pub type CommandOutcome = Result<u64, Conflict>;
+/// The change group a [`CommandBody::Txn`] makes goes to the publisher, not back to the writer - a
+/// writer knows what it wrote, and this is also what a forwarded write's answer carries over the
+/// network (ech0-media#30). This is the exact shape the idempotency ledger records too
+/// (`crate::kv::ledger::LedgerOutcome`); `crate::storage::adapter::state_machine` is the seam that
+/// converts between the two, so neither `crate::kv` nor this module needs to know about the other.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandOutcome {
+    /// A transaction's own outcome: the revision it committed at, or the conflict it hit
+    Txn(Result<u64, Conflict>),
+    /// A registry command's outcome - registering, updating, or removing an entry cannot itself
+    /// fail once accepted, so there is nothing to carry beyond "this ran"
+    Registry,
+}
