@@ -1,6 +1,7 @@
-//! The registry: type-erased handlers keyed by name, and the wire envelope a dispatch answers in
+//! The handler table: type-erased handlers keyed by name, and the wire envelope a dispatch answers
+//! in
 //!
-//! [`register`](Registry::register) is called with `Req`/`Resp`/error types fully known, and
+//! [`register`](Handlers::register) is called with `Req`/`Resp`/error types fully known, and
 //! builds a closure that captures them; only the closure's *signature* is erased to raw bytes in
 //! and a JSON value out, never what it does internally. This is what lets one `HashMap` hold
 //! handlers of unrelated types, and what lets [`crate::server`]'s HTTP route dispatch by name
@@ -20,7 +21,7 @@ use super::RpcError;
 
 /// A dispatchable handler, after `Req`/`Resp` have been erased
 ///
-/// `Arc`, not `Box`: [`Registry::dispatch`] clones this handle out from under the registry's lock
+/// `Arc`, not `Box`: [`Handlers::dispatch`] clones this handle out from under the table's lock
 /// before calling it, so a slow handler never blocks another dispatch - or a new registration -
 /// from looking itself up.
 type BoxedHandler = Arc<dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = serde_json::Value> + Send>> + Send + Sync>;
@@ -66,11 +67,11 @@ impl<T> Outcome<T> {
 /// `.await` inside it, so a `std::sync` lock held only across that operation is the simpler and
 /// cheaper choice - a lock must never be held across an `.await`, and this one never is.
 #[derive(Default)]
-pub(super) struct Registry {
+pub(super) struct Handlers {
     handlers: RwLock<HashMap<String, BoxedHandler>>,
 }
 
-impl Registry {
+impl Handlers {
     /// Register `handler` under `name`, unless a handler is already registered there
     ///
     /// Returns `true` on success, `false` if `name` was already taken - registering a name twice
@@ -142,23 +143,23 @@ mod tests {
 
     #[tokio::test]
     async fn a_registered_handler_answers_ok() {
-        let registry = Registry::default();
-        assert!(registry.register::<String, String, std::convert::Infallible, _, _>(
+        let handlers = Handlers::default();
+        assert!(handlers.register::<String, String, std::convert::Infallible, _, _>(
             "echo".to_string(),
             |req: String| async move { Ok(req) },
         ));
 
         let body = serde_json::to_vec(&"hello".to_string()).unwrap();
-        let value = registry.dispatch("echo", body).await;
+        let value = handlers.dispatch("echo", body).await;
         let outcome: Outcome<String> = serde_json::from_value(value).unwrap();
         assert_eq!("hello".to_string(), outcome.into_rpc_result("echo").unwrap());
     }
 
     #[tokio::test]
     async fn dispatching_an_unregistered_name_answers_unknown_name() {
-        let registry = Registry::default();
+        let handlers = Handlers::default();
 
-        let value = registry.dispatch("missing", Vec::new()).await;
+        let value = handlers.dispatch("missing", Vec::new()).await;
         let outcome: Outcome<()> = serde_json::from_value(value).unwrap();
         let err = outcome.into_rpc_result("missing").unwrap_err();
         assert!(matches!(err, RpcError::Remote(_)));
@@ -167,26 +168,26 @@ mod tests {
 
     #[tokio::test]
     async fn registering_the_same_name_twice_is_refused() {
-        let registry = Registry::default();
+        let handlers = Handlers::default();
         assert!(
-            registry
+            handlers
                 .register::<(), (), std::convert::Infallible, _, _>("name".to_string(), |_: ()| async move { Ok(()) },)
         );
         assert!(
-            !registry
+            !handlers
                 .register::<(), (), std::convert::Infallible, _, _>("name".to_string(), |_: ()| async move { Ok(()) },)
         );
     }
 
     #[tokio::test]
     async fn a_request_that_does_not_decode_answers_bad_request() {
-        let registry = Registry::default();
-        assert!(registry.register::<u64, u64, std::convert::Infallible, _, _>(
+        let handlers = Handlers::default();
+        assert!(handlers.register::<u64, u64, std::convert::Infallible, _, _>(
             "needs_a_number".to_string(),
             |req: u64| async move { Ok(req) },
         ));
 
-        let value = registry.dispatch("needs_a_number", b"\"not a number\"".to_vec()).await;
+        let value = handlers.dispatch("needs_a_number", b"\"not a number\"".to_vec()).await;
         let outcome: Outcome<u64> = serde_json::from_value(value).unwrap();
         let err = outcome.into_rpc_result("needs_a_number").unwrap_err();
         assert!(err.to_string().contains("did not decode"), "{err}");
@@ -194,13 +195,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_handler_error_answers_handler_error() {
-        let registry = Registry::default();
+        let handlers = Handlers::default();
         assert!(
-            registry
+            handlers
                 .register::<(), (), String, _, _>("fails".to_string(), |_: ()| async move { Err("boom".to_string()) })
         );
 
-        let value = registry.dispatch("fails", serde_json::to_vec(&()).unwrap()).await;
+        let value = handlers.dispatch("fails", serde_json::to_vec(&()).unwrap()).await;
         let outcome: Outcome<()> = serde_json::from_value(value).unwrap();
         let err = outcome.into_rpc_result("fails").unwrap_err();
         assert_eq!("'fails': boom", err.to_string());
