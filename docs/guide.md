@@ -229,8 +229,8 @@ async fn increment(node: &EzKv, key: &str) -> Result<u64, WriteError> {
 ### 上限
 
 `Txn::validate(&self, limits: &KvLimits)` 在事务真正被提议*之前*检查大小与数量：`KvLimits` 有
-`max_key_bytes`、`max_value_bytes`、`max_txn_ops`、`max_txn_bytes`（事务里全部 key、value 字节数之
-和，涵盖 `conditions` 与 `ops` 两边）四项，通过 `EzConfig::kv_limits` 配置（默认值同样待 ech0-media#36
+`max_key_bytes`、`max_value_bytes`、`max_txn_ops`（操作数的上限，同时也是条件数的上限，两者各自计数）、
+`max_txn_bytes`（事务里全部 key、value 字节数之和，涵盖 `conditions` 与 `ops` 两边）四项，通过 `EzConfig::kv_limits` 配置（默认值同样待 ech0-media#36
 实测，见上一节）。`EzKv::write`/`write_with_id` 先用**发起节点自己的**限制检查一遍（不满足就地拒绝，不
 发出任何请求），转发到 leader 之后 leader 还会用**自己的**限制再检查一遍——两节点配置不同时，不允许因为
 检查发生在哪个节点上而让副本产生分歧。超限返回 `WriteError::LimitExceeded(LimitError)`，`LimitError`
@@ -583,9 +583,12 @@ leader 上执行」的逻辑用 leader 专属任务（见下一节），需要�
 - `external_addr`：客户端与业务方用来联系这个节点的地址，和成员配置里 Raft 用的内部地址是两码事；
   底座从不解析或拨号它，原样存、原样交还——完全由 `EzConfig::external_addr` 决定内容。
 - `meta`：上游自定义的不透明字节，底座同样不解释；`EzKv::update_node_meta(meta)` 可以随时更新它（保留
-  已登记的 `external_addr` 不变），受 `EzConfig::write_deadline` 约束，超时返回
-  `RegistryIndeterminate { request_id }`（注册/更新一旦被接受就不会失败——没有条件会不满足，所以这是
-  这个调用唯一可能「没成功」的方式）。
+  已登记的 `external_addr` 不变），受 `EzConfig::write_deadline` 约束。一条注册表条目和普通 value 一样
+  经由日志复制，所以大小也按一个 value 计：`external_addr` 加 `meta` 超过 `KvLimits::max_value_bytes`
+  时返回 `RegistryWriteError::LimitExceeded(LimitError::NodeEntryTooLarge { .. })`，什么都不会被提议
+  （启动时 `EzConfig::external_addr` 加 `node_meta` 超限则 `create`/`join` 直接失败）；超时返回
+  `RegistryWriteError::Indeterminate { request_id }`——更新可能仍会生效，重新调用一次总是安全的，
+  因为条目是整条覆盖的。
 - `status`：底座对这个节点是否可达的判断，`NodeStatus::Up` 或 `NodeStatus::Down`。
 
 每个节点在启动时都会自己在后台把 `external_addr`/`node_meta` 登记进注册表，失败就一直重试直到成功
@@ -882,6 +885,8 @@ feature 时才存在（默认关闭，正常构建完全不含这部分代码，
 | `LimitError::KeyTooLarge { key, actual, max }` | 一个 key（或 `DeletePrefix` 的 `prefix`）超过 `max_key_bytes` | 同上，消息里带着具体大小 |
 | `LimitError::ValueTooLarge { key, actual, max }` | 一个 `Put` 的 value 超过 `max_value_bytes` | 同上 |
 | `LimitError::TooManyOps { actual, max }` | 事务的操作数超过 `max_txn_ops` | 拆成多个事务，或减少操作数 |
+| `LimitError::TooManyConditions { actual, max }` | 事务的条件数超过 `max_txn_ops`（条件和操作各自计数，共用同一个上限） | 减少条件数 |
+| `LimitError::NodeEntryTooLarge { actual, max }` | 节点注册表条目（`external_addr` 加 `meta`）超过 `max_value_bytes` | 见下方 `RegistryWriteError::LimitExceeded` |
 | `LimitError::TooLarge { actual, max }` | 事务的总字节数超过 `max_txn_bytes` | 同上 |
 | `Conflict { index, condition, key, current_mod_rev }` | 第 `index` 个条件不满足 | 重读 `key`（拿到 `current_mod_rev`），按新状态重建事务再写一次 |
 | `WriteError::LimitExceeded(LimitError)` | 见上面几行 | 见上面几行 |
@@ -903,7 +908,8 @@ feature 时才存在（默认关闭，正常构建完全不含这部分代码，
 | `RpcError::Remote(String)` | 对端 RPC 层的确定答复，但不是类型化结果（未知名字/请求解码失败/handler 自身错误） | 按消息判断 |
 | `RpcRegisterError::Reserved(String)` | 名字以 `ez.` 开头 | 换一个名字 |
 | `RpcRegisterError::AlreadyRegistered(String)` | 这个名字已经注册过 | 检查是不是重复注册，不要用同名覆盖 |
-| `RegistryIndeterminate { request_id }` | `update_node_meta` 在 `write_deadline` 内没有确认结果 | 注册/更新一旦被接受就不会失败；可以重新调用一次 `update_node_meta` |
+| `RegistryWriteError::LimitExceeded(LimitError)` | `update_node_meta`：`external_addr` 加新的 `meta` 超过 `max_value_bytes`，没有提议任何东西 | 缩小 `meta`；大块数据放进 KV，`meta` 里只放指向它的 key |
+| `RegistryWriteError::Indeterminate { request_id }` | `update_node_meta` 在 `write_deadline` 内没有确认结果 | 更新可能仍会生效；条目是整条覆盖的，重新调用一次总是安全的 |
 | 其余方法（`create`/`join`/`serve`/`promote`/`demote`/`remove_node`/`transfer_leader`/`metrics`/`wait_metrics`/`trigger_snapshot`/`purge_log`/`shutdown` 等） | 返回 `std::io::Error`，包括与 I/O 本身无关的失败（例如在 follower 上调用 `promote`） | 消息里说明了具体原因；这些方法没有更细的类型化错误 |
 
 ## 给上游的使用约定

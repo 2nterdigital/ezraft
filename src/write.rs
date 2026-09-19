@@ -268,8 +268,12 @@ async fn propose(
     required_term: Option<u64>,
     body: CommandBody,
 ) -> Result<ProposeOutcome, LimitError> {
-    if let CommandBody::Txn(txn) = &body {
-        txn.validate(&kv_limits)?;
+    // Every size a caller controls is checked here, before anything enters the log - never in
+    // `apply`. The remaining command bodies carry node ids and a status, nothing of any size.
+    match &body {
+        CommandBody::Txn(txn) => txn.validate(&kv_limits)?,
+        CommandBody::RegisterNode(entry) => entry.validate(&kv_limits)?,
+        CommandBody::RemoveNode(_) | CommandBody::SetStatus(_) | CommandBody::ReconcileRegistry => {}
     }
 
     let command = Command {

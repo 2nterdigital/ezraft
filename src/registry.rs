@@ -32,6 +32,7 @@ use tokio::task::JoinHandle;
 
 use crate::command::CommandBody;
 use crate::command::CommandOutcome;
+use crate::kv::LimitError;
 use crate::kv::RegisterNode;
 use crate::kv::Registry;
 use crate::kv::RemoveNode;
@@ -39,18 +40,27 @@ use crate::kv::RequestId;
 use crate::raft::EzKv;
 use crate::write::Attempt;
 
-/// Why [`EzKv::update_node_meta`] did not confirm its update within the deadline
+/// Why [`EzKv::update_node_meta`] did not confirm its update
 ///
-/// Registering or updating an entry cannot itself fail once accepted - there is no condition to
-/// fail, unlike a transaction - so this is the only way the call can end without succeeding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("registry write outcome unknown after the deadline (request {request_id})")]
-pub struct RegistryIndeterminate {
-    /// The id this same command was proposed under - not reusable to "retry" the way
-    /// [`crate::EzKv::write_with_id`] reuses one, since [`EzKv::update_node_meta`] does not expose
-    /// its own request id up front, but useful to correlate with the structured `tracing` events
-    /// this module emits.
-    pub request_id: RequestId,
+/// The same two ways a write without conditions can end short of success: refused for its size
+/// before anything was proposed, or still unconfirmed at the deadline.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RegistryWriteError {
+    /// The entry - this node's `external_addr` plus the new `meta` - is larger than a single
+    /// value may be ([`LimitError::NodeEntryTooLarge`]). Nothing was proposed.
+    #[error(transparent)]
+    LimitExceeded(#[from] LimitError),
+
+    /// The deadline passed with no confirmed result
+    ///
+    /// The update may still take effect. Calling [`EzKv::update_node_meta`] again is always safe:
+    /// the entry is overwritten whole, so the last call to be applied wins.
+    #[error("registry write outcome unknown after the deadline (request {request_id})")]
+    Indeterminate {
+        /// The id the command was proposed under - useful to correlate with the structured
+        /// `tracing` events this module emits.
+        request_id: RequestId,
+    },
 }
 
 /// Start this node's self-registration task: propose `RegisterNode { node_id, external_addr,
@@ -78,8 +88,14 @@ pub(crate) fn spawn_self_registration(node: EzKv, external_addr: String, meta: B
             let believed_leader = node.inner().metrics().borrow_watched().current_leader;
 
             match crate::write::attempt_command(&node, request_id, body, round_timeout).await {
-                Attempt::Done(_) => {
+                Attempt::Done(Ok(_)) => {
                     tracing::info!(node_id, external_addr, "node registered itself in the registry");
+                    return;
+                }
+                // `EzKv::new` already held this entry to this node's own limits, so only a leader
+                // configured with stricter ones can answer this - and will again, every time.
+                Attempt::Done(Err(refused)) => {
+                    tracing::error!(node_id, error = %refused, "the leader refused this node's registry entry; not retrying");
                     return;
                 }
                 Attempt::Retry(reason) => {
@@ -151,13 +167,18 @@ impl EzKv {
     ///
     /// # Errors
     ///
-    /// [`RegistryIndeterminate`] if the deadline passes with no confirmed result.
-    pub async fn update_node_meta(&self, meta: impl Into<Bytes>) -> Result<(), RegistryIndeterminate> {
-        let body = CommandBody::RegisterNode(RegisterNode {
+    /// [`RegistryWriteError::LimitExceeded`] if the entry would be larger than a single value may
+    /// be - checked on this node before anything is sent, and again by the leader against its own
+    /// limits; [`RegistryWriteError::Indeterminate`] if the deadline passes with no confirmed
+    /// result.
+    pub async fn update_node_meta(&self, meta: impl Into<Bytes>) -> Result<(), RegistryWriteError> {
+        let entry = RegisterNode {
             node_id: self.node_id(),
             external_addr: self.external_addr().to_string(),
             meta: meta.into(),
-        });
+        };
+        entry.validate(&self.kv_limits())?;
+        let body = CommandBody::RegisterNode(entry);
 
         let request_id = RequestId::new();
         let deadline = tokio::time::Instant::now() + self.write_deadline();
@@ -166,15 +187,17 @@ impl EzKv {
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(RegistryIndeterminate { request_id });
+                return Err(RegistryWriteError::Indeterminate { request_id });
             }
 
             let believed_leader = self.inner().metrics().borrow_watched().current_leader;
             match crate::write::attempt_command(self, request_id, body.clone(), remaining).await {
                 Attempt::Done(Ok(CommandOutcome::Registry)) => return Ok(()),
-                // A registry command is answered as one, and has no limit to exceed. Anything else
-                // came from a node that does not speak this one's protocol - a forwarded command's
-                // answer is a peer's to give - so it is not an outcome, and not worth a panic.
+                // The leader's own limits are stricter than this node's.
+                Attempt::Done(Err(refused)) => return Err(refused.into()),
+                // A registry command is answered as one. Anything else came from a node that does
+                // not speak this one's protocol - a forwarded command's answer is a peer's to give
+                // - so it is not an outcome, and not worth a panic.
                 Attempt::Done(unexpected) => {
                     tracing::error!(request_id = %request_id, outcome = ?unexpected, "unexpected answer to a registry command");
                     self.wait_before_next_attempt(believed_leader, backoff, remaining).await;

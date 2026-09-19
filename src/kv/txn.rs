@@ -146,6 +146,15 @@ impl Txn {
                 max: limits.max_txn_ops,
             });
         }
+        // Counted separately, against the same limit. Left unbounded, conditions are the one part
+        // of a transaction whose encoded size the byte limit below says nothing about: each one
+        // is a few dozen bytes of structure around a key that may be a single byte.
+        if self.conditions.len() > limits.max_txn_ops {
+            return Err(LimitError::TooManyConditions {
+                actual: self.conditions.len(),
+                max: limits.max_txn_ops,
+            });
+        }
 
         let mut total_bytes: usize = 0;
 
@@ -239,7 +248,8 @@ pub struct KvLimits {
     pub max_key_bytes: usize,
     /// Maximum size of a single value, in bytes. Default: 64 KiB.
     pub max_value_bytes: usize,
-    /// Maximum number of ops in one transaction. Default: 128.
+    /// Maximum number of ops in one transaction, and - counted separately - of conditions.
+    /// Default: 128.
     pub max_txn_ops: usize,
     /// Maximum total size of a transaction, in bytes: the sum of every key's (and, for `Put`,
     /// value's) bytes across both `conditions` and `ops`. Default: 1 MiB.
@@ -302,6 +312,14 @@ pub enum LimitError {
         /// The configured `max_txn_ops`
         max: usize,
     },
+    /// The transaction had more conditions than `max_txn_ops`
+    #[error("transaction has {actual} condition(s), exceeding the {max}-condition limit")]
+    TooManyConditions {
+        /// The number of conditions in the transaction
+        actual: usize,
+        /// The configured `max_txn_ops`, which bounds conditions and ops alike, each on its own
+        max: usize,
+    },
     /// The transaction's total size exceeded `max_txn_bytes`
     #[error("transaction is {actual} bytes, exceeding the {max}-byte limit")]
     TooLarge {
@@ -309,6 +327,17 @@ pub enum LimitError {
         /// ops)
         actual: usize,
         /// The configured `max_txn_bytes`
+        max: usize,
+    },
+    /// A node's registry entry - its `external_addr` plus its `meta` - exceeded `max_value_bytes`
+    ///
+    /// Not a transaction's limit, but the same kind of refusal for the same reason: a registry
+    /// entry is replicated through the log like any value, and is held to a value's size.
+    #[error("node registry entry is {actual} bytes, exceeding the {max}-byte limit")]
+    NodeEntryTooLarge {
+        /// The entry's size in bytes (`external_addr` plus `meta`)
+        actual: usize,
+        /// The configured `max_value_bytes`
         max: usize,
     },
 }
@@ -483,6 +512,25 @@ mod tests {
         };
         let txn = Txn::new().put("a", Bytes::new()).put("b", Bytes::new()).put("c", Bytes::new());
         assert_eq!(Err(LimitError::TooManyOps { actual: 3, max: 2 }), txn.validate(&limits));
+    }
+
+    #[test]
+    fn validate_bounds_conditions_by_the_same_limit_as_ops_counted_on_their_own() {
+        let limits = KvLimits {
+            max_txn_ops: 2,
+            ..KvLimits::default()
+        };
+        let not_exists = |key: &str| Condition::NotExists { key: key.to_string() };
+
+        // Two conditions and two ops: each count is at its own limit, neither over it.
+        let at_the_limit = Txn::new().when(not_exists("a")).when(not_exists("b")).put("a", Bytes::new()).delete("b");
+        assert_eq!(Ok(()), at_the_limit.validate(&limits));
+
+        let one_over = Txn::new().when(not_exists("a")).when(not_exists("b")).when(not_exists("c"));
+        assert_eq!(
+            Err(LimitError::TooManyConditions { actual: 3, max: 2 }),
+            one_over.validate(&limits)
+        );
     }
 
     #[test]

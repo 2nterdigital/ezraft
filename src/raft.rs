@@ -297,6 +297,20 @@ impl EzKv {
         // mark a peer `Down` before a freshly elected leader could possibly have heard from it.
         config.validate_liveness()?;
 
+        // This node's own registry entry is proposed in the background, retried until it lands;
+        // an entry too large to ever be accepted has to fail here, where the caller can see it.
+        let entry_bytes = config.external_addr.len() + config.node_meta.len();
+        if entry_bytes > config.kv_limits.max_value_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "EzConfig::external_addr plus EzConfig::node_meta is {entry_bytes} bytes, exceeding \
+                     kv_limits.max_value_bytes ({} bytes): a node's registry entry is held to the size of a single value",
+                    config.kv_limits.max_value_bytes
+                ),
+            ));
+        }
+
         // Converted first, because it is the only step that can fail on nothing but its
         // arguments, and everything below it either takes an id from the cluster or changes the
         // cluster's membership. A configuration this node cannot run with must not first cost the

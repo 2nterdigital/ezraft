@@ -130,7 +130,7 @@ pub use openraft::RaftTypeConfig;
 pub use openraft::ServerState;
 pub use raft::EzKv;
 pub use read::ReadError;
-pub use registry::RegistryIndeterminate;
+pub use registry::RegistryWriteError;
 pub use rpc::Rpc;
 pub use rpc::RpcError;
 pub use rpc::RpcRegisterError;
