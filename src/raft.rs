@@ -555,6 +555,8 @@ impl EzKv {
     /// process** - exactly what the in-process cluster tests, and any real restart, need - can
     /// bind it again immediately after this returns. A node with no address to answer on has no
     /// business serving anyway. A node that never called `serve` simply has nothing to stop here.
+    /// The internal HTTP server does not handle process signals: the embedding application owns
+    /// them and calls this after its own drain and cleanup are complete.
     pub async fn shutdown(&self) -> Result<(), io::Error> {
         // "Retries until it succeeds" (ech0-media#33) must not mean "forever, even after this
         // node has stopped" - a no-op if it already finished on its own. First, so that nothing
@@ -588,6 +590,10 @@ impl EzKv {
     /// node only through this server, so a node that has joined a cluster but is not serving yet
     /// cannot be replicated to, and holds up every quorum it is counted in.
     ///
+    /// The internal server does not install process-level signal handlers. The embedding
+    /// application owns signals such as `SIGINT` and `SIGTERM`; after its own drain and cleanup,
+    /// it must call [`Self::shutdown`] to stop this server and the Raft engine.
+    ///
     /// This is also where the promotion started by [`Self::join`] is collected. The server goes
     /// up first, because the promotion completes only once this node has caught up and it can
     /// only catch up through that server; a promotion that fails is returned here, and stops the
@@ -605,6 +611,8 @@ impl EzKv {
     ///
     /// The closure extends the bundled server with routes backed by the same node handle.
     /// Standard Raft and admin routes are installed first and cannot be replaced.
+    /// Like [`Self::serve`], this does not handle process signals; the embedding application
+    /// owns them and stops the node with [`Self::shutdown`] after its own cleanup.
     pub async fn serve_with<F>(self, configure: F) -> Result<(), io::Error>
     where F: Fn(&mut actix_web::web::ServiceConfig) + Clone + Send + 'static {
         let promotion = self.promotion.lock().unwrap().take();

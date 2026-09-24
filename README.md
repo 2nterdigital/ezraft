@@ -68,8 +68,17 @@ async fn main() -> std::io::Result<()> {
     node.write(Txn::new().put("hello", "world")).await.map_err(std::io::Error::other)?;
     println!("{:?}", node.view().get("hello"));
 
-    // The Raft RPCs peers need, plus the admin API. Runs until shutdown.
-    node.serve().await
+    // The embedding application owns process signals. This example handles Ctrl-C; a deployment
+    // that receives SIGTERM must register it too, then use the same shutdown path.
+    let mut serving = tokio::spawn(node.clone().serve());
+    tokio::select! {
+        result = &mut serving => result.map_err(std::io::Error::other)?,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            node.shutdown().await?;
+            serving.await.map_err(std::io::Error::other)?
+        }
+    }
 }
 ```
 

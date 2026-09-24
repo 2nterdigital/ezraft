@@ -86,9 +86,17 @@ async fn main() -> io::Result<()> {
     node.write(Txn::new().put("hello", "world")).await.map_err(io::Error::other)?;
     println!("{:?}", node.view().get("hello"));
 
-    // 5. 提供内部端口的 Raft RPC 与管理 API。这会一直阻塞；有其他工作要做时用
-    //    `tokio::spawn` 启动它。
-    node.serve().await
+    // 5. 提供内部端口的 Raft RPC 与管理 API。应用自己捕获 Ctrl-C，完成 drain/清理后
+    //    调用 shutdown；部署若接收 SIGTERM，也要由应用注册对应的处理器。
+    let mut serving = tokio::spawn(node.clone().serve());
+    tokio::select! {
+        result = &mut serving => result.map_err(io::Error::other)?,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            node.shutdown().await?;
+            serving.await.map_err(io::Error::other)?
+        }
+    }
 }
 ```
 
@@ -128,6 +136,16 @@ async fn main() -> io::Result<()> {
 
 内部端口只应该绑定在集群自己的私有网络里；它不做双向 TLS，`examples/kvstore.rs` 也因此把它和上游自己的
 对外端口分开监听。
+
+### 进程信号与显式停机
+
+`EzKv::serve()` 和 `serve_with()` 的内部 HTTP 服务不会接管进程信号，也不会因为 `SIGINT` 或 `SIGTERM`
+自行停止。进程宿主负责捕获自己会收到的信号：先完成上游的会话 drain 和自清理，再调用并等待
+`EzKv::shutdown()`。这段时间节点仍能通过内部端口接收 Raft RPC；`shutdown()` 才会停止 Raft 与内部 HTTP
+服务并等待它们结束。
+
+快速开始示例用 `tokio::signal::ctrl_c()` 演示 Ctrl-C。它不注册 `SIGTERM`；若容器或进程管理器会发送
+`SIGTERM`，宿主也必须显式处理该信号并走同一停机路径。
 
 ### `RedbStorage`
 

@@ -310,6 +310,9 @@ where F: Fn(&mut ServiceConfig) + Clone + Send + 'static {
             .route(&rpc_route, web::post().to(EzServer::handle_rpc))
             .configure(configure)
     })
+    // Process signals belong to the embedding application so it can finish its own drain and
+    // cleanup while peers can still reach this node, then stop the server through `EzKv::shutdown`.
+    .disable_signals()
     .bind(&addr)?;
 
     Ok(server.run())

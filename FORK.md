@@ -284,6 +284,12 @@
   `Arc<EzConfig>` 而不是逐字段拷贝，`Clone` 改为 derive；`kv`、`watch`、`server` 改为私有模块（公开项本来就
   都从 crate 根重导出）；RPC 处理器表改名 `rpc/handlers.rs` / `Handlers`，不再与节点注册表重名。
 
+- [#150 优雅停机与内部服务的信号所有权](https://github.com/2nterdigital/ech0-media/issues/150)：`src/server.rs` 的内部 Actix
+  HTTP server 调用 `disable_signals()`，由 embedding application 独占 `SIGINT`/`SIGTERM` 所有权；上游可先完成会话
+  drain 和名下记录清理，再显式调用 `EzKv::shutdown()`，内部 Raft RPC 在此之前继续可用。同步更新 `serve`/`serve_with`
+  API 文档、使用指南、crate Quick Start 与 README；示例只演示 Ctrl-C，SIGTERM 由宿主另行注册。ech0-media 增加真实
+  三节点进程回归，覆盖会话关闭码、自清理结果、退出时限及 leader/term 稳定性。
+
 ## 验证命令
 
 合入 `dev` 之前全部通过（与 CI 一致）：

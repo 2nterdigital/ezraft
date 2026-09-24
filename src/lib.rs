@@ -60,9 +60,17 @@
 //!     node.write(Txn::new().put("hello", "world")).await.map_err(io::Error::other)?;
 //!     println!("{:?}", node.view().get("hello"));
 //!
-//!     // 5. Serve the Raft RPCs peers need, plus the admin API. This blocks;
-//!     //    `tokio::spawn` it when the caller has other work to do.
-//!     node.serve().await
+//!     // 5. Serve the Raft RPCs peers need, plus the admin API. The embedding app owns process
+//!     //    signals; this sample handles Ctrl-C, shuts the node down, and waits for serve to end.
+//!     let mut serving = tokio::spawn(node.clone().serve());
+//!     tokio::select! {
+//!         result = &mut serving => result.map_err(io::Error::other)?,
+//!         signal = tokio::signal::ctrl_c() => {
+//!             signal?;
+//!             node.shutdown().await?;
+//!             serving.await.map_err(io::Error::other)?
+//!         }
+//!     }
 //! }
 //! ```
 //!
