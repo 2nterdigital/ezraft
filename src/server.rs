@@ -255,11 +255,9 @@ impl EzServer {
 
 /// Bind the node's HTTP server, running `configure` on top of the standard routes
 ///
-/// Binding is synchronous (it can fail immediately, e.g. `AddrInUse`); running the accept loop
-/// is not, which is why this hands back the still-unawaited [`Server`] rather than awaiting it
-/// itself - the caller ([`EzKv::serve_with`](crate::raft::EzKv::serve_with)) needs the `Server`'s
-/// own `handle()` before the accept loop starts, so [`EzKv::shutdown`](crate::raft::EzKv::shutdown)
-/// can stop it later.
+/// The socket was acquired by `EzKv`'s constructor and is passed here to Actix. This returns the
+/// still-unawaited [`Server`] so its caller can retain the `ServerHandle` before the accept loop
+/// starts and stop it later from [`EzKv::shutdown`](crate::raft::EzKv::shutdown).
 ///
 /// `EzConfig::json_body_limit` is the app-wide request body limit (every route here but
 /// `/raft/snapshot` carries JSON, `configure`'s own routes included). It has to be set twice,
@@ -270,9 +268,8 @@ impl EzServer {
 /// be refused on every retry. `/raft/snapshot` overrides the `PayloadConfig` with its own, from
 /// `EzConfig::snapshot_max_bytes`, since it is the one route whose body can legitimately be far
 /// larger than any JSON request this node accepts (ech0-media#26).
-pub(crate) fn bind<F>(raft: EzKv, configure: F) -> std::io::Result<Server>
+pub(crate) fn bind<F>(raft: EzKv, listener: std::net::TcpListener, configure: F) -> std::io::Result<Server>
 where F: Fn(&mut ServiceConfig) + Clone + Send + 'static {
-    let addr = raft.addr().to_string();
     let json_body_limit = raft.json_body_limit();
     let snapshot_payload_limit = raft.snapshot_max_bytes().saturating_add(SNAPSHOT_FRAME_OVERHEAD_ALLOWANCE);
     let token = raft.cluster_token().to_string();
@@ -313,7 +310,7 @@ where F: Fn(&mut ServiceConfig) + Clone + Send + 'static {
     // Process signals belong to the embedding application so it can finish its own drain and
     // cleanup while peers can still reach this node, then stop the server through `EzKv::shutdown`.
     .disable_signals()
-    .bind(&addr)?;
+    .listen(listener)?;
 
     Ok(server.run())
 }

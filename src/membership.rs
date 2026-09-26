@@ -43,8 +43,8 @@ impl EzKv {
     /// two. Joining replicates the log; it does not change who decides. Until this is called the
     /// new node is a read replica, which is also what to leave it as if that is all you want.
     ///
-    /// Returns once the node is a voter. Bringing it up to date is part of the change, so this
-    /// lasts as long as that catch-up takes - for a large state, a whole snapshot transfer.
+    /// Returns once OpenRaft's membership change completes. EzRaft does not add a separate
+    /// readiness or catch-up check, so the target should be serving before it is promoted.
     ///
     /// Fails if the node is not a learner of this cluster, and if another membership change is
     /// still in flight, since a cluster admits one at a time. Both are the caller's to retry -

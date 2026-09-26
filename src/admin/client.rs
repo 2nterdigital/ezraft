@@ -72,8 +72,9 @@ impl AdminClient {
 
     /// Ask the cluster to change who is in it
     pub async fn membership(&self, change: MembershipChange) -> Result<(), io::Error> {
-        // A promotion is answered only once the node has caught up, so that call is as long as
-        // the catch-up; the rest are answered as soon as the leader commits them.
+        // Role changes use the longer budget because OpenRaft may wait for its membership
+        // transition to complete. The protocol does not itself prove that the target server is
+        // ready or that it has caught up.
         let timeout = match change {
             MembershipChange::SetRole { .. } => MEMBERSHIP_CHANGE_TIMEOUT,
             _ => ADMIN_TIMEOUT,

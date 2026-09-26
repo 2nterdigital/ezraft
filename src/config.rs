@@ -22,6 +22,17 @@ use crate::watch::WatchLimits;
 /// Election timeout is automatically calculated as 3-6x the heartbeat interval.
 #[derive(Clone)]
 pub struct EzConfig {
+    /// Local address the internal HTTP server binds, if it differs from the address declared to
+    /// the cluster
+    ///
+    /// `EzKv::create`/`join`/`join_as_learner` always use their `http_addr` argument as this node's
+    /// member communication address and as [`crate::EzKv::addr`]. When this is `Some`, only the
+    /// local listener uses this value; it is bound before the constructor requests an id or
+    /// changes cluster membership. This lets a container listen on a local or wildcard interface
+    /// while advertising a stable DNS name. When `None` (the default), the constructor argument
+    /// continues to serve as the local bind address too.
+    pub internal_bind_addr: Option<String>,
+
     /// Heartbeat interval
     ///
     /// Leader sends heartbeats to followers at this interval.
@@ -304,6 +315,7 @@ impl fmt::Debug for EzConfig {
         // Destructured in full, so that a field added later cannot be left out of this by
         // accident - or, were it another secret, shown by default.
         let Self {
+            internal_bind_addr,
             heartbeat_interval,
             snapshot_interval,
             snapshot_log_to_keep,
@@ -327,6 +339,7 @@ impl fmt::Debug for EzConfig {
 
         let mut shown = f.debug_struct("EzConfig");
         shown
+            .field("internal_bind_addr", internal_bind_addr)
             .field("heartbeat_interval", heartbeat_interval)
             .field("snapshot_interval", snapshot_interval)
             .field("snapshot_log_to_keep", snapshot_log_to_keep)
@@ -353,6 +366,7 @@ impl fmt::Debug for EzConfig {
 impl Default for EzConfig {
     fn default() -> Self {
         Self {
+            internal_bind_addr: None,
             heartbeat_interval: Duration::from_millis(500),
             cluster_token: String::new(),
             snapshot_interval: 500,

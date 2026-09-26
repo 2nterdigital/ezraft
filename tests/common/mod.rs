@@ -168,8 +168,7 @@ pub async fn wait_for_revision(node: &EzKv, revision: u64) -> io::Result<View> {
     }
 }
 
-/// Serve a node in the background, which is also where a join's promotion is
-/// collected - a joined node reaches the voter set only once this is running.
+/// Serve a node in the background, which starts the deferred voter-change request for `join`.
 pub fn spawn_serve(node: &EzKv) {
     let node = node.clone();
     tokio::spawn(async move { node.serve().await });

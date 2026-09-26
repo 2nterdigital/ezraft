@@ -62,8 +62,8 @@ async fn cluster_tracks_a_learner_join_and_its_promotion_to_voter() -> io::Resul
         "the founding voter is visible to a learner too"
     );
 
-    // Being caught up is the only thing a promotion waits for (see `tests/membership.rs`'s own
-    // precedent); anchored to the leader's index rather than a fixed write count.
+    // Wait for the learner to apply a real log entry before explicitly promoting it; this checks
+    // replication without treating catch-up as an automatic promotion gate.
     a.write(set("k1", "v1")).await.map_err(|e| io::Error::other(e.to_string()))?;
     let target = a.metrics().await.last_log_index.expect("the leader has written entries");
     b.wait_metrics(

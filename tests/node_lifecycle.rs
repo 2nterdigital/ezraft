@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io;
 use std::time::Duration;
@@ -14,35 +15,188 @@ use ezraft::EzConfig;
 use ezraft::EzKv;
 use ezraft::EzStorage;
 
-/// `serve` must report a server that cannot start, even for a joining voter whose promotion is
-/// still pending. The promotion is waiting for this node to catch up, which it can only do
-/// through the server that just failed, so collecting the promotion first would sit on the bind
-/// error for the twenty attempts and ninety seconds each it still has to spend.
+/// Joining reserves the internal endpoint in its constructor and returns the original bind error
+/// before it asks the seed to change membership.
 #[tokio::test(flavor = "multi_thread")]
-async fn serve_reports_a_server_that_cannot_bind_instead_of_awaiting_promotion() -> io::Result<()> {
-    let (seed, _seed_node, _seed_data) = founding_node().await?;
+async fn join_reports_an_occupied_listener_during_construction() -> io::Result<()> {
+    let (seed, seed_node, _seed_data) = founding_node().await?;
 
-    // Hold the address the node is about to claim, so its server cannot bind it.
+    // Hold the address the constructor must reserve before it asks the seed for an id.
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = occupied.local_addr().unwrap().to_string();
 
     let data = NodeData::new();
-    let node = EzKv::join(&addr, &seed, data.open().await?, config()).await?;
-
-    // Comfortably below the promotion's own retry budget, and far above what returning a bind
-    // error takes.
-    let served = tokio::time::timeout(Duration::from_secs(5), node.serve())
-        .await
-        .map_err(|_| io::Error::other("serve is still waiting for a promotion its server cannot deliver"))?;
-
-    let err = served.expect_err("serve reports the bind failure");
+    let err = match EzKv::join(&addr, &seed, data.open().await?, config()).await {
+        Err(err) => err,
+        Ok(_) => return Err(io::Error::other("join succeeded with an occupied internal listener")),
+    };
     assert_eq!(
         io::ErrorKind::AddrInUse,
         err.kind(),
-        "the error is the bind failure itself: {}",
-        err
+        "the original bind error is returned: {err}"
     );
 
+    let membership = seed_node.metrics().await.committed_membership_config.membership().clone();
+    assert_eq!(BTreeSet::from([0]), membership.voter_ids().collect::<BTreeSet<_>>());
+    assert!(membership.learner_ids().next().is_none());
+    assert_eq!(vec![0], membership.nodes().map(|(id, _)| *id).collect::<Vec<_>>());
+
+    Ok(())
+}
+
+/// Both join APIs must refuse a conflict before touching voters, learners, or their addresses.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_occupied_internal_listener_leaves_every_committed_member_and_address_unchanged() -> io::Result<()> {
+    assert_occupied_join_preserves_membership(ezraft::NodeRole::Learner).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_occupied_internal_listener_refuses_voter_join_before_membership_changes() -> io::Result<()> {
+    assert_occupied_join_preserves_membership(ezraft::NodeRole::Voter).await
+}
+
+async fn assert_occupied_join_preserves_membership(role: ezraft::NodeRole) -> io::Result<()> {
+    let (seed, seed_node, _seed_data) = founding_node().await?;
+    let (_, voter, _voter_data) = joined_voter(&seed).await?;
+    let (_, learner, _learner_data) = joined_learner(&seed).await?;
+    let voters = BTreeSet::from([0, voter.node_id()]);
+    wait_for_voters(&seed_node, voters, "the healthy multi-voter cluster is committed").await?;
+
+    let before = seed_node.metrics().await.committed_membership_config.membership().clone();
+    let voters_before = before.voter_ids().collect::<BTreeSet<_>>();
+    let learners_before = before.learner_ids().collect::<BTreeSet<_>>();
+    let addresses_before =
+        before.nodes().map(|(id, node)| (*id, node.internal_addr.clone())).collect::<BTreeMap<_, _>>();
+    assert!(learners_before.contains(&learner.node_id()));
+
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bind_addr = occupied.local_addr().unwrap().to_string();
+    let declared_addr = "joiner.internal.invalid:9600";
+    let data = NodeData::new();
+    let config = EzConfig {
+        internal_bind_addr: Some(bind_addr),
+        ..config()
+    };
+    let storage = data.open().await?;
+    let result = match role {
+        ezraft::NodeRole::Learner => EzKv::join_as_learner(declared_addr, &seed, storage, config).await,
+        ezraft::NodeRole::Voter => EzKv::join(declared_addr, &seed, storage, config).await,
+    };
+
+    if let Ok(unexpected_node) = result {
+        // Keep the baseline failure from leaving an extra learner in this live test cluster.
+        seed_node.remove_node(unexpected_node.node_id()).await?;
+        unexpected_node.shutdown().await?;
+        return Err(io::Error::other(
+            "join succeeded while its configured internal listener was occupied",
+        ));
+    }
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => unreachable!("a successful join was removed above"),
+    };
+    assert_eq!(
+        io::ErrorKind::AddrInUse,
+        err.kind(),
+        "the original bind error is returned: {err}"
+    );
+
+    let after = seed_node.metrics().await.committed_membership_config.membership().clone();
+    assert_eq!(voters_before, after.voter_ids().collect::<BTreeSet<_>>());
+    assert_eq!(learners_before, after.learner_ids().collect::<BTreeSet<_>>());
+    assert_eq!(
+        addresses_before,
+        after.nodes().map(|(id, node)| (*id, node.internal_addr.clone())).collect()
+    );
+
+    Ok(())
+}
+
+/// A node listens at its local override while the declared DNS address remains in the public
+/// handle and the initial membership entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_binds_override_and_keeps_declared_address_for_membership() -> io::Result<()> {
+    let local_addr = free_addr();
+    let declared_addr = "node-0.internal.invalid:9602";
+    let data = NodeData::new();
+    let node = EzKv::create(declared_addr, data.open().await?, EzConfig {
+        internal_bind_addr: Some(local_addr.clone()),
+        ..config()
+    })
+    .await?;
+
+    assert_eq!(declared_addr, node.addr());
+    assert_eq!(
+        io::ErrorKind::AddrInUse,
+        std::net::TcpListener::bind(&local_addr).unwrap_err().kind(),
+        "construction keeps the local listener reserved",
+    );
+
+    let serving = tokio::spawn(node.clone().serve());
+    wait_until_serving(&local_addr).await?;
+    node.wait_metrics(
+        WAIT,
+        |metrics| {
+            metrics
+                .committed_membership_config
+                .membership()
+                .get_node(&node.node_id())
+                .is_some_and(|entry| entry.internal_addr == declared_addr)
+        },
+        "the configured DNS address is committed for peer communication",
+    )
+    .await?;
+    node.shutdown().await?;
+    serving.await.map_err(io::Error::other)??;
+
+    let _rebound = std::net::TcpListener::bind(&local_addr)?;
+    Ok(())
+}
+
+/// A service-factory failure before the first Actix worker is ready leaves the pre-bound port
+/// available again after `serve_with` returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_factory_failure_releases_the_prebound_listener() -> io::Result<()> {
+    let local_addr = free_addr();
+    let data = NodeData::new();
+    let node = EzKv::create("node-0.internal.invalid:9603", data.open().await?, EzConfig {
+        internal_bind_addr: Some(local_addr.clone()),
+        ..config()
+    })
+    .await?;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        node.clone().serve_with(|_| panic!("intentional service-factory failure")),
+    )
+    .await
+    .map_err(|_| io::Error::other("serve_with did not report the failed service factory"))?;
+    assert!(result.is_err(), "the service-factory failure is returned to serve_with");
+
+    node.shutdown().await?;
+    let _rebound = std::net::TcpListener::bind(&local_addr)?;
+    Ok(())
+}
+
+/// A failed second serve call has no ownership of the first server and leaves it serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_serve_call_does_not_stop_the_existing_server() -> io::Result<()> {
+    let local_addr = free_addr();
+    let data = NodeData::new();
+    let node = EzKv::create("node-0.internal.invalid:9604", data.open().await?, EzConfig {
+        internal_bind_addr: Some(local_addr.clone()),
+        ..config()
+    })
+    .await?;
+
+    let first_serve = tokio::spawn(node.clone().serve());
+    wait_until_serving(&local_addr).await?;
+    let err = node.clone().serve().await.expect_err("only one server owns the pre-bound listener");
+    assert_eq!(io::ErrorKind::AlreadyExists, err.kind());
+    wait_until_serving(&local_addr).await?;
+
+    node.shutdown().await?;
+    first_serve.await.map_err(io::Error::other)??;
     Ok(())
 }
 
@@ -104,8 +258,8 @@ async fn a_failed_promotion_is_finished_by_promote_not_by_restarting() -> io::Re
     let restarted = EzKv::join(&addr, &seed, data.open().await?, config()).await?;
     spawn_serve(&restarted);
 
-    // Being caught up is the only thing a promotion waits for, so a restart that meant to promote
-    // would have done it by now.
+    // Reopening the persisted node id does not issue a promotion. Applying new leader entries only
+    // proves that the restarted learner is receiving the log.
     seed_node.write(set("k1", "v1")).await.map_err(|e| io::Error::other(e.to_string()))?;
     wait_for_applied(&restarted, &seed_node).await?;
 
@@ -201,5 +355,68 @@ async fn a_restarted_voter_recovers_its_redb_state_and_the_cluster_keeps_serving
     wait_for_applied(&restarted, &a).await?;
     assert_eq!(Some("v3".to_string()), restarted.view().get("k3").map(|kv| text(&kv)));
 
+    Ok(())
+}
+
+/// A serve future may be dropped by a thread outside Tokio while its original runtime remains
+/// alive. Shutdown must still wait for the server's graceful completion, not just enqueue stop.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_serve_outside_runtime_preserves_shutdown_completion() -> io::Result<()> {
+    let addr = free_addr();
+    let data = NodeData::new();
+    let node = EzKv::create(&addr, data.open().await?, config()).await?;
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handler_release = release.clone();
+    let mut serving = Box::pin(node.clone().serve_with(move |routes| {
+        let release = handler_release.clone();
+        let entered = entered_tx.clone();
+        routes.route(
+            "/held",
+            actix_web::web::get().to(move || {
+                let release = release.clone();
+                let entered = entered.clone();
+                async move {
+                    let _ = entered.send(());
+                    release.notified().await;
+                    actix_web::HttpResponse::Ok().finish()
+                }
+            }),
+        );
+    }));
+    std::future::poll_fn(|cx| {
+        assert!(serving.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    wait_until_serving(&addr).await?;
+    let request_addr = addr.clone();
+    let request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .get(format!("http://{request_addr}/held"))
+            .bearer_auth(config().cluster_token)
+            .send()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("custom request did not enter"))?;
+    std::thread::spawn(move || drop(serving)).join().expect("drop thread completes");
+    let closing_node = node.clone();
+    let mut closing = tokio::spawn(async move { closing_node.shutdown().await });
+    let early = tokio::time::timeout(Duration::from_millis(300), &mut closing).await;
+    release.notify_one();
+    let response = request.await.map_err(io::Error::other)?.map_err(io::Error::other)?;
+    assert!(response.status().is_success());
+    assert!(
+        early.is_err(),
+        "shutdown returned before the held HTTP request finished"
+    );
+    tokio::time::timeout(Duration::from_secs(5), closing)
+        .await
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)??;
+    let _rebound = std::net::TcpListener::bind(&addr)?;
     Ok(())
 }

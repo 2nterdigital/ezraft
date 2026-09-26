@@ -108,15 +108,16 @@ async fn main() -> io::Result<()> {
   节点这样调用；分别对两个节点调用 `create` 得到的是两个永远不会合并的独立集群。
 - `EzKv::join(http_addr, seed_addr, storage, config)`：通过 `seed_addr`（集群里任意一个已有节点的
   内部端口地址，不必是 leader）加入集群，并请求成为投票者（voter）。节点总是先以*学习者*
-  （learner，只复制日志，不参与多数派计票）身份进入，追上进度后才会被提升为投票者；这个提升在后台发起，
-  必须由 `EzKv::serve`/`serve_with` 收尾等待——**因此一个正在 join 的节点必须调用 `serve`**，提升失败
-  也是从这里返回的。
+  （learner，只复制日志，不参与多数派计票）身份进入。只有本节点的 Actix workers 初始化后，才会发出
+  `SetRole(Voter)` 请求；`serve`/`serve_with` 等待这次请求完成——**因此一个正在 join 的节点必须调用
+  `serve`**，提升失败也是从这里返回的。EzRaft 不会在 OpenRaft 成员协议之外另做追平或就绪检查。
 - `EzKv::join_as_learner(http_addr, seed_addr, storage, config)`：同样通过 `seed_addr` 加入，但不
   请求提升，节点永远是学习者：复制全部日志、能回答读请求，但从不投票，因此不会拖慢写入需要等待的多数派。
   之后可以在 leader 上用 `EzKv::promote` 把它变成投票者。
 
-三者返回的 `EzKv` 都需要调用 `serve()`（或 `serve_with`）之后，这个节点才能被别的节点复制到、也才能真正
-完成 join 触发的提升。重启时（同一份存储、同一个 `http_addr`）三者都会读回持久化的节点 id，既不会重新联系
+三个构造函数都会先取得并持有本地内部监听，然后才请求身份或改变成员关系；监听冲突会原样返回，集群成员不变。
+`EzKv::shutdown()` 即使在 `serve()` 前调用，也会释放预占的监听。调用 `serve()`（或 `serve_with`）后，其他节点
+才能连接并复制到该节点，join 才会开始 voter 请求。重启时（同一份存储、同一个声明地址）三者都会读回持久化的节点 id，既不会重新联系
 `seed_addr`，也不会重新发起提升——一个节点当前是不是投票者，完全由集群的成员配置决定，重启不会改变它。
 
 节点 id 由集群分配、持久化，不是配置出来的：三节点集群的 id 可能是 `0`、`7`、`2` 这样不连续但唯一的数字。
@@ -125,7 +126,10 @@ async fn main() -> io::Result<()> {
 
 ### 内部端口与集群 token
 
-`http_addr` 就是内部端口的绑定地址：它承载 Raft 的 append/vote/snapshot/transfer_leader、管理 API
+`http_addr` 是保存在成员表里的节点通信地址，也是 `EzKv::addr()` 返回值。默认时它也作为本地监听地址；设置
+`EzConfig::internal_bind_addr` 后，底座只在该本地地址绑定，不解析 `http_addr`。因此容器可以绑定本地接口或通配
+接口，同时向成员表发布稳定 DNS 名。监听冲突发生在构造期间，早于身份申请和成员变更。内部端口承载 Raft 的
+append/vote/snapshot/transfer_leader、管理 API
 （`/api/node_id`、`/api/membership`、`/api/metrics`）和全部节点间 RPC（`/rpc/<name>`）。这个端口上的
 **每一个**请求都必须带 `Authorization: Bearer <cluster_token>`，包括通过 `EzKv::serve_with` 挂载的、
 上游自己加的路由——鉴权中间件包住了整个 HTTP 应用，常数时间比较，凭证缺失或错误一律 `401`，且从不进入
@@ -166,6 +170,7 @@ async fn main() -> io::Result<()> {
 | 字段 | 作用 |
 | --- | --- |
 | `cluster_token` | 内部端口鉴权用的集群 token。**没有默认值**：留空节点拒绝启动，这是刻意的设计，不是待实测的数值。 |
+| `internal_bind_addr` | 本机内部 HTTP 监听地址。`None` 使用 `create`/`join` 的 `http_addr`；`Some` 只影响本地 bind，成员通信地址仍是构造参数。 |
 | `heartbeat_interval` | leader 发心跳的间隔；选举超时由它按 3~6 倍推导。 |
 | `snapshot_interval` | 距上一次快照多少条新日志后自动触发下一次快照构建。 |
 | `snapshot_log_to_keep` | 快照覆盖之后，磁盘上仍保留多少条日志，好让轻微落后的 follower 靠日志追上而不必装整份快照。留 `None` 按 `snapshot_interval` 推导。 |
@@ -825,7 +830,7 @@ async fn hand_over_leadership(leader: &EzKv, target: u64) -> std::io::Result<()>
 `GET /api/metrics` 读某个节点自己的视角。协议里的角色用 `ezraft::NodeRole` 表示，只有两个取值：
 `Learner`（复制日志、可以应答读，但不投票、不计入多数派）和 `Voter`（计入多数派）；`SetRole` 把一个
 已有节点改成其中之一，对应 Rust 侧的 `demote` / `promote`。节点总是先以 `Learner` 身份进入集群，
-`join` 只是在追上进度之后多做一步提升。
+`join` 会在本节点服务启动后多发一步 voter 变更请求；EzRaft 不额外保证 learner 已追平或就绪。
 
 进阶用法可以通过 `EzKv::inner()` 直接拿到底层 openraft 的 `Raft` 句柄，类型参数固定为
 `ezraft::OpenRaftTypes`；`ezraft::RaftMetrics`、`ezraft::RaftTypeConfig`、`ezraft::ServerState`、

@@ -40,9 +40,9 @@ pub enum MembershipChange {
     /// counted in the quorum a write must reach. Asking for the role a node already holds changes
     /// nothing.
     ///
-    /// Becoming a voter is answered only once the node has caught up, so that request lasts as
-    /// long as the catch-up - for a large state, a whole snapshot transfer - and the node must be
-    /// serving, or it can never catch up.
+    /// OpenRaft's membership protocol determines when this change completes. EzRaft does not add
+    /// a separate readiness or catch-up check, so the target's internal server should be running
+    /// to receive replication before it is promoted.
     SetRole { node_id: u64, role: NodeRole },
 
     /// Take a node out of the cluster entirely

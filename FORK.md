@@ -289,6 +289,19 @@
   drain 和名下记录清理，再显式调用 `EzKv::shutdown()`，内部 Raft RPC 在此之前继续可用。同步更新 `serve`/`serve_with`
   API 文档、使用指南、crate Quick Start 与 README；示例只演示 Ctrl-C，SIGTERM 由宿主另行注册。ech0-media 增加真实
   三节点进程回归，覆盖会话关闭码、自清理结果、退出时限及 leader/term 稳定性。
+- [#138 内部监听预绑定与节点通信地址分离](https://github.com/2nterdigital/ech0-media/issues/138)：构造时先绑定并持有内部监听，冲突以原始 I/O
+  错误返回，早于身份申请与成员变更；`shutdown()` 在尚未 `serve()` 时也会释放预占端口。新增
+  `EzConfig::internal_bind_addr` 作为本地监听覆盖，构造参数及 `EzKv::addr()` 仍是成员表通信地址，因此可用容器
+  本地/通配监听发布稳定 DNS。join voter 的 `SetRole` 请求只在 Actix worker 服务工厂初始化完成后发出；取消或
+  关停时停止本地 promotion 与 HTTP 服务，不自动回滚已提交的远端成员变化，也不在 OpenRaft 之外新增追平检查。
+  更新 `docs/guide.md`、配置与 promotion API 文档，并增加预绑定冲突、成员地址不变及本地/DNS 地址分离回归。
+  `tests/promotion_lifecycle.rs` 分开验证本地取消/停止重试与真实集群已提交 voter 保留；服务 future 从普通线程
+  丢弃时仍由节点 runtime 执行清理，`shutdown` 等待同一收尾完成信号。2026-09-26 验证：
+  `cargo test --no-fail-fast` 为 344 passed / 0 failed / 1 ignored（33 个套件）；
+  `cargo fmt --all -- --check`、`cargo check --all-targets`、
+  `cargo clippy --no-deps --all-targets -- -D warnings`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --all --no-deps` 均通过。Linux 容器 DNS/端口冲突证据在
+  ech0-media `docs/lab/internal-startup-138.md`，只覆盖内部通信。
 
 ## 验证命令
 

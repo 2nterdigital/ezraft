@@ -1,15 +1,13 @@
 //! The node handle: `EzKv`
 //!
-//! This module provides the primary [`EzKv`] struct users interact with: cluster lifecycle
-//! (`create`/`join`/`join_as_learner`/`serve`/`shutdown`), membership, metrics and the local
-//! view. The write path lives in `crate::write`, cluster observation in `crate::cluster`, the
-//! node registry's handle-level half in `crate::registry`, and leader-only tasks in
-//! `crate::leader_task` - each its own `impl EzKv` block, kept separate so this file stays about
-//! lifecycle and membership as it grows. This module still owns starting each of those (cluster
-//! observation's background task, the registry's self-registration task, the leader-task
-//! supervisor and the built-in liveness task) from the node's own constructor, and the two
-//! membership operations that also touch the registry ([`EzKv::remove_node`]) or must stop a
-//! still-retrying registration ([`EzKv::shutdown`]).
+//! This module defines the primary [`EzKv`] handle, its constructors, metrics, membership and
+//! local view. HTTP serving and listener/promotion ownership live in the adjacent
+//! `raft/lifecycle.rs`. The write path, cluster observation, node registry and leader tasks each
+//! keep their own `impl EzKv` block in their feature modules. This module starts those background
+//! tasks from the constructor and owns the membership operation that also touches the registry
+//! ([`EzKv::remove_node`]).
+
+mod lifecycle;
 
 use std::collections::BTreeMap;
 use std::io;
@@ -17,7 +15,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use actix_web::dev::ServerHandle;
 use openraft::Raft;
 use openraft::RaftMetrics;
 use openraft::async_runtime::WatchReceiver;
@@ -26,6 +23,8 @@ use openraft::errors::RaftError;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use self::lifecycle::NodeLifecycle;
+use self::lifecycle::PromotionRequest;
 use crate::admin::AdminClient;
 use crate::admin::MembershipChange;
 use crate::cluster::ClusterState;
@@ -51,15 +50,6 @@ use crate::type_config::OpenRaftTypes;
 /// The internal OpenRaft instance, with the KV state machine behind it
 pub type ORRaft = Raft<OpenRaftTypes, StateMachineStore>;
 
-/// A promotion in flight, handed from [`EzKv::join`] to [`EzKv::serve`]
-type Promotion = Arc<Mutex<Option<JoinHandle<Result<(), io::Error>>>>>;
-
-/// The HTTP server handle [`EzKv::serve_with`] hands to [`EzKv::shutdown`]
-///
-/// Set once `serve`/`serve_with` has bound the node's address, and taken by `shutdown` so a node
-/// stopped that way releases the address again, and can be restarted on it in the same process.
-type ServeHandle = Arc<Mutex<Option<ServerHandle>>>;
-
 /// The node handle: create or join a cluster, serve it, and read and write its replicated KV
 ///
 /// `Clone` is cheap: every clone shares the same underlying Raft node.
@@ -68,24 +58,17 @@ pub struct EzKv {
     /// Node ID
     node_id: u64,
 
-    /// HTTP bind address
+    /// Address peers use to reach this node, separate from the local listener override
     addr: String,
 
     /// Internal OpenRaft instance
     raft: ORRaft,
 
-    /// The promotion [`Self::join`] started, for [`Self::serve`] to finish
-    ///
-    /// Shared and taken rather than owned, because [`EzKv`] is cloned freely and only the one
-    /// call to `serve` may await it. `None` once taken, and for a node that never asked to be
-    /// promoted.
-    promotion: Promotion,
+    /// The internal listener and serving/promotion lifecycle shared by every handle clone
+    lifecycle: NodeLifecycle,
 
     /// A lock-free reader onto the KV's latest published view
     view_rx: ViewReceiver,
-
-    /// The actix `ServerHandle` for the address `serve`/`serve_with` bound, once bound
-    serve_handle: ServeHandle,
 
     /// The configuration this node was started with, shared by every clone of this handle:
     /// whatever another module needs from it is read through one of the accessors below, never
@@ -136,7 +119,8 @@ impl EzKv {
     ///
     /// # Arguments
     ///
-    /// * `http_addr` - Address to bind HTTP server (e.g., "127.0.0.1:8080")
+    /// * `http_addr` - Address peers use to reach this node (e.g., "127.0.0.1:8080");
+    ///   [`EzConfig::internal_bind_addr`] can override the local listener address
     /// * `storage` - This node's storage
     /// * `config` - configuration (use `EzConfig::default()` for sensible defaults)
     pub async fn create(
@@ -169,12 +153,11 @@ impl EzKv {
 
     /// Join the cluster that `seed_addr` belongs to, and become a voter
     ///
-    /// Three steps, of which this call finishes the first two: the seed hands out a node id, adds
-    /// this node to the cluster as a *learner*, and then the promotion to *voter* is started in
-    /// the background and left for [`Self::serve`] to finish. It has to be left, because a node
-    /// is promoted only once it has caught up, and it cannot receive anything until its own HTTP
-    /// server is running - which is what `serve` starts. So **a joining node must call `serve`**,
-    /// and that is where a failed promotion surfaces.
+    /// The seed hands out a node id and adds this node as a *learner*. The voter change is only
+    /// requested after this node's Actix workers have initialized in [`Self::serve`], which is
+    /// also where a failed promotion surfaces. The learner needs its internal server running to
+    /// receive replication; ezraft does not add a separate catch-up/readiness check to OpenRaft's
+    /// membership protocol. So **a joining node must call `serve`**.
     ///
     /// The seed does not have to be the leader.
     ///
@@ -190,7 +173,8 @@ impl EzKv {
     ///
     /// # Arguments
     ///
-    /// * `http_addr` - Address to bind HTTP server (e.g., "127.0.0.1:8081")
+    /// * `http_addr` - Address peers use to reach this node (e.g., "node-1.internal:8081"); set
+    ///   [`EzConfig::internal_bind_addr`] when the local listener uses a different address
     /// * `seed_addr` - Address of any node already in the cluster
     /// * `storage` - This node's storage
     /// * `config` - configuration (use `EzConfig::default()` for sensible defaults)
@@ -252,6 +236,12 @@ impl EzKv {
         // cluster's membership. A configuration this node cannot run with must not first cost the
         // cluster a learner that then has to be removed by hand.
         let raft_config = Arc::new(config.to_raft_config()?);
+
+        // Hold the internal socket before asking another node for an id or changing membership.
+        // When configured separately, only this local endpoint is resolved here; `http_addr`
+        // remains the address stored in membership and returned from `EzKv::addr`.
+        let internal_listener =
+            std::net::TcpListener::bind(config.internal_bind_addr.as_deref().unwrap_or(&http_addr))?;
         let config = Arc::new(config);
 
         // Open user storage as the two stores openraft asks for
@@ -346,24 +336,15 @@ impl EzKv {
         // ever calls its own `write`.
         crate::write::register_forward_handler(&rpc, raft.clone(), config.kv_limits, config.ledger_capacity);
 
-        // Asking now, answered later. The leader holds the request until this node has caught up,
-        // which cannot happen until `serve` is running, so the wait belongs there and not here.
-        let promotion = promote_via.map(|admin| {
-            let promote = MembershipChange::SetRole {
-                node_id,
-                role: NodeRole::Voter,
-            };
-
-            tokio::spawn(async move { admin.membership(promote).await })
-        });
-
         let ez = Self {
             node_id,
             addr: http_addr,
             raft,
-            promotion: Arc::new(Mutex::new(promotion)),
+            lifecycle: NodeLifecycle::new(
+                internal_listener,
+                promote_via.map(|admin| PromotionRequest::new(admin, node_id)),
+            ),
             view_rx,
-            serve_handle: Arc::new(Mutex::new(None)),
             config,
             rpc,
             read_index,
@@ -549,110 +530,12 @@ impl EzKv {
         self.raft.trigger().transfer_leader(node_id).await.map_err(io::Error::other)
     }
 
-    /// Stop this node's Raft engine and HTTP server, and wait for both to finish
-    ///
-    /// Releases the address `serve`/`serve_with` bound: a node restarted **in the same
-    /// process** - exactly what the in-process cluster tests, and any real restart, need - can
-    /// bind it again immediately after this returns. A node with no address to answer on has no
-    /// business serving anyway. A node that never called `serve` simply has nothing to stop here.
-    /// The internal HTTP server does not handle process signals: the embedding application owns
-    /// them and calls this after its own drain and cleanup are complete.
-    pub async fn shutdown(&self) -> Result<(), io::Error> {
-        // "Retries until it succeeds" (ech0-media#33) must not mean "forever, even after this
-        // node has stopped" - a no-op if it already finished on its own. First, so that nothing
-        // below can return early and leave it retrying against a node that is gone.
-        if let Some(handle) = self.self_registration.lock().unwrap().take() {
-            handle.abort();
-        }
-
-        self.raft.shutdown().await.map_err(io::Error::other)?;
-
-        // Nothing will be applied again, so nothing will be published again: end every watch
-        // stream rather than leave its consumer waiting on a node that is gone.
-        self.watch.close_watch();
-
-        let handle = self.serve_handle.lock().unwrap().take();
-        if let Some(handle) = handle {
-            handle.stop(true).await;
-        }
-
-        Ok(())
-    }
-
-    /// Start the HTTP server
-    ///
-    /// This starts the HTTP server that handles:
-    /// - Internal Raft RPC (append entries, vote, install snapshot)
-    /// - Admin API (join, add learner, change membership, metrics)
-    ///
-    /// This method blocks until the server is stopped, so a caller with other work to do spawns
-    /// it: `tokio::spawn(node.clone().serve())`. Start it as early as possible. Peers reach a
-    /// node only through this server, so a node that has joined a cluster but is not serving yet
-    /// cannot be replicated to, and holds up every quorum it is counted in.
-    ///
-    /// The internal server does not install process-level signal handlers. The embedding
-    /// application owns signals such as `SIGINT` and `SIGTERM`; after its own drain and cleanup,
-    /// it must call [`Self::shutdown`] to stop this server and the Raft engine.
-    ///
-    /// This is also where the promotion started by [`Self::join`] is collected. The server goes
-    /// up first, because the promotion completes only once this node has caught up and it can
-    /// only catch up through that server; a promotion that fails is returned here, and stops the
-    /// server with it. A node that joined as a learner, or was created, has nothing to collect
-    /// and simply serves.
-    ///
-    /// Whichever of the two fails first is what this returns. A server that cannot bind its
-    /// address says so immediately, instead of waiting out a promotion that was never going to
-    /// arrive without it.
-    pub async fn serve(self) -> Result<(), io::Error> {
-        self.serve_with(|_| {}).await
-    }
-
-    /// Start the HTTP server with application-specific routes
-    ///
-    /// The closure extends the bundled server with routes backed by the same node handle.
-    /// Standard Raft and admin routes are installed first and cannot be replaced.
-    /// Like [`Self::serve`], this does not handle process signals; the embedding application
-    /// owns them and stops the node with [`Self::shutdown`] after its own cleanup.
-    pub async fn serve_with<F>(self, configure: F) -> Result<(), io::Error>
-    where F: Fn(&mut actix_web::web::ServiceConfig) + Clone + Send + 'static {
-        let promotion = self.promotion.lock().unwrap().take();
-
-        let server = crate::server::bind(self.clone(), configure)?;
-        *self.serve_handle.lock().unwrap() = Some(server.handle());
-        let mut server_task = tokio::spawn(server);
-
-        if let Some(mut promotion) = promotion {
-            // The two are raced rather than collected in turn. A promotion completes only once
-            // this node has caught up, which a server that never came up will never let it do -
-            // waiting for the promotion first would sit on the bind error for the twenty attempts
-            // and ninety seconds each that the promotion still has to spend.
-            tokio::select! {
-                finished = &mut server_task => {
-                    // The promotion has nothing left to wait for, and would keep asking the
-                    // leader for half an hour if it were merely dropped.
-                    promotion.abort();
-                    return finished.map_err(io::Error::other)?;
-                }
-                promoted = &mut promotion => {
-                    if let Err(e) = promoted.map_err(io::Error::other)? {
-                        // Nothing else will stop it: the caller is holding this call, not the
-                        // server.
-                        server_task.abort();
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        server_task.await.map_err(io::Error::other)?
-    }
-
     /// Get the node ID
     pub fn node_id(&self) -> u64 {
         self.node_id
     }
 
-    /// Get the HTTP address
+    /// Get the internal address peers use to reach this node
     pub fn addr(&self) -> &str {
         &self.addr
     }

@@ -91,11 +91,10 @@ async fn learner_joins_and_stays_a_learner_until_promoted() -> io::Result<()> {
             .map_err(|e| io::Error::other(e.to_string()))?;
     }
 
-    // Being caught up is the whole condition a promotion waits for, so once the
-    // learner has applied everything, nothing but an explicit promote is left
-    // to make it a voter. Anchored to the leader's index: a node that has
-    // replicated nothing yet has its own `last_applied` and `last_log_index`
-    // both unset, and comparing those two would pass instantly.
+    // This learner must receive the written state and still remain a learner: replication alone
+    // never changes its role. The explicit promote below is the only request this test makes to
+    // change that role. Anchor the wait to the leader's index because a node that has replicated
+    // nothing yet has its own `last_applied` and `last_log_index` both unset.
     let target = a.metrics().await.last_log_index.expect("the leader has written entries");
     b.wait_metrics(
         WAIT,
