@@ -115,6 +115,14 @@ impl EzServer {
         req: web::Json<raft::TransferLeaderRequest<C>>,
         ez: Data<Self>,
     ) -> Result<web::Json<Result<raft::TransferLeaderResponse<C>, Infallible>>, actix_web::Error> {
+        // Transfers are broadcast to voters so they can release the old leader's lease.
+        // Only reject becoming the target ourselves; transfers to another node must still
+        // reach OpenRaft so an ineligible voter can vote for the eligible successor.
+        if *req.to_node_id() == ez.raft.node_id() && !ez.raft.leader_eligible() {
+            return Err(actix_web::error::ErrorForbidden(
+                "this node is not eligible for leadership",
+            ));
+        }
         let resp = ez
             .raft
             .inner()

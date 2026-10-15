@@ -303,6 +303,13 @@
   `RUSTDOCFLAGS="-D warnings" cargo doc --all --no-deps` 均通过。Linux 容器 DNS/端口冲突证据在
   ech0-media `docs/lab/internal-startup-138.md`，只覆盖内部通信。
 
+- 新增本地 `EzConfig::leader_eligible`（默认 `true`）：启动前映射 OpenRaft 自动选举开关，禁用节点同时
+  关闭持久化 leader 恢复，仅拒绝目标为自己的转移请求（HTTP `403`）；发往其他目标的广播照常交给
+  OpenRaft 处理，以释放旧租约并支持有资格节点接任。禁用节点仍为正常 voter，复制和投票不变；新建集群
+  在分配 id 0、初始化成员前拒绝；仅持久化 id 0 的中断 bootstrap 同样拒绝，已初始化节点可无 seed 重启。新增配置兼容、HK 故障切换与 SZ
+  投票/复制、全部 HK 不可用时不竞选、转移限制及原 leader 禁用后重启测试。`inner()` 的手动覆盖不属于
+  此本地策略的支持范围。
+
 ## 验证命令
 
 合入 `dev` 之前全部通过（与 CI 一致）：

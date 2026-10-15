@@ -33,6 +33,14 @@ pub struct EzConfig {
     /// continues to serve as the local bind address too.
     pub internal_bind_addr: Option<String>,
 
+    /// Whether this node may become leader (default: `true`)
+    ///
+    /// When `false`, it still votes and replicates as a normal voter, but does not campaign,
+    /// restore a persisted leadership, or accept a leadership transfer addressed to itself.
+    /// A fresh node must join an existing cluster; it cannot create one. Restarting an initialized
+    /// persisted node without a seed is supported. This is local startup policy, not membership.
+    pub leader_eligible: bool,
+
     /// Heartbeat interval
     ///
     /// Leader sends heartbeats to followers at this interval.
@@ -316,6 +324,7 @@ impl fmt::Debug for EzConfig {
         // accident - or, were it another secret, shown by default.
         let Self {
             internal_bind_addr,
+            leader_eligible,
             heartbeat_interval,
             snapshot_interval,
             snapshot_log_to_keep,
@@ -340,6 +349,7 @@ impl fmt::Debug for EzConfig {
         let mut shown = f.debug_struct("EzConfig");
         shown
             .field("internal_bind_addr", internal_bind_addr)
+            .field("leader_eligible", leader_eligible)
             .field("heartbeat_interval", heartbeat_interval)
             .field("snapshot_interval", snapshot_interval)
             .field("snapshot_log_to_keep", snapshot_log_to_keep)
@@ -367,6 +377,7 @@ impl Default for EzConfig {
     fn default() -> Self {
         Self {
             internal_bind_addr: None,
+            leader_eligible: true,
             heartbeat_interval: Duration::from_millis(500),
             cluster_token: String::new(),
             snapshot_interval: 500,
@@ -465,6 +476,10 @@ impl EzConfig {
         }
 
         let config = Config {
+            enable_elect: self.leader_eligible,
+            // Preserve upstream restore defaults for eligible nodes. Ineligible nodes must not
+            // resume a committed self-vote as leadership before any election timeout occurs.
+            enable_leader_restore: if self.leader_eligible { None } else { Some(false) },
             heartbeat_interval: heartbeat_ms,
             election_timeout_min: heartbeat_ms * 3,
             election_timeout_max: heartbeat_ms * 6,
@@ -487,6 +502,27 @@ impl EzConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leader_eligibility_defaults_preserve_elections_and_restore() {
+        let config = EzConfig::default();
+        assert!(config.leader_eligible);
+        let raft = config.to_raft_config().unwrap();
+        assert!(raft.enable_elect);
+        assert_eq!(None, raft.enable_leader_restore);
+    }
+
+    #[test]
+    fn ineligible_nodes_disable_elections_and_leader_restore() {
+        let raft = EzConfig {
+            leader_eligible: false,
+            ..EzConfig::default()
+        }
+        .to_raft_config()
+        .unwrap();
+        assert!(!raft.enable_elect);
+        assert_eq!(Some(false), raft.enable_leader_restore);
+    }
 
     /// The defaults batch a handful of maximal transactions per replication request.
     #[test]
