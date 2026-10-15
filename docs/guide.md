@@ -159,6 +159,12 @@ append/vote/snapshot/transfer_leader、管理 API
 能共享同一个文件——redb 用操作系统文件锁强制这一点，第二次 `open` 会直接失败而不是悄悄损坏第一个节点的
 日志。
 
+`leader_eligible = false` 是本地启动策略，不改变 voter/learner 成员身份。新节点必须通过 `join` 或
+`join_as_learner` 加入已有集群；直接 `create` 一个全新集群会在分配 id 0 和初始化成员前失败。已经初始化且有持久化
+身份的节点仍可不带 seed 重启；仅保存 id 0、尚未完成初始化的崩溃状态也不能绕过新建集群限制。若全部有资格的节点都不可用，即使剩余 voter 构成多数派，也不会选出 leader。
+该 voter 仍会处理目标为其他节点的转移广播，以清除旧 leader 租约并支持有资格节点接任。
+`inner()` 暴露的底层 OpenRaft 手动选举、转移处理和运行时配置覆盖不在此策略的支持范围内。
+
 ### `EzConfig`：每一项可调参数
 
 `EzConfig` 收纳了这个节点的全部可调项。除 `cluster_token` 外都有默认值，`EzConfig::default()` 可以直接
@@ -171,6 +177,7 @@ append/vote/snapshot/transfer_leader、管理 API
 | --- | --- |
 | `cluster_token` | 内部端口鉴权用的集群 token。**没有默认值**：留空节点拒绝启动，这是刻意的设计，不是待实测的数值。 |
 | `internal_bind_addr` | 本机内部 HTTP 监听地址。`None` 使用 `create`/`join` 的 `http_addr`；`Some` 只影响本地 bind，成员通信地址仍是构造参数。 |
+| `leader_eligible` | 本节点是否有资格成为 leader，默认 `true`。`false` 仍保留完整 voter 的投票和复制能力，但不主动竞选、不从持久化自投票恢复 leader，并以 HTTP `403` 拒绝目标为自己的领导权转移。 |
 | `heartbeat_interval` | leader 发心跳的间隔；选举超时由它按 3~6 倍推导。 |
 | `snapshot_interval` | 距上一次快照多少条新日志后自动触发下一次快照构建。 |
 | `snapshot_log_to_keep` | 快照覆盖之后，磁盘上仍保留多少条日志，好让轻微落后的 follower 靠日志追上而不必装整份快照。留 `None` 按 `snapshot_interval` 推导。 |

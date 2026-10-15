@@ -281,6 +281,14 @@ impl EzKv {
             }
             id
         } else {
+            // Refuse a fresh bootstrap before assigning id 0 or initializing membership.
+            // Persisted restarts above remain valid even without a seed.
+            if !config.leader_eligible {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "leader-ineligible nodes cannot create a fresh cluster; join an existing cluster instead",
+                ));
+            }
             // First node in cluster
             let id = 0;
             log.save_meta(|m| m.node_id = Some(id)).await?;
@@ -308,10 +316,21 @@ impl EzKv {
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        // The created node starts the cluster with itself as its only member. On restart it loads
-        // id 0 from storage and comes back here, where initializing is rightly refused; every
-        // other refusal means the node cannot run.
-        if node_id == 0 {
+        // Persisting id 0 precedes initialize: a crash between them leaves an identity without
+        // a cluster. initialize itself campaigns, even with automatic elections disabled, so an
+        // ineligible restart must never call it. Reject that unfinished bootstrap and stop the
+        // core before returning; fully initialized persisted nodes still restart without a seed.
+        if node_id == 0 && !config.leader_eligible && !raft.is_initialized().await.map_err(io::Error::other)? {
+            raft.shutdown().await.map_err(io::Error::other)?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "leader-ineligible nodes cannot finish an uninitialized cluster bootstrap",
+            ));
+        }
+
+        // Eligible node 0 may finish an interrupted bootstrap. For an initialized restart,
+        // OpenRaft refuses reinitialization, which is the expected outcome.
+        if node_id == 0 && config.leader_eligible {
             let nodes = BTreeMap::from_iter([(node_id, Node::new(http_addr.clone()))]);
             match raft.initialize(nodes).await {
                 Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {}
@@ -535,6 +554,11 @@ impl EzKv {
         self.node_id
     }
 
+    /// The local startup policy used by the incoming leadership-transfer handler.
+    pub(crate) fn leader_eligible(&self) -> bool {
+        self.config.leader_eligible
+    }
+
     /// Get the internal address peers use to reach this node
     pub fn addr(&self) -> &str {
         &self.addr
@@ -542,7 +566,9 @@ impl EzKv {
 
     /// Get a reference to the internal OpenRaft instance
     ///
-    /// This provides access to advanced OpenRaft APIs if needed.
+    /// This provides access to advanced OpenRaft APIs if needed. Direct manual election,
+    /// transfer handling, or runtime configuration overrides through this escape hatch are
+    /// outside the supported [`EzConfig::leader_eligible`] policy.
     pub fn inner(&self) -> &ORRaft {
         &self.raft
     }
